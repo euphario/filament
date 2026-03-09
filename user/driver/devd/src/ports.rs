@@ -4,7 +4,7 @@
 //! Flat store keyed by port name. Uses trait-based design for testability.
 
 use abi::{PortInfo, PortClass, PortState};
-use userlib::error::SysError;
+use libsys::error::SysError;
 
 // =============================================================================
 // Constants

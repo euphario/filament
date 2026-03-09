@@ -15,12 +15,12 @@
 #![no_std]
 #![no_main]
 
-use userlib::{uinfo, unotice, udebug, uerror};
-use userlib::bus::{
+use libsys::{uinfo, unotice, udebug, uerror};
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId, ConfigKey,
     bus_msg, PortInfo, PortClass, PortMetadata, port_subclass,
 };
-use userlib::bus_runtime::driver_main;
+use libsys::bus_runtime::driver_main;
 
 // ============================================================================
 // PCI Class Constants
@@ -119,7 +119,7 @@ fn format_port_name(cname: &str, index: u8, buf: &mut [u8; 32]) -> usize {
 // ============================================================================
 
 struct PcieDriver {
-    devices: [userlib::BusDevice; MAX_PCI_DEVICES],
+    devices: [libsys::BusDevice; MAX_PCI_DEVICES],
     count: usize,
     kernel_bus: Option<KernelBusId>,
     /// Per-class port index counters for class:index naming
@@ -151,7 +151,7 @@ fn class_counter_for(base_class: u8, subclass: u8, prog_if: u8) -> ClassCounter 
 impl PcieDriver {
     const fn new() -> Self {
         Self {
-            devices: [userlib::BusDevice::empty(); MAX_PCI_DEVICES],
+            devices: [libsys::BusDevice::empty(); MAX_PCI_DEVICES],
             count: 0,
             kernel_bus: None,
             class_counters: [0; 8],
@@ -219,7 +219,7 @@ impl Driver for PcieDriver {
         // Claim the kernel bus — receives StateSnapshot + DeviceList
         match ctx.claim_kernel_bus(bus_path) {
             Ok((bus_id, info)) => {
-                unotice!("pcied", "bus_claimed"; bus_type = info.bus_type as u32, caps = userlib::ulog::hex32(info.capabilities as u32));
+                unotice!("pcied", "bus_claimed"; bus_type = info.bus_type as u32, caps = libsys::ulog::hex32(info.capabilities as u32));
                 self.kernel_bus = Some(bus_id);
             }
             Err(_) => {
@@ -314,6 +314,59 @@ impl Driver for PcieDriver {
             _ => Disposition::Forward,
         }
     }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        PCIE_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        match key {
+            b"devices" => {
+                let mut pos = 0;
+                let mut counters = [0u8; 8];
+                for dev in &self.devices[..self.count] {
+                    if pos > 0 && pos < buf.len() { buf[pos] = b' '; pos += 1; }
+                    let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
+                    let counter = class_counter_for(dev.base_class(), dev.subclass(), dev.prog_if());
+                    let cidx = counters[counter as usize];
+                    counters[counter as usize] = cidx + 1;
+                    let mut name_buf = [0u8; 32];
+                    let nlen = format_port_name(cname, cidx, &mut name_buf);
+                    let copy = nlen.min(buf.len() - pos);
+                    buf[pos..pos + copy].copy_from_slice(&name_buf[..copy]);
+                    pos += copy;
+                    if pos < buf.len() { buf[pos] = b'('; pos += 1; }
+                    let clen = cname.len().min(buf.len() - pos);
+                    buf[pos..pos + clen].copy_from_slice(&cname.as_bytes()[..clen]);
+                    pos += clen;
+                    if pos < buf.len() { buf[pos] = b','; pos += 1; }
+                    let n = fmt_hex16(dev.vendor_id, &mut buf[pos..]);
+                    pos += n;
+                    if pos < buf.len() { buf[pos] = b':'; pos += 1; }
+                    let n = fmt_hex16(dev.device_id, &mut buf[pos..]);
+                    pos += n;
+                    if pos < buf.len() { buf[pos] = b')'; pos += 1; }
+                }
+                pos
+            }
+            _ => 0,
+        }
+    }
+}
+
+const PCIE_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_only(b"devices"),
+];
+
+fn fmt_hex16(val: u16, buf: &mut [u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if buf.len() < 6 { return 0; }
+    buf[0] = b'0'; buf[1] = b'x';
+    buf[2] = HEX[((val >> 12) & 0xf) as usize];
+    buf[3] = HEX[((val >> 8) & 0xf) as usize];
+    buf[4] = HEX[((val >> 4) & 0xf) as usize];
+    buf[5] = HEX[(val & 0xf) as usize];
+    6
 }
 
 // ============================================================================
@@ -325,76 +378,5 @@ static mut DRIVER: PcieDriver = PcieDriver::new();
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"pcied", PcieDriverWrapper(driver));
-}
-
-struct PcieDriverWrapper(&'static mut PcieDriver);
-
-const PCIE_CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey::read_only(b"devices"),
-];
-
-impl PcieDriverWrapper {
-    fn fmt_hex16(val: u16, buf: &mut [u8]) -> usize {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        if buf.len() < 6 { return 0; }
-        buf[0] = b'0'; buf[1] = b'x';
-        buf[2] = HEX[((val >> 12) & 0xf) as usize];
-        buf[3] = HEX[((val >> 8) & 0xf) as usize];
-        buf[4] = HEX[((val >> 4) & 0xf) as usize];
-        buf[5] = HEX[(val & 0xf) as usize];
-        6
-    }
-}
-
-impl Driver for PcieDriverWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
-
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
-
-    fn config_keys(&self) -> &[ConfigKey] {
-        PCIE_CONFIG_KEYS
-    }
-
-    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
-        match key {
-            b"devices" => {
-                // Compact list: "class:N(vid:did) class:N(...) ..."
-                let mut pos = 0;
-                let mut counters = [0u8; 8];
-                for dev in &self.0.devices[..self.0.count] {
-                    if pos > 0 && pos < buf.len() { buf[pos] = b' '; pos += 1; }
-                    // class:index
-                    let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
-                    let counter = class_counter_for(dev.base_class(), dev.subclass(), dev.prog_if());
-                    let cidx = counters[counter as usize];
-                    counters[counter as usize] = cidx + 1;
-                    let mut name_buf = [0u8; 32];
-                    let nlen = format_port_name(cname, cidx, &mut name_buf);
-                    let copy = nlen.min(buf.len() - pos);
-                    buf[pos..pos + copy].copy_from_slice(&name_buf[..copy]);
-                    pos += copy;
-                    // (class,vid:did)
-                    if pos < buf.len() { buf[pos] = b'('; pos += 1; }
-                    let cname = class_name(dev.base_class(), dev.subclass(), dev.prog_if());
-                    let clen = cname.len().min(buf.len() - pos);
-                    buf[pos..pos + clen].copy_from_slice(&cname.as_bytes()[..clen]);
-                    pos += clen;
-                    if pos < buf.len() { buf[pos] = b','; pos += 1; }
-                    let n = Self::fmt_hex16(dev.vendor_id, &mut buf[pos..]);
-                    pos += n;
-                    if pos < buf.len() { buf[pos] = b':'; pos += 1; }
-                    let n = Self::fmt_hex16(dev.device_id, &mut buf[pos..]);
-                    pos += n;
-                    if pos < buf.len() { buf[pos] = b')'; pos += 1; }
-                }
-                pos
-            }
-            _ => 0,
-        }
-    }
+    driver_main(b"pcied", driver);
 }

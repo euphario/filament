@@ -72,7 +72,7 @@ The kernel provides shared memory primitives for DMA-capable buffers:
 
 ## Ring Buffer Protocol
 
-### userlib::ring::Ring<S, C>
+### libsys::ring::Ring<S, C>
 
 Generic ring buffer built on shared memory:
 
@@ -176,7 +176,7 @@ user/driver/usb/src/
 ├── trb.rs              # TRB structures
 └── ...
 
-user/userlib/src/
+user/libsys/src/
 ├── ring.rs             # Generic Ring<S,C> on shared memory
 │   ├── Ring::create()  # Server creates ring
 │   ├── Ring::map()     # Client maps ring

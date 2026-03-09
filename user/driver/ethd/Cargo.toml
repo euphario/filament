@@ -5,7 +5,7 @@ edition = "2021"
 description = "MT7988 native Ethernet driver (GMAC1 + internal switch)"
 
 [dependencies]
-userlib = { path = "../../userlib" }
+libsys = { path = "../../libsys" }
 
 [profile.release]
 opt-level = "s"       # Optimize for size

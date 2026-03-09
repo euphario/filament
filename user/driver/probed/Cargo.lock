@@ -7,16 +7,16 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
+name = "libsys"
+version = "0.1.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "probed"
 version = "0.1.0"
 dependencies = [
  "abi",
- "userlib",
-]
-
-[[package]]
-name = "userlib"
-version = "0.1.0"
-dependencies = [
- "abi",
+ "libsys",
 ]

@@ -211,7 +211,7 @@ and route frames to the correct one.
 | File | Changes |
 |------|---------|
 | `user/abi/src/lib.rs` | Added `NET_BRIDGE_GROUP` port subclass |
-| `user/userlib/src/ring.rs` | Added `NET_SET_GROUPS` sidechannel message type |
+| `user/libsys/src/ring.rs` | Added `NET_SET_GROUPS` sidechannel message type |
 | `user/driver/ethd/src/main.rs` | Enabled PORT_SPEC_TAG, MTK tag parse/strip on RX, tag insert on TX, port→group mapping, NET_SET_GROUPS handler |
 | `user/driver/switchd/src/main.rs` | Bridge group model replacing per-port registration, group config API |
 | `user/driver/ipd/src/main.rs` | CQE group_id filtering, SQE group_id tagging |

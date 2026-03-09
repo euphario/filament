@@ -30,13 +30,13 @@ use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
-use userlib::ipc::Shmem;
-use userlib::syscall;
+use libsys::ipc::Shmem;
+use libsys::syscall;
 
-// Re-export the core ring primitives from userlib.
-// These live in userlib to avoid a circular dependency (libf → userlib → libf).
+// Re-export the core ring primitives from libsys.
+// These live in libsys to avoid a circular dependency (libf → libsys → libf).
 // SharedPipe and SharedChannel add shmem allocation and notification on top.
-pub use userlib::half_ring::{HalfRing, TypedRing};
+pub use libsys::half_ring::{HalfRing, TypedRing};
 
 // ============================================================================
 // SharedPipe — bidirectional byte pipe over shared memory

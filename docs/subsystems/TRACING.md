@@ -105,12 +105,12 @@ fn load_firmware(dev: &Device) -> Result<()> {
 }
 ```
 
-### Userspace (`userlib/src/utrace.rs`)
+### Userspace (`libsys/src/utrace.rs`)
 
 Same API, different backend (syscall drain).
 
 ```rust
-use userlib::{span, trace_enter, trace_exit};
+use libsys::{span, trace_enter, trace_exit};
 
 fn init_dma(dev: &Mt7996) -> Result<()> {
     let _span = span!("dma", "init"; dev = dev.bdf());
@@ -291,5 +291,5 @@ trace clear
 | File | Purpose |
 |------|---------|
 | `src/ktrace.rs` | Kernel tracing |
-| `user/userlib/src/utrace.rs` | Userspace tracing |
+| `user/libsys/src/utrace.rs` | Userspace tracing |
 | `docs/TRACING.md` | This document |

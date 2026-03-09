@@ -5,7 +5,7 @@ edition = "2021"
 description = "USB host controller driver (xHCI, bus framework)"
 
 [dependencies]
-userlib = { path = "../../userlib" }
+libsys = { path = "../../libsys" }
 usb = { path = "../usb", features = ["mt7988a"] }
 
 [profile.release]

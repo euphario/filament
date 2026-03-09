@@ -71,13 +71,13 @@ Each driver migration follows this pattern:
 
 ```rust
 // Before (old IPC)
-use userlib::ipc::{Channel, Message};
+use libsys::ipc::{Channel, Message};
 let chan = Channel::connect("devd")?;
 chan.send(&msg)?;
 let reply = chan.recv()?;
 
 // After (ipc2)
-use userlib::ipc2::{Channel, Port, Message};
+use libsys::ipc2::{Channel, Port, Message};
 let port = Port::connect("devd")?;  // Named service lookup
 let chan = port.accept()?;          // Get channel from port
 chan.send(&msg)?;
@@ -306,7 +306,7 @@ The bus module cleanly separates:
 ## Quick Reference: What to Do Next
 
 1. **Pick a disabled driver** from Phase 1 list (suggest: logd)
-2. **Update its IPC imports** to use `userlib::ipc2`
+2. **Update its IPC imports** to use `libsys::ipc2`
 3. **Update its code** to use new Channel/Port/Timer APIs
 4. **Enable it in build.sh** - Move from disabled to enabled
 5. **Test** - Ensure it builds, loads, and works
@@ -347,7 +347,7 @@ src/kernel/
 ### Userspace IPC Files (for migration reference)
 
 ```
-user/userlib/src/
+user/libsys/src/
 ├── ipc.rs           # Old IPC (deprecated)
 ├── ipc2.rs          # New unified IPC (use this)
 └── service.rs       # Service framework (needs migration)

@@ -3,7 +3,7 @@
 //! Each step is a standalone function that returns Result.
 //! Load order: patch → WM → DSP → WA, then poll for FW_STATE_RDY(7).
 
-use userlib::{unotice, uinfo, uerror, udebug, ulog};
+use libsys::{unotice, uinfo, uerror, udebug, ulog};
 use crate::regs::*;
 use crate::device::Mt76Device;
 use crate::dma::TxRing;
@@ -183,7 +183,7 @@ fn load_patch(
         upload_chunks(dev, fwdl_ring, &fw[data_offs..data_offs + len as usize], seq, fw_irq)?;
     }
 
-    userlib::delay_ms(100);
+    libsys::delay_ms(100);
 
     mcu::start_firmware(dev, mcu_ring, true, 0, 0, *seq, irq(fw_irq))?;
     *seq = seq.wrapping_add(1);
@@ -269,19 +269,19 @@ pub fn load_all(
     load_patch(dev, mcu_ring, fwdl_ring, &mut seq, &mut irq)?;
     uinfo!("firmware", "patch_done"; seq = seq);
     ulog::flush();
-    userlib::delay_ms(100);
+    libsys::delay_ms(100);
 
     // 2. WM
     load_ram(dev, mcu_ring, fwdl_ring, FW_WM, "WM", 0, &mut seq, &mut irq)?;
     uinfo!("firmware", "wm_done"; seq = seq);
     ulog::flush();
-    userlib::delay_ms(100);
+    libsys::delay_ms(100);
 
     // 3. DSP
     load_ram(dev, mcu_ring, fwdl_ring, FW_DSP, "DSP", fw_start::WORKING_PDA_DSP, &mut seq, &mut irq)?;
     uinfo!("firmware", "dsp_done"; seq = seq);
     ulog::flush();
-    userlib::delay_ms(100);
+    libsys::delay_ms(100);
 
     // 4. WA
     load_ram(dev, mcu_ring, fwdl_ring, FW_WA, "WA", fw_start::WORKING_PDA_CR4, &mut seq, &mut irq)?;
@@ -309,7 +309,7 @@ pub fn load_all(
             }
             fw_irq.ack();
         } else {
-            userlib::delay_ms(20);
+            libsys::delay_ms(20);
         }
     }
 

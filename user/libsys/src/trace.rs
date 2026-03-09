@@ -5,7 +5,7 @@
 //! # Usage
 //!
 //! ```rust
-//! use userlib::{trace, trace_enabled};
+//! use libsys::{trace, trace_enabled};
 //!
 //! // Basic tracing
 //! trace!(DMA, "ring {} initialized", ring_id);

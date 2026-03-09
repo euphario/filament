@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-extern crate userlib;
+extern crate libsys;
 
-use userlib::bus::{BusCtx, BusError, ConfigKey, Disposition, Driver, BusMsg};
-use userlib::bus_runtime::driver_main;
-use userlib::syscall::{self, Handle, ObjectType};
+use libsys::bus::{BusCtx, BusError, ConfigKey, Disposition, Driver, BusMsg};
+use libsys::bus_runtime::driver_main;
+use libsys::syscall::{self, Handle, ObjectType};
 
 const TAG_KLOG: u32 = 0x4B4C; // "KL"
 

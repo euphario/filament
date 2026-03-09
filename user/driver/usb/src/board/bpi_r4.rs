@@ -22,7 +22,7 @@
 use super::{Board, BoardError, UsbControllerConfig};
 use crate::soc::{Mt7988aSoc, Mt7988aControllerId as ControllerId};
 use crate::phy::Mt7988aTphy;
-use userlib::println;
+use libsys::println;
 
 /// USB controller configurations for BPI-R4
 const BPI_R4_USB_CONTROLLERS: &[UsbControllerConfig] = &[

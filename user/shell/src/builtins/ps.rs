@@ -9,7 +9,7 @@
 //!   ps -vvv         - + KIDS, CAPS
 //!   ps -r           - Reset all stats, then show ps
 
-use userlib::syscall;
+use libsys::syscall;
 use crate::output::{Table, Row, Align, CommandResult};
 
 fn prio_name(level: u8) -> &'static str {

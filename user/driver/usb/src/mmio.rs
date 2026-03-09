@@ -1,11 +1,11 @@
 //! MMIO helpers for memory-mapped I/O access
 //!
-//! Re-exports MmioRegion and delay_ms from userlib, plus USB-specific helpers.
+//! Re-exports MmioRegion and delay_ms from libsys, plus USB-specific helpers.
 
-use userlib::syscall;
+use libsys::syscall;
 
-// Re-export from userlib (now uses unified object interface)
-pub use userlib::mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interval};
+// Re-export from libsys (now uses unified object interface)
+pub use libsys::mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interval};
 
 /// Format MMIO URL: "mmio:ADDR/SIZE" in hex
 /// (kept for compatibility with existing code)

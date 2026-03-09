@@ -357,7 +357,7 @@ When a port is registered, devd receives the full `PortInfo` instead of just the
 
 1. **Phase 1**: Add `PortInfo` to `abi` crate
 2. **Phase 2**: Extend kernel port registration to accept optional `PortInfo`
-3. **Phase 3**: Update `userlib::bus` to build and pass `PortInfo`
+3. **Phase 3**: Update `libsys::bus` to build and pass `PortInfo`
 4. **Phase 4**: Update devd to store and match on `PortInfo`
 5. **Phase 5**: Convert rules from string patterns to class/subclass matching
 6. **Phase 6**: Remove legacy string-based matching

@@ -14,16 +14,16 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall;
-use userlib::mmio::{MmioRegion, DmaPool};
-use userlib::bus::{
+use libsys::syscall;
+use libsys::mmio::{MmioRegion, DmaPool};
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, BlockGeometry, bus_msg,
     PortInfo, PortClass, port_subclass,
 };
-use userlib::bus_runtime::driver_main;
-use userlib::ring::{io_op, io_status, side_msg};
-use userlib::{uinfo, unotice, udebug, uerror};
+use libsys::bus_runtime::driver_main;
+use libsys::ring::{io_op, io_status, side_msg};
+use libsys::{uinfo, unotice, udebug, uerror};
 
 // =============================================================================
 // NVMe Register Definitions (NVMe 1.4 spec)
@@ -581,7 +581,7 @@ impl NvmeDriver {
         };
 
         // Collect pending SQ requests
-        let mut requests: [Option<userlib::ring::IoSqe>; 8] = [None; 8];
+        let mut requests: [Option<libsys::ring::IoSqe>; 8] = [None; 8];
         let mut req_count = 0;
 
         if let Some(port) = ctx.block_port(port_id) {
@@ -674,7 +674,7 @@ impl NvmeDriver {
         }
 
         // Process sidechannel queries (geometry, etc.)
-        let mut queries: [Option<userlib::ring::SideEntry>; 4] = [None; 4];
+        let mut queries: [Option<libsys::ring::SideEntry>; 4] = [None; 4];
         let mut query_count = 0;
 
         if let Some(port) = ctx.block_port(port_id) {
@@ -808,21 +808,5 @@ static mut DRIVER: NvmeDriver = NvmeDriver::new();
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"nvmed", NvmeDriverWrapper(driver));
-}
-
-struct NvmeDriverWrapper(&'static mut NvmeDriver);
-
-impl Driver for NvmeDriverWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
-
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
-
-    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        self.0.data_ready(port, ctx)
-    }
+    driver_main(b"nvmed", driver);
 }

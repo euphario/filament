@@ -6,8 +6,8 @@
 
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
-use userlib::syscall::RamfsListEntry;
-use userlib::vfs_client::VfsClient;
+use libsys::syscall::RamfsListEntry;
+use libsys::vfs_client::VfsClient;
 
 /// TFTP opcodes (RFC 1350).
 const OP_RRQ: u16 = 1;
@@ -344,7 +344,7 @@ impl TftpServer {
     /// Generate a listing of ramfs entries (like 'ls /bin').
     fn load_ramfs_listing(&mut self) -> bool {
         let mut entries = [RamfsListEntry::empty(); 32];
-        let count = userlib::syscall::ramfs_list(&mut entries);
+        let count = libsys::syscall::ramfs_list(&mut entries);
         if count < 0 {
             return false;
         }

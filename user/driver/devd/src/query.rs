@@ -1,15 +1,15 @@
 //! Query Handling Module
 //!
 //! Handles queries from clients and port registration from managed services.
-//! Implements the query protocol defined in `userlib::query`.
+//! Implements the query protocol defined in `libsys::query`.
 //!
 //! Managed services (spawned by devd) communicate via SuperQ (kernel supervision queue).
 //! Dynamic clients (connected via devd-query: port) use IPC channels.
 
-use userlib::ipc::Channel;
-use userlib::error::SysError;
-use userlib::supervision::SupervisionHandle;
-use userlib::query::{
+use libsys::ipc::Channel;
+use libsys::error::SysError;
+use libsys::supervision::SupervisionHandle;
+use libsys::query::{
     QueryHeader, ErrorResponse,
     PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
     SpawnChildContext, query_flags,
@@ -91,7 +91,7 @@ impl QueryClient {
     }
 
     /// Get the IPC handle for this client (Channel or SuperQ, both Mux-watchable).
-    pub fn handle(&self) -> Option<userlib::ipc::ObjHandle> {
+    pub fn handle(&self) -> Option<libsys::ipc::ObjHandle> {
         match &self.transport {
             ClientTransport::Channel(ch) => Some(ch.handle()),
             ClientTransport::Supervision { superq } => Some(superq.handle()),
@@ -172,7 +172,7 @@ impl QueryHandler {
     }
 
     /// Find client slot by channel handle (only matches channel-based clients)
-    pub fn find_by_handle(&self, handle: userlib::ipc::ObjHandle) -> Option<usize> {
+    pub fn find_by_handle(&self, handle: libsys::ipc::ObjHandle) -> Option<usize> {
         (0..MAX_QUERY_CLIENTS).find(|&i| {
             self.clients[i]
                 .as_ref()
@@ -257,7 +257,7 @@ impl QueryHandler {
         let resp = PortRegisterResponse::new(seq_id, result);
         if let Some(client) = self.get_mut(slot) {
             if client.send(&resp.to_bytes()).is_err() {
-                userlib::syscall::klog(userlib::syscall::LogLevel::Warn,
+                libsys::syscall::klog(libsys::syscall::LogLevel::Warn,
                     b"[devd] port_reg_resp send failed");
             }
         }
@@ -355,7 +355,7 @@ impl QueryHandler {
         let mut buf = [0u8; 512];
 
         let len = if let Some(context) = ctx {
-            let (filter, pattern) = userlib::query::PortFilter::exact(trigger_port);
+            let (filter, pattern) = libsys::query::PortFilter::exact(trigger_port);
             cmd.write_to_with_context(&mut buf, binary, &filter, pattern, context)?
         } else {
             cmd.write_to(&mut buf, binary, trigger_port)?
@@ -409,7 +409,7 @@ impl QueryHandler {
         let mut base = [0u8; 512];
 
         let base_len = if let Some(context) = ctx {
-            let (filter, pattern) = userlib::query::PortFilter::exact(trigger_port);
+            let (filter, pattern) = libsys::query::PortFilter::exact(trigger_port);
             cmd.write_to_with_context(&mut base, binary, &filter, pattern, context)?
         } else {
             cmd.write_to(&mut base, binary, trigger_port)?

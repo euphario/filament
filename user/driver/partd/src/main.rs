@@ -30,16 +30,16 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall;
-use userlib::uerror;
-use userlib::uinfo;
-use userlib::bus::{
+use libsys::syscall;
+use libsys::uerror;
+use libsys::uinfo;
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, BlockMetadata, PortInfo, PortClass, port_subclass, bus_msg,
     ConfigKey,
 };
-use userlib::bus_runtime::driver_main;
-use userlib::ring::io_status;
+use libsys::bus_runtime::driver_main;
+use libsys::ring::io_status;
 
 // =============================================================================
 // Constants
@@ -293,7 +293,7 @@ impl PartitionDriver {
         };
 
         // Collect pending SQ requests
-        let mut requests: [Option<userlib::ring::IoSqe>; 8] = [None; 8];
+        let mut requests: [Option<libsys::ring::IoSqe>; 8] = [None; 8];
         let mut req_count = 0;
 
         if let Some(port) = ctx.block_port(provider_id) {
@@ -311,15 +311,15 @@ impl PartitionDriver {
         for i in 0..req_count {
             if let Some(sqe) = requests[i].take() {
                 match sqe.opcode {
-                    userlib::ring::io_op::READ => {
+                    libsys::ring::io_op::READ => {
                         self.handle_ring_read(disk_idx, &sqe, ctx);
                     }
-                    userlib::ring::io_op::WRITE => {
+                    libsys::ring::io_op::WRITE => {
                         self.handle_ring_write(disk_idx, &sqe, ctx);
                     }
                     _ => {
                         if let Some(port) = ctx.block_port(provider_id) {
-                            port.complete_error(sqe.tag, userlib::ring::io_status::INVALID);
+                            port.complete_error(sqe.tag, libsys::ring::io_status::INVALID);
                             port.notify();
                         }
                     }
@@ -328,7 +328,7 @@ impl PartitionDriver {
         }
 
         // Process sidechannel queries
-        let mut queries: [Option<userlib::ring::SideEntry>; 4] = [None; 4];
+        let mut queries: [Option<libsys::ring::SideEntry>; 4] = [None; 4];
         let mut query_count = 0;
 
         if let Some(port) = ctx.block_port(provider_id) {
@@ -344,14 +344,14 @@ impl PartitionDriver {
 
         for i in 0..query_count {
             if let Some(entry) = queries[i].take() {
-                use userlib::ring::side_msg;
+                use libsys::ring::side_msg;
                 match entry.msg_type {
                     side_msg::QUERY_GEOMETRY => {
                         let disk = match &self.disks[disk_idx] {
                             Some(d) => d,
                             None => continue,
                         };
-                        let info = userlib::bus::BlockGeometry {
+                        let info = libsys::bus::BlockGeometry {
                             block_size: disk.block_size,
                             block_count: if disk.partition_count > 0 {
                                 disk.partitions[0].sector_count
@@ -380,7 +380,7 @@ impl PartitionDriver {
     /// Translates LBA, submits to consumer port, stores inflight entry.
     /// Completion arrives later via `process_completions()` when the consumer
     /// port fires a data_ready callback.
-    fn handle_ring_read(&mut self, disk_idx: usize, sqe: &userlib::ring::IoSqe, ctx: &mut dyn BusCtx) {
+    fn handle_ring_read(&mut self, disk_idx: usize, sqe: &libsys::ring::IoSqe, ctx: &mut dyn BusCtx) {
         let (provider_id, consumer_id, block_size, partition_count) = match &self.disks[disk_idx] {
             Some(d) => (
                 match d.provider_port { Some(id) => id, None => return },
@@ -482,7 +482,7 @@ impl PartitionDriver {
     }
 
     /// Handle a ring WRITE request — copy data to consumer pool, submit write.
-    fn handle_ring_write(&mut self, disk_idx: usize, sqe: &userlib::ring::IoSqe, ctx: &mut dyn BusCtx) {
+    fn handle_ring_write(&mut self, disk_idx: usize, sqe: &libsys::ring::IoSqe, ctx: &mut dyn BusCtx) {
         let (provider_id, consumer_id, block_size, partition_count) = match &self.disks[disk_idx] {
             Some(d) => (
                 match d.provider_port { Some(id) => id, None => return },
@@ -945,6 +945,63 @@ impl Driver for PartitionDriver {
             self.process_completions(disk_idx, ctx);
         }
     }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        PART_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        match key {
+            b"count" => {
+                let mut total = 0u32;
+                for disk in &self.disks {
+                    if let Some(d) = disk {
+                        total += d.partition_count as u32;
+                    }
+                }
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, total);
+                copy_to_buf(buf, 0, &tmp[..len])
+            }
+            b"table" => {
+                let mut pos = 0;
+                for disk in &self.disks {
+                    let Some(d) = disk else { continue };
+                    for i in 0..d.partition_count {
+                        let p = &d.partitions[i];
+                        if pos >= buf.len() { break; }
+                        if pos > 0 { pos = copy_to_buf(buf, pos, b" "); }
+                        let mut tmp = [0u8; 24];
+                        let len = format_u32(&mut tmp, p.index as u32);
+                        pos = copy_to_buf(buf, pos, &tmp[..len]);
+                        pos = copy_to_buf(buf, pos, b":");
+                        let suffix = mbr_type_to_suffix(p.partition_type);
+                        pos = copy_to_buf(buf, pos, suffix);
+                        pos = copy_to_buf(buf, pos, b"@");
+                        let len = format_u64(&mut tmp, p.start_lba);
+                        pos = copy_to_buf(buf, pos, &tmp[..len]);
+                        pos = copy_to_buf(buf, pos, b"+");
+                        let len = format_u64(&mut tmp, p.sector_count);
+                        pos = copy_to_buf(buf, pos, &tmp[..len]);
+                    }
+                }
+                pos
+            }
+            _ => 0,
+        }
+    }
+}
+
+const PART_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_only(b"count"),
+    ConfigKey::read_only(b"table"),
+];
+
+fn copy_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
+    let end = (pos + src.len()).min(buf.len());
+    let n = end - pos;
+    buf[pos..end].copy_from_slice(&src[..n]);
+    end
 }
 
 // =============================================================================
@@ -956,88 +1013,7 @@ static mut DRIVER: PartitionDriver = PartitionDriver::new();
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"partd", PartitionDriverWrapper(driver));
-}
-
-/// Wrapper to pass &'static mut PartitionDriver to driver_main
-struct PartitionDriverWrapper(&'static mut PartitionDriver);
-
-const PART_CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey::read_only(b"count"),
-    ConfigKey::read_only(b"table"),
-];
-
-impl PartitionDriverWrapper {
-    fn copy_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
-        let end = (pos + src.len()).min(buf.len());
-        let n = end - pos;
-        buf[pos..end].copy_from_slice(&src[..n]);
-        end
-    }
-}
-
-impl Driver for PartitionDriverWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
-
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
-
-    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        self.0.data_ready(port, ctx)
-    }
-
-    fn config_keys(&self) -> &[ConfigKey] {
-        PART_CONFIG_KEYS
-    }
-
-    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
-        let drv = &self.0;
-        match key {
-            b"count" => {
-                // Total partition count across all disks
-                let mut total = 0u32;
-                for disk in &drv.disks {
-                    if let Some(d) = disk {
-                        total += d.partition_count as u32;
-                    }
-                }
-                let mut tmp = [0u8; 16];
-                let len = format_u32(&mut tmp, total);
-                Self::copy_to_buf(buf, 0, &tmp[..len])
-            }
-            b"table" => {
-                // Compact: "0:fat@2048+131072 1:ext2@200000+50000"
-                let mut pos = 0;
-                for disk in &drv.disks {
-                    let Some(d) = disk else { continue };
-                    for i in 0..d.partition_count {
-                        let p = &d.partitions[i];
-                        if pos >= buf.len() { break; }
-                        if pos > 0 { pos = Self::copy_to_buf(buf, pos, b" "); }
-                        // index:type
-                        let mut tmp = [0u8; 24];
-                        let len = format_u32(&mut tmp, p.index as u32);
-                        pos = Self::copy_to_buf(buf, pos, &tmp[..len]);
-                        pos = Self::copy_to_buf(buf, pos, b":");
-                        let suffix = mbr_type_to_suffix(p.partition_type);
-                        pos = Self::copy_to_buf(buf, pos, suffix);
-                        // @start_lba+sectors
-                        pos = Self::copy_to_buf(buf, pos, b"@");
-                        let len = format_u64(&mut tmp, p.start_lba);
-                        pos = Self::copy_to_buf(buf, pos, &tmp[..len]);
-                        pos = Self::copy_to_buf(buf, pos, b"+");
-                        let len = format_u64(&mut tmp, p.sector_count);
-                        pos = Self::copy_to_buf(buf, pos, &tmp[..len]);
-                    }
-                }
-                pos
-            }
-            _ => 0,
-        }
-    }
+    driver_main(b"partd", driver);
 }
 
 // =============================================================================

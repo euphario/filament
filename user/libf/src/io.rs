@@ -4,13 +4,13 @@
 //! signatures as `std::io`. The [`Error`] type wraps [`SysError`] into
 //! std-compatible [`ErrorKind`] variants.
 //!
-//! [`SysError`]: userlib::error::SysError
+//! [`SysError`]: libsys::error::SysError
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 use core::fmt;
-use userlib::error::SysError;
+use libsys::error::SysError;
 
 // ============================================================================
 // Error types
@@ -228,16 +228,16 @@ pub trait BufRead: Read {
 }
 
 // ============================================================================
-// Impls on userlib types
+// Impls on libsys types
 // ============================================================================
 
-impl Read for userlib::ipc::Channel {
+impl Read for libsys::ipc::Channel {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.recv(buf).map_err(Error::from)
     }
 }
 
-impl Write for userlib::ipc::Channel {
+impl Write for libsys::ipc::Channel {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         self.send(buf).map(|()| buf.len()).map_err(Error::from)
     }

@@ -230,10 +230,17 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "hmac",
+ "libsys",
  "poly1305",
  "sha1",
  "sha2",
- "userlib",
+]
+
+[[package]]
+name = "libsys"
+version = "0.1.0"
+dependencies = [
+ "abi",
 ]
 
 [[package]]
@@ -403,13 +410,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "userlib"
-version = "0.1.0"
-dependencies = [
- "abi",
-]
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -420,7 +420,7 @@ name = "wifi2"
 version = "0.1.0"
 dependencies = [
  "libf",
- "userlib",
+ "libsys",
  "wifi80211",
 ]
 

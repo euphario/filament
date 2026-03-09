@@ -7,5 +7,5 @@ edition = "2024"
 path = "src/lib.rs"
 
 [dependencies]
-userlib = { path = "../../userlib" }
+libsys = { path = "../../libsys" }
 pcie = { path = "../pcie" }

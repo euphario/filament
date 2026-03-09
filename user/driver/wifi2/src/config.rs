@@ -4,7 +4,7 @@
 
 use core::fmt::Write;
 use libf::fmt::BufWriter;
-use userlib::bus::ConfigKey;
+use libsys::bus::ConfigKey;
 
 use crate::DriverState;
 

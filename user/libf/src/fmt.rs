@@ -36,22 +36,6 @@ impl StackStr {
         s
     }
 
-    /// Format a u32 as hex with `0x` prefix.
-    pub fn from_hex32(val: u32) -> Self {
-        let mut s = Self::new();
-        let n = format_hex32_into(&mut s.buf, val);
-        s.len = n as u8;
-        s
-    }
-
-    /// Format a u64 as hex with `0x` prefix.
-    pub fn from_hex64(val: u64) -> Self {
-        let mut s = Self::new();
-        let n = format_hex64_into(&mut s.buf, val);
-        s.len = n as u8;
-        s
-    }
-
     /// The formatted bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
@@ -137,32 +121,6 @@ pub fn format_u64_into(buf: &mut [u8], val: u64) -> usize {
     len
 }
 
-/// Format a u32 as hex with `0x` prefix, minimal digits. Returns bytes written.
-pub fn format_hex32_into(buf: &mut [u8], val: u32) -> usize {
-    if buf.len() < 3 {
-        return 0;
-    }
-    buf[0] = b'0';
-    buf[1] = b'x';
-    if val == 0 {
-        buf[2] = b'0';
-        return 3;
-    }
-    // Find first non-zero nibble
-    let mut started = false;
-    let mut pos = 2;
-    for i in (0..8).rev() {
-        let nibble = ((val >> (i * 4)) & 0xF) as u8;
-        if nibble != 0 {
-            started = true;
-        }
-        if started && pos < buf.len() {
-            buf[pos] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            pos += 1;
-        }
-    }
-    pos
-}
 
 /// A `core::fmt::Write` wrapper for `&mut [u8]` buffers.
 ///
@@ -216,6 +174,20 @@ impl<'a> BufWriter<'a> {
         }
     }
 
+    /// Write u32 as decimal.
+    pub fn u32(&mut self, val: u32) {
+        let mut tmp = [0u8; 10];
+        let n = format_u32_into(&mut tmp, val);
+        self.put(&tmp[..n]);
+    }
+
+    /// Write u64 as decimal.
+    pub fn u64(&mut self, val: u64) {
+        let mut tmp = [0u8; 20];
+        let n = format_u64_into(&mut tmp, val);
+        self.put(&tmp[..n]);
+    }
+
     /// Bytes written so far.
     pub fn len(&self) -> usize {
         self.pos
@@ -234,28 +206,3 @@ impl fmt::Write for BufWriter<'_> {
     }
 }
 
-/// Format a u64 as hex with `0x` prefix, minimal digits. Returns bytes written.
-pub fn format_hex64_into(buf: &mut [u8], val: u64) -> usize {
-    if buf.len() < 3 {
-        return 0;
-    }
-    buf[0] = b'0';
-    buf[1] = b'x';
-    if val == 0 {
-        buf[2] = b'0';
-        return 3;
-    }
-    let mut started = false;
-    let mut pos = 2;
-    for i in (0..16).rev() {
-        let nibble = ((val >> (i * 4)) & 0xF) as u8;
-        if nibble != 0 {
-            started = true;
-        }
-        if started && pos < buf.len() {
-            buf[pos] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            pos += 1;
-        }
-    }
-    pos
-}

@@ -4,8 +4,8 @@
 //!   mount              - List all registered mounts
 
 use crate::println;
-use userlib::ipc::{Channel, Timer, Mux, MuxFilter};
-use userlib::query::{QueryHeader, MountsListResponse, MountListEntry, mount_transport, msg};
+use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
+use libsys::query::{QueryHeader, MountsListResponse, MountListEntry, mount_transport, msg};
 use crate::output::CommandResult;
 
 pub fn run(_args: &[u8]) -> CommandResult {

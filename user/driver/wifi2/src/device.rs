@@ -3,7 +3,7 @@
 //! Provides all register access methods for the MT7996 via BAR0.
 //! Other modules take `&Mt76Device` to read/write registers.
 
-use userlib::{uinfo, uerror};
+use libsys::{uinfo, uerror};
 use crate::regs::*;
 
 /// Error type for device operations.
@@ -162,7 +162,7 @@ impl Mt76Device {
         if (val & mask) == expected { return Ok(val); }
 
         for _ in 0..timeout_ms.max(1) {
-            userlib::delay_ms(1);
+            libsys::delay_ms(1);
             let val = self.rr(reg);
             if (val & mask) == expected { return Ok(val); }
         }
@@ -303,9 +303,9 @@ impl Mt76Device {
     /// Source: init.c
     pub fn wfsys_reset(&self) {
         self.set_remap(MT_WF_SUBSYS_RST, 0x1);
-        userlib::delay_ms(20);
+        libsys::delay_ms(20);
         self.clear_remap(MT_WF_SUBSYS_RST, 0x1);
-        userlib::delay_ms(20);
+        libsys::delay_ms(20);
     }
 
     /// Claim driver ownership from firmware for a band.

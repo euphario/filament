@@ -7,8 +7,8 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall;
-use userlib::ipc::{Mux, Process, Timer, MuxFilter};
+use libsys::syscall;
+use libsys::ipc::{Mux, Process, Timer, MuxFilter};
 
 /// Test binary names (must exist in initrd)
 static TESTS: &[&str] = &[

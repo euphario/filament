@@ -458,7 +458,7 @@ impl HandshakeCtx {
         let pmk = pbkdf2_sha1(passphrase, ssid);
 
         // Generate GTK: SHA-256(time || bssid || "GTK"), take first 16 bytes
-        let time_ns = userlib::syscall::gettime();
+        let time_ns = libsys::syscall::gettime();
         let mut gtk_seed = [0u8; 46]; // 8 + 6 + 32 max label
         gtk_seed[..8].copy_from_slice(&time_ns.to_le_bytes());
         gtk_seed[8..14].copy_from_slice(bssid);
@@ -487,7 +487,7 @@ impl HandshakeCtx {
     /// but sufficient for nonce uniqueness (no getrandom syscall available).
     pub fn generate_anonce(&mut self) -> [u8; 32] {
         self.nonce_counter = self.nonce_counter.wrapping_add(1);
-        let time_ns = userlib::syscall::gettime();
+        let time_ns = libsys::syscall::gettime();
         let mut seed = [0u8; 18]; // 8 + 6 + 4
         seed[..8].copy_from_slice(&time_ns.to_le_bytes());
         seed[8..14].copy_from_slice(&self.bssid);

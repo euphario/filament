@@ -48,8 +48,8 @@ pub use controller::{PcieController, PcieError, PcieDevice, PcieDeviceList};
 pub use client::{PcieClient, PcieDeviceInfo, DeviceList};
 pub use msi::{MsiController, MsiAssignment, MsiEvent};
 
-// Re-export MmioRegion from userlib for use by submodules
-pub use userlib::MmioRegion;
+// Re-export MmioRegion from libsys for use by submodules
+pub use libsys::MmioRegion;
 
-// Re-export delay_ms from userlib (timer-based, more accurate)
-pub use userlib::delay_ms;
+// Re-export delay_ms from libsys (timer-based, more accurate)
+pub use libsys::delay_ms;

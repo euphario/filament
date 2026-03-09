@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-userlib = { path = "../../userlib" }
+libsys = { path = "../../libsys" }
 wifi80211 = { path = "../../lib/wifi80211" }
 libf = { path = "../../libf" }
 

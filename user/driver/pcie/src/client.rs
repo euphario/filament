@@ -8,8 +8,8 @@
 //! - Query: vendor_id (2), device_id (2), class_mask (3)
 //! - Response: count, then for each device: port, bdf, ids, bar0_addr, bar0_size
 
-use userlib::ipc::Channel;
-use userlib::syscall;
+use libsys::ipc::Channel;
+use libsys::syscall;
 
 /// Maximum devices in a query response
 pub const MAX_DEVICES: usize = 16;

@@ -5,7 +5,7 @@
 
 use crate::types::{EthAddr, Ipv4Addr};
 use crate::arp::ArpTable;
-use userlib::bus::PortId;
+use libsys::bus::PortId;
 
 /// Maximum number of attached NICs.
 pub const MAX_NICS: usize = 4;

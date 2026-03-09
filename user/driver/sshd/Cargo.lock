@@ -230,10 +230,17 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "hmac",
+ "libsys",
  "poly1305",
  "sha1",
  "sha2",
- "userlib",
+]
+
+[[package]]
+name = "libsys"
+version = "0.1.0"
+dependencies = [
+ "abi",
 ]
 
 [[package]]
@@ -368,7 +375,7 @@ name = "sshd"
 version = "0.1.0"
 dependencies = [
  "libf",
- "userlib",
+ "libsys",
 ]
 
 [[package]]
@@ -408,13 +415,6 @@ checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
 dependencies = [
  "crypto-common",
  "subtle",
-]
-
-[[package]]
-name = "userlib"
-version = "0.1.0"
-dependencies = [
- "abi",
 ]
 
 [[package]]

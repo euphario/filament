@@ -7,9 +7,9 @@
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
-use userlib::bus::BlockTransport;
-use userlib::ring::{IoSqe, IoCqe, io_op, io_status};
-use userlib::udebug;
+use libsys::bus::BlockTransport;
+use libsys::ring::{IoSqe, IoCqe, io_op, io_status};
+use libsys::udebug;
 
 /// Ethernet header: dst(6) + src(6) + ethertype(2).
 const ETH_HEADER_LEN: usize = 14;

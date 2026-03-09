@@ -21,10 +21,10 @@
 extern crate abi;
 
 use abi::{PortInfo, PortClass, port_subclass};
-use userlib::{uinfo, unotice, udebug, uerror};
-use userlib::mmio::MmioRegion;
-use userlib::bus::{Driver, BusCtx, BusMsg, Disposition, ConfigKey};
-use userlib::bus_runtime::driver_main;
+use libsys::{uinfo, unotice, udebug, uerror};
+use libsys::mmio::MmioRegion;
+use libsys::bus::{Driver, BusCtx, BusMsg, Disposition, ConfigKey};
+use libsys::bus_runtime::driver_main;
 
 // =============================================================================
 // MT7531 Switch Registers
@@ -182,7 +182,7 @@ impl SwitchDriver {
             if val & VTCR_BUSY == 0 {
                 return (val & VTCR_INVALID) == 0;
             }
-            userlib::mmio::delay_us(10);
+            libsys::mmio::delay_us(10);
         }
         false
     }
@@ -241,7 +241,7 @@ impl SwitchDriver {
             if val & ATC_BUSY == 0 {
                 return true;
             }
-            userlib::mmio::delay_us(10);
+            libsys::mmio::delay_us(10);
         }
         false
     }
@@ -477,7 +477,7 @@ const SWITCH_CONFIG_KEYS: &[ConfigKey] = &[
 // =============================================================================
 
 impl Driver for SwitchDriver {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), userlib::bus::BusError> {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), libsys::bus::BusError> {
         udebug!("switchd", "init_start";);
 
         // Map switch MMIO region
@@ -488,7 +488,7 @@ impl Driver for SwitchDriver {
             }
             None => {
                 uerror!("switchd", "mmio_map_failed";);
-                return Err(userlib::bus::BusError::SpawnFailed);
+                return Err(libsys::bus::BusError::SpawnFailed);
             }
         }
 

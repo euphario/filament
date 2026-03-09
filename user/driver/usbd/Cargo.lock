@@ -7,23 +7,23 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
+name = "libsys"
+version = "0.1.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "usb"
 version = "0.1.0"
 dependencies = [
- "userlib",
+ "libsys",
 ]
 
 [[package]]
 name = "usbd"
 version = "0.1.0"
 dependencies = [
+ "libsys",
  "usb",
- "userlib",
-]
-
-[[package]]
-name = "userlib"
-version = "0.1.0"
-dependencies = [
- "abi",
 ]

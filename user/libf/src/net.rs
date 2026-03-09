@@ -24,9 +24,9 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use crate::io;
-use userlib::data_port::DataPort;
-use userlib::ipc::Channel;
-use userlib::ring::{io_op, io_status, IoCqe, IoSqe};
+use libsys::data_port::DataPort;
+use libsys::ipc::Channel;
+use libsys::ring::{io_op, io_status, IoCqe, IoSqe};
 
 // =============================================================================
 // Ethernet — link-layer types shared across drivers
@@ -300,7 +300,7 @@ impl TcpListener {
     }
 
     /// Returns the raw handle of the control channel (for Mux watching).
-    pub fn control_handle(&self) -> userlib::syscall::Handle {
+    pub fn control_handle(&self) -> libsys::syscall::Handle {
         self.control.handle()
     }
 
@@ -365,7 +365,7 @@ impl TcpStream {
     ///
     /// Returns the DataPort's underlying shmem (or doorbell) handle.
     /// When ipd posts a CQE, this handle becomes readable.
-    pub fn poll_handle(&self) -> userlib::syscall::Handle {
+    pub fn poll_handle(&self) -> libsys::syscall::Handle {
         self.data_port.mux_handle()
     }
 
@@ -605,8 +605,8 @@ impl io::Write for TcpStream {
         };
         if !self.data_port.submit(&sqe) {
             // SQ ring full — data lost! Log this.
-            userlib::uerror!("net", "sq_full"; data_len = len);
-            userlib::ulog::flush();
+            libsys::uerror!("net", "sq_full"; data_len = len);
+            libsys::ulog::flush();
             self.data_port.free(offset);
             return Err(io::Error::new(io::ErrorKind::WouldBlock));
         }

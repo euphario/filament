@@ -8,7 +8,7 @@
 //!   dmesg -m pcie          — only records from "pcie" subsystem
 //!   dmesg -l debug -m usb  — combined filter
 
-use userlib::syscall;
+use libsys::syscall;
 
 /// Run the dmesg command
 pub fn run(args: &[u8]) {

@@ -98,12 +98,12 @@ dump_begin!("dma", "reg_dump"; dev = bdf, count = 10);
 dump_end!("dma", "reg_dump"; dev = bdf);
 ```
 
-### Userspace (userlib/src/ulog.rs)
+### Userspace (libsys/src/ulog.rs)
 
 Identical API, different backend (syscall to drain buffer).
 
 ```rust
-use userlib::log::{log, info, warn, error, debug, trace};
+use libsys::log::{log, info, warn, error, debug, trace};
 
 info!("mt7996", "init_start"; version = "1.0");
 error!("mt7996", [dev = bdf], "fw_timeout"; queue = "WM", cpu_idx = 5, dma_idx = 0);
@@ -282,7 +282,7 @@ error!("cfg_read_failed"; op = "pcie_config", err = "timeout", next = "retry");
 
 ### Phase 1: Core Framework
 1. Implement `src/klog.rs` with ring buffer and macros
-2. Implement `user/userlib/src/ulog.rs` (same macros, syscall drain)
+2. Implement `user/libsys/src/ulog.rs` (same macros, syscall drain)
 3. Keep old `println!` working (maps to `info!("legacy", "print"; msg = ...)`)
 
 ### Phase 2: Adopt in Key Paths
@@ -324,7 +324,7 @@ After migration:
 src/
   klog.rs              # Kernel logging (ring buffer, macros, drain)
 
-user/userlib/src/
+user/libsys/src/
   ulog.rs              # Userspace logging (same API, syscall drain)
 
 docs/

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-userlib = { path = "../../userlib" }
+libsys = { path = "../../libsys" }
 
 [profile.release]
 opt-level = "s"

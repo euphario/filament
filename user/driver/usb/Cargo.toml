@@ -16,4 +16,4 @@ block-client = []
 usbd = ["mt7988a", "block-client"]
 
 [dependencies]
-userlib = { path = "../../userlib" }
+libsys = { path = "../../libsys" }

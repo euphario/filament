@@ -7,7 +7,7 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall;
+use libsys::syscall;
 
 fn log(msg: &[u8]) {
     syscall::debug_write(msg);

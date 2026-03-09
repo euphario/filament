@@ -4,7 +4,7 @@
 //! MT7996 WFDMA engine. Uses Linux head/tail/queued model to avoid
 //! wrap-boundary ambiguity.
 
-use userlib::uwarn;
+use libsys::uwarn;
 use crate::regs::*;
 use crate::device::Mt76Device;
 

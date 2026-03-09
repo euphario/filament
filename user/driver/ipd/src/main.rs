@@ -34,19 +34,19 @@ use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
-use userlib::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, PortId, ConfigKey, bus_msg};
-use userlib::bus_runtime::driver_main;
-use userlib::ipc::Timer;
-use userlib::ring::{SideEntry, side_msg, side_status};
-use userlib::syscall::Handle;
-use userlib::{uinfo, udebug, uerror};
+use libsys::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, PortId, ConfigKey, bus_msg};
+use libsys::bus_runtime::driver_main;
+use libsys::ipc::Timer;
+use libsys::ring::{SideEntry, side_msg, side_status};
+use libsys::syscall::Handle;
+use libsys::{uinfo, udebug, uerror};
 
 use device::{RxOffsetQueue, SmolDevice, TxTracker, DataPathStats};
 use rsh::RemoteShell;
 use dhcp_server::DhcpServer;
 use socket_svc::SocketService;
 use tftp::TftpServer;
-use userlib::vfs_client::VfsClient;
+use libsys::vfs_client::VfsClient;
 
 // =============================================================================
 // Constants
@@ -504,7 +504,7 @@ impl IpdDriver {
     // =========================================================================
 
     fn smoltcp_now() -> Instant {
-        let ns = userlib::syscall::gettime();
+        let ns = libsys::syscall::gettime();
         Instant::from_millis((ns / 1_000_000) as i64)
     }
 
@@ -671,7 +671,7 @@ impl IpdDriver {
     /// TX completions free the consumer pool slot. RX CQEs are buffered.
     /// Returns the number of RX CQEs peeked (for later ack).
     fn drain_rx(&mut self, ctx: &mut dyn BusCtx) -> u32 {
-        use userlib::ring::io_status::CQE_FLAG_TX_DONE;
+        use libsys::ring::io_status::CQE_FLAG_TX_DONE;
 
         let port_id = self.nic_port;
         let mut rx_count = 0u32;
@@ -1376,7 +1376,7 @@ fn contains_header_end(data: &[u8]) -> bool {
 
 /// Build an HTTP/1.0 response with system status page.
 fn build_http_response(_request: &[u8], out: &mut [u8], ip: [u8; 4], ip_source: &str) -> usize {
-    let uptime_ns = userlib::syscall::gettime();
+    let uptime_ns = libsys::syscall::gettime();
     let uptime_s = uptime_ns / 1_000_000_000;
 
     // Build body
@@ -1398,8 +1398,8 @@ fn build_http_response(_request: &[u8], out: &mut [u8], ip: [u8; 4], ip_source: 
     bpos += copy_str(&mut body[bpos..], "UDP:    port 69 (tftp)\n");
 
     // Ramfs listing
-    let mut entries = [userlib::syscall::RamfsListEntry::empty(); 32];
-    let count = userlib::syscall::ramfs_list(&mut entries);
+    let mut entries = [libsys::syscall::RamfsListEntry::empty(); 32];
+    let count = libsys::syscall::ramfs_list(&mut entries);
     if count > 0 {
         bpos += copy_str(&mut body[bpos..], "\nRamfs (/bin):\n");
         for i in 0..count as usize {
@@ -1640,21 +1640,19 @@ impl Driver for IpdDriver {
             _ => {}
         }
     }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        IPD_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        self.ipd_config_get(key, buf)
+    }
+
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
+        self.ipd_config_set(key, value, buf, ctx)
+    }
 }
-
-// =============================================================================
-// Main
-// =============================================================================
-
-static mut DRIVER: IpdDriver = IpdDriver::new();
-
-#[unsafe(no_mangle)]
-fn main() {
-    let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"ipd", IpdDriverWrapper(driver));
-}
-
-struct IpdDriverWrapper(&'static mut IpdDriver);
 
 const IPD_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_write(b"ip"),
@@ -1667,32 +1665,14 @@ const IPD_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_only(b"diag.rx"),
 ];
 
-impl Driver for IpdDriverWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
+// =============================================================================
+// Main
+// =============================================================================
 
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
+static mut DRIVER: IpdDriver = IpdDriver::new();
 
-    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        self.0.data_ready(port, ctx)
-    }
-
-    fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
-        self.0.handle_event(tag, handle, ctx)
-    }
-
-    fn config_keys(&self) -> &[ConfigKey] {
-        IPD_CONFIG_KEYS
-    }
-
-    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
-        self.0.ipd_config_get(key, buf)
-    }
-
-    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
-        self.0.ipd_config_set(key, value, buf, ctx)
-    }
+#[unsafe(no_mangle)]
+fn main() {
+    let driver = unsafe { &mut *(&raw mut DRIVER) };
+    driver_main(b"ipd", driver);
 }

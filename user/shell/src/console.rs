@@ -12,8 +12,8 @@
 //! | 70     | 2    | rows (u16 LE)                   |
 
 use libf::sync::SharedPipe;
-use userlib::syscall;
-use userlib::Handle;
+use libsys::syscall;
+use libsys::Handle;
 
 /// Console I/O state
 pub struct Console {
@@ -167,16 +167,16 @@ impl Console {
 
         let writable_before = pipe.writable();
         if data.len() > writable_before {
-            userlib::udebug!("shell", "pipe_write_backpressure"; len = data.len(), writable = writable_before, capacity = pipe.outgoing().capacity());
-            userlib::ulog::flush();
+            libsys::udebug!("shell", "pipe_write_backpressure"; len = data.len(), writable = writable_before, capacity = pipe.outgoing().capacity());
+            libsys::ulog::flush();
         }
 
         // SharedPipe::push_all handles the write loop with backpressure.
         pipe.push_all(data);
 
         if data.len() > writable_before {
-            userlib::udebug!("shell", "pipe_write_resumed"; len = data.len());
-            userlib::ulog::flush();
+            libsys::udebug!("shell", "pipe_write_resumed"; len = data.len());
+            libsys::ulog::flush();
         }
     }
 

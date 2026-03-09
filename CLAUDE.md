@@ -113,7 +113,7 @@ pub enum WakeReason { Readable, Writable, Closed, Accepted, Timeout }
 
 ### 7. Bus Framework Is The Only Way To Write Drivers
 
-All userspace drivers use the bus framework (`userlib/src/bus.rs`). No exceptions.
+All userspace drivers use the bus framework (`libsys/src/bus.rs`). No exceptions.
 
 ```rust
 struct MyDriver { /* domain state */ }
@@ -256,7 +256,7 @@ bpi-r4-kernel/
 │   ├── arch/aarch64/       # ARM64-specific code
 │   └── platform/mt7988/    # MT7988A SoC code
 ├── user/
-│   ├── userlib/            # Kernel interface (raw syscalls, IPC, bus)
+│   ├── libsys/            # Kernel interface (raw syscalls, IPC, bus)
 │   ├── libf/               # Standard library (fmt, str, parse — mirrors std)
 │   ├── shell/              # Shell program
 │   └── driver/
@@ -452,8 +452,8 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 ### Driver Stack Migration (COMPLETE)
 See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for architecture.
 
-- `userlib/src/ring.rs` - Ring protocol with IoSqe/IoCqe/SideEntry
-- `userlib/src/data_port.rs` - DataPort API with Layer trait
+- `libsys/src/ring.rs` - Ring protocol with IoSqe/IoCqe/SideEntry
+- `libsys/src/data_port.rs` - DataPort API with Layer trait
 - `devd/src/ports.rs` - Port hierarchy with parent/child
 - `devd/src/rules.rs` - Auto-spawn rules for port events
 - Consumer block ports registered with Mux for event-driven callbacks
@@ -461,7 +461,7 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
 - fatfsd uses kernel-backed `wait()` instead of `sleep_us()` polling
 
 ### IPC Migration (COMPLETE)
-- Unified `userlib::ipc` module (Channel, Port, Timer, Mux, EventLoop) used by all userspace
+- Unified `libsys::ipc` module (Channel, Port, Timer, Mux, EventLoop) used by all userspace
 - Legacy Service framework removed; devd, consoled, shell all use `ipc` directly
 - Legacy syscalls (6-17, 28-30, 80+) removed from kernel enum, return Invalid
 - IPC cohesion fixes applied: sidechannel doorbell, send_down() deadline enforcement
@@ -490,7 +490,7 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
   - `libf::fmt` — StackStr (64-byte stack buffer with Display/Write), format_u32/u64/hex_into
   - `libf::str` — trim, eq_ignore_ascii_case, starts_with/contains_ignore_case, split_once, split_whitespace
   - `libf::parse` — parse_u32/u64 (decimal, overflow-checked), parse_hex_u32/u64
-  - `libf::prelude` — re-exports alloc types + common libf/userlib symbols
+  - `libf::prelude` — re-exports alloc types + common libf/libsys symbols
   - Shell integrated: replaced duplicated functions in main.rs, output.rs, handle.rs, ls.rs, logs.rs
   - Shell ELF size unchanged (95.7K)
 - **libf::io module** (`user/libf/src/io.rs`)
@@ -635,7 +635,7 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
   - Unified syscall interface
   - No tech debt policy
   - Subscriber-based waking
-- **New userlib ipc2 module** (`user/userlib/src/ipc2.rs`)
+- **New libsys ipc2 module** (`user/libsys/src/ipc2.rs`)
   - `Channel` - Bidirectional IPC with explicit state machine
   - `Port` - Named service endpoint with Listening/Closed states
   - `Timer` - Deadline-based timer with Armed/Disarmed/Fired states
@@ -736,7 +736,7 @@ See [docs/decisions/ADR.md](docs/decisions/ADR.md) for architecture decisions.
 | `src/platform/mt7988/sd.rs:307` | CSD capacity hardcoded 512MB | Parse from register |
 | `src/kernel/elf.rs:167` | Signature verification stub | Always passes, ready for crypto |
 | `user/driver/usbd/src/main.rs:4739` | SCSI WRITE(10) not impl | Read works |
-| `user/userlib/src/byte_ring.rs:45` | No futex notification | Optimization |
+| `user/libsys/src/byte_ring.rs:45` | No futex notification | Optimization |
 
 ### Logging Migration Status
 

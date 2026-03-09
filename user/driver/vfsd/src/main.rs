@@ -24,15 +24,15 @@
 #![no_std]
 #![no_main]
 
-use userlib::bus::{
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, bus_msg,
     PortInfo, PortClass, port_subclass,
 };
-use userlib::bus_runtime::driver_main;
-use userlib::ring::side_msg;
-use userlib::vfs_proto::{MountTable, MountEntry};
-use userlib::{uinfo, uerror};
+use libsys::bus_runtime::driver_main;
+use libsys::ring::side_msg;
+use libsys::vfs_proto::{MountTable, MountEntry};
+use libsys::{uinfo, uerror};
 
 const MAX_MOUNTS: usize = MountTable::MAX_MOUNTS;
 
@@ -294,23 +294,7 @@ static mut DRIVER: VfsDriver = VfsDriver::new();
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"vfsd", VfsDriverWrapper(driver));
-}
-
-struct VfsDriverWrapper(&'static mut VfsDriver);
-
-impl Driver for VfsDriverWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
-
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
-
-    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        self.0.data_ready(port, ctx)
-    }
+    driver_main(b"vfsd", driver);
 }
 
 // =============================================================================

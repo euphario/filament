@@ -260,9 +260,9 @@ pub static RULES: &[Rule] = &[
 | Component | File | Status |
 |-----------|------|--------|
 | Port hierarchy | `devd/src/ports.rs` | Complete |
-| Ring protocol | `userlib/src/ring.rs` | Complete |
-| DataPort API | `userlib/src/data_port.rs` | Complete |
-| Layer trait | `userlib/src/data_port.rs` | Complete |
+| Ring protocol | `libsys/src/ring.rs` | Complete |
+| DataPort API | `libsys/src/data_port.rs` | Complete |
+| Layer trait | `libsys/src/data_port.rs` | Complete |
 | devd rules | `devd/src/rules.rs` | Complete |
 | **usbd conversion** | `usbd/src/main.rs` | **TODO** |
 | **partition conversion** | `partition/src/main.rs` | **TODO** |

@@ -9,7 +9,7 @@
 //! Note: The devd protocol is being rewritten. Some commands may not work.
 
 use crate::println;
-use userlib::ipc::{Channel, Timer, Mux, MuxFilter};
+use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
 use crate::output::CommandResult;
 
 /// Main entry point for devd builtin

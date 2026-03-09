@@ -269,7 +269,7 @@ devd is the single source of truth for all device and driver state:
 ### Files
 
 - `user/driver/devd/src/main.rs` - Device manager (single source of truth)
-- `user/userlib/src/ipc/protocols/devd.rs` - DevdProtocol for registration/queries
+- `user/libsys/src/ipc/protocols/devd.rs` - DevdProtocol for registration/queries
 - `user/driver/pcied/src/main.rs` - Reports devices to devd
 
 ---
@@ -333,8 +333,8 @@ if !conn.client_has_capability(syscall::caps::MMIO) {
 ### Files
 
 - `src/kernel/syscall.rs` - GetCapabilities, ChannelGetPeer syscalls
-- `user/userlib/src/syscall.rs` - Capability constants and helpers
-- `user/userlib/src/ipc/server.rs` - Connection capability checking methods
+- `user/libsys/src/syscall.rs` - Capability constants and helpers
+- `user/libsys/src/ipc/server.rs` - Connection capability checking methods
 - `user/driver/pcied/src/main.rs` - Example capability checks
 
 ---
@@ -399,7 +399,7 @@ loop {
 ### Files
 
 - `src/kernel/event.rs` - Event system implementation
-- `user/userlib/src/syscall.rs` - Event types and syscall wrappers
+- `user/libsys/src/syscall.rs` - Event types and syscall wrappers
 - `user/driver/consoled/src/main.rs` - Example event-driven daemon
 
 ---

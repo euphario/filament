@@ -3,8 +3,8 @@
 //! Provides McuTxd/UniTxd packet encoding, IRQ-based command waiting,
 //! and named command functions for firmware/radio initialization.
 
-use userlib::{uerror, udebug, ulog};
-use userlib::ipc::{Irq, Mux, MuxFilter};
+use libsys::{uerror, udebug, ulog};
+use libsys::ipc::{Irq, Mux, MuxFilter};
 use crate::regs::*;
 use crate::device::{Mt76Device, DeviceError};
 use crate::dma::TxRing;
@@ -346,7 +346,7 @@ fn wait_tx_done(
         if ctrl & MT_DMA_CTL_DMA_DONE != 0 {
             return Ok(());
         }
-        userlib::delay_ms(1);
+        libsys::delay_ms(1);
     }
 
     uerror!("mcu", "tx_timeout"; cmd = cmd_name);
@@ -422,9 +422,9 @@ fn wait_rx_response(
         if let Some(ref mut fw_irq) = irq {
             let _ = fw_irq.wait();
             fw_irq.ack();
-            userlib::delay_ms(1);
+            libsys::delay_ms(1);
         } else {
-            userlib::delay_ms(1);
+            libsys::delay_ms(1);
         }
     }
 
@@ -518,7 +518,7 @@ pub fn send_fw_chunk(
     if next == dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX) {
         for _ in 0..100u32 {
             if next != dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX) { break; }
-            userlib::delay_ms(1);
+            libsys::delay_ms(1);
         }
         if next == dev.rr(ring.regs_base + MT_QUEUE_DMA_IDX) {
             uerror!("mcu", "fw_chunk_ring_full");
@@ -584,7 +584,7 @@ fn wait_rx_wm(
             if dev.rr(MCU_WM_RX_REGS + MT_QUEUE_DMA_IDX) != pre_dma_idx {
                 return Ok(());
             }
-            userlib::delay_ms(1);
+            libsys::delay_ms(1);
         }
     }
 
@@ -662,7 +662,7 @@ pub fn set_mwds(
     let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 2000, "mwds")?;
     // WA EXT commands need settling time — Linux mcu.c:3265
-    userlib::delay_ms(10);
+    libsys::delay_ms(10);
     Ok(())
 }
 
@@ -708,7 +708,7 @@ pub fn wa_cmd(
     let prev = ring.last_submitted();
     wait_tx_done(dev, ring, prev, 2000, "wa_cmd")?;
     // WA needs settling time before next command — Linux mcu.c:375
-    userlib::delay_ms(10);
+    libsys::delay_ms(10);
     Ok(())
 }
 

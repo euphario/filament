@@ -24,7 +24,7 @@ use core::cell::{RefCell, RefMut, Ref};
 /// # Example
 ///
 /// ```ignore
-/// use userlib::sync::SingleThreadCell;
+/// use libsys::sync::SingleThreadCell;
 ///
 /// static DRIVER: SingleThreadCell<MyDriver> = SingleThreadCell::new();
 ///

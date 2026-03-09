@@ -68,7 +68,7 @@ pub fn run(args: &[u8]) -> CommandResult {
         "get" => {
             let key = parts.next().unwrap_or("");
             let mut buf = [0u8; 1024];
-            let n = userlib::config::get(service.as_bytes(), key.as_bytes(), &mut buf);
+            let n = libsys::config::get(service.as_bytes(), key.as_bytes(), &mut buf);
             if n > 0 {
                 if key == "@topology" {
                     return format_topology(&buf[..n]);
@@ -96,7 +96,7 @@ pub fn run(args: &[u8]) -> CommandResult {
                 }
             };
             let mut buf = [0u8; 128];
-            let n = userlib::config::set_raw(service.as_bytes(), key.as_bytes(), value.as_bytes(), &mut buf);
+            let n = libsys::config::set_raw(service.as_bytes(), key.as_bytes(), value.as_bytes(), &mut buf);
             if n > 0 {
                 return format_response(&buf[..n]);
             } else if service.is_empty() {

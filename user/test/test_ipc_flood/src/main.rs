@@ -7,8 +7,8 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall;
-use userlib::ipc::{Channel, Mux, MuxFilter};
+use libsys::syscall;
+use libsys::ipc::{Channel, Mux, MuxFilter};
 
 fn log(msg: &[u8]) {
     syscall::debug_write(msg);
@@ -228,7 +228,7 @@ fn phase3_mux_interleave() -> bool {
                         }
                     }
                 }
-                Err(userlib::SysError::Timeout) => break, // Batch drained, send more
+                Err(libsys::SysError::Timeout) => break, // Batch drained, send more
                 Err(_) => {
                     log(b"  phase3: FAIL - mux.wait error\r\n");
                     return false;

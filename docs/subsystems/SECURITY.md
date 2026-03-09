@@ -25,7 +25,7 @@ Defined in `src/kernel/caps.rs`:
 
 ## Capability Presets
 
-Defined in `user/userlib/src/syscall.rs`:
+Defined in `user/libsys/src/syscall.rs`:
 
 | Preset | Capabilities | Use Case |
 |--------|-------------|----------|

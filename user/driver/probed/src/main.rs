@@ -10,8 +10,8 @@
 #![no_main]
 
 use abi::{bus_type, bus_create_flags, BusCreateInfo, ObjectType};
-use userlib::syscall;
-use userlib::unotice;
+use libsys::syscall;
+use libsys::unotice;
 
 #[unsafe(no_mangle)]
 fn main() {
@@ -20,7 +20,7 @@ fn main() {
     #[cfg(feature = "platform-mt7988a")]
     let platform = "mt7988a";
 
-    userlib::uinfo!("probed", "platform"; name = platform);
+    libsys::uinfo!("probed", "platform"; name = platform);
 
     #[cfg(feature = "platform-qemu-virt")]
     register_qemu_buses();
@@ -29,13 +29,13 @@ fn main() {
     register_mt7988_buses();
 
     unotice!("probed", "bus_discovery_done");
-    userlib::ulog::flush();
+    libsys::ulog::flush();
     // exit(0) is called automatically by _start after main returns
 }
 
 /// Create a bus and return its handle.
 /// Caller can write(handle, BusDevice) to register devices, then close.
-fn bus_create(info: &BusCreateInfo) -> Option<userlib::Handle> {
+fn bus_create(info: &BusCreateInfo) -> Option<libsys::Handle> {
     let params = unsafe {
         core::slice::from_raw_parts(
             info as *const BusCreateInfo as *const u8,
@@ -45,7 +45,7 @@ fn bus_create(info: &BusCreateInfo) -> Option<userlib::Handle> {
     match syscall::open(ObjectType::Bus, params) {
         Ok(handle) => Some(handle),
         Err(_) => {
-            userlib::uerror!("probed", "bus_create_failed");
+            libsys::uerror!("probed", "bus_create_failed");
             None
         }
     }

@@ -11,11 +11,11 @@ name = "devd"
 version = "0.1.0"
 dependencies = [
  "abi",
- "userlib",
+ "libsys",
 ]
 
 [[package]]
-name = "userlib"
+name = "libsys"
 version = "0.1.0"
 dependencies = [
  "abi",

@@ -343,7 +343,7 @@ impl PcieController {
     /// This prints all the important registers from the MediaTek PCIe MAC
     /// for comparison with OpenWRT/Linux.
     pub fn dump_soc_registers(&self) {
-        use userlib::println;
+        use libsys::println;
 
         // Register addresses from pcie-mediatek-gen3.c
         const PCIE_BASE_CFG_REG: usize = 0x14;

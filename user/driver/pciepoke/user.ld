@@ -1,1 +1,1 @@
-../../userlib/user.ld
+../../libsys/user.ld

@@ -25,14 +25,14 @@ mod ip;
 mod icmp;
 mod nic;
 
-use userlib::bus::{
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId, bus_msg,
 };
-use userlib::bus_runtime::driver_main;
-use userlib::ipc::Timer;
-use userlib::ring::{IoSqe, SideEntry, io_op, side_msg, side_status};
-use userlib::syscall::Handle;
-use userlib::{uinfo, udebug, uerror};
+use libsys::bus_runtime::driver_main;
+use libsys::ipc::Timer;
+use libsys::ring::{IoSqe, SideEntry, io_op, side_msg, side_status};
+use libsys::syscall::Handle;
+use libsys::{uinfo, udebug, uerror};
 
 use types::{EthAddr, Ipv4Addr, ethertype, ip_proto};
 use nic::{NicTable, NicState};
@@ -559,25 +559,5 @@ static mut DRIVER: NetSvcDriver = NetSvcDriver::new();
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"netsvc", NetSvcDriverWrapper(driver));
-}
-
-struct NetSvcDriverWrapper(&'static mut NetSvcDriver);
-
-impl Driver for NetSvcDriverWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
-
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
-
-    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        self.0.data_ready(port, ctx)
-    }
-
-    fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
-        self.0.handle_event(tag, handle, ctx)
-    }
+    driver_main(b"netsvc", driver);
 }

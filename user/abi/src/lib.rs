@@ -1,12 +1,12 @@
 //! Kernel ABI - Shared types between kernel and userspace
 //!
 //! This crate defines all types that cross the kernel/userspace boundary.
-//! Both the kernel and userlib depend on this crate to ensure consistency.
+//! Both the kernel and libsys depend on this crate to ensure consistency.
 //!
 //! # Rules
 //! - All structs must be `#[repr(C)]` for stable layout
 //! - No heap allocation (no_std compatible)
-//! - No dependencies on kernel or userlib internals
+//! - No dependencies on kernel or libsys internals
 
 #![no_std]
 

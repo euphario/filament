@@ -100,7 +100,7 @@ pub use abi::BusInfo;
 
 /// Unified device information
 /// All devices are equal - platform devices and bus controllers
-/// Layout must match userlib::syscall::DeviceInfo
+/// Layout must match libsys::syscall::DeviceInfo
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct DeviceInfo {

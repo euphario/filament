@@ -18,8 +18,8 @@
 //! 3. Load WA firmware (acceleration processor)
 //! 4. Load DSP firmware (optional)
 
-use userlib::syscall;
-use userlib::firmware::FirmwareClient;
+use libsys::syscall;
+use libsys::firmware::FirmwareClient;
 
 /// Firmware loading error
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +80,7 @@ impl Firmware {
     ///
     /// Allocates DMA memory and reads the entire file into it.
     pub fn load(path: &str) -> Result<Self, FirmwareError> {
-        use userlib::{println, print};
+        use libsys::{println, print};
 
         println!("[FW] Loading: {}", path);
 
@@ -200,11 +200,11 @@ pub fn check_firmware_files() -> bool {
 pub fn check_usb_available() -> bool {
     match FirmwareClient::connect() {
         Some(_client) => {
-            userlib::println!("[fw] fatfs connection OK");
+            libsys::println!("[fw] fatfs connection OK");
             true
         }
         None => {
-            userlib::println!("[fw] fatfs connection FAILED");
+            libsys::println!("[fw] fatfs connection FAILED");
             false
         }
     }
@@ -230,11 +230,11 @@ impl UsbFirmware {
                 Ok(Self { vaddr, paddr, size, shmem_id })
             }
             Err(code) => {
-                if code == userlib::firmware::error::NOT_FOUND {
+                if code == libsys::firmware::error::NOT_FOUND {
                     Err(FirmwareError::FileNotFound)
-                } else if code == userlib::firmware::error::TOO_LARGE {
+                } else if code == libsys::firmware::error::TOO_LARGE {
                     Err(FirmwareError::TooLarge)
-                } else if code == userlib::firmware::error::NO_MEMORY {
+                } else if code == libsys::firmware::error::NO_MEMORY {
                     Err(FirmwareError::DmaAllocFailed)
                 } else {
                     Err(FirmwareError::ReadFailed)

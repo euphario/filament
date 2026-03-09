@@ -11,12 +11,12 @@
 #![no_std]
 #![no_main]
 
-extern crate userlib;
+extern crate libsys;
 
-use userlib::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
-use userlib::bus_runtime::driver_main;
-use userlib::MmioRegion;
-use userlib::unotice;
+use libsys::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
+use libsys::bus_runtime::driver_main;
+use libsys::MmioRegion;
+use libsys::unotice;
 
 // =============================================================================
 // MT7988 PWM Hardware Constants

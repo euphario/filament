@@ -8,7 +8,7 @@ platform-qemu-virt = []
 platform-mt7988a = []
 
 [dependencies]
-userlib = { path = "../../userlib" }
+libsys = { path = "../../libsys" }
 abi = { path = "../../abi" }
 
 [profile.release]

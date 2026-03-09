@@ -16,7 +16,7 @@ mod output;
 mod readline;
 
 // Shell-local print macros that route through console (consoled channel when connected)
-// This avoids the output interleaving that happens when using userlib::print! directly
+// This avoids the output interleaving that happens when using libsys::print! directly
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
@@ -37,9 +37,9 @@ macro_rules! println {
     }};
 }
 
-use userlib::syscall;
-use userlib::ipc::{Process, Mux, MuxFilter};
-use userlib::vfs_client::VfsClient;
+use libsys::syscall;
+use libsys::ipc::{Process, Mux, MuxFilter};
+use libsys::vfs_client::VfsClient;
 
 // Re-export libf utilities so builtins can use crate::trim, crate::cmd_eq, etc.
 pub use libf::str::trim;
@@ -84,19 +84,19 @@ static mut VFS_CLIENT: Option<VfsClient> = None;
 
 #[unsafe(no_mangle)]
 fn main() {
-    userlib::uinfo!("shell", "starting";);
-    userlib::ulog::flush();
+    libsys::uinfo!("shell", "starting";);
+    libsys::ulog::flush();
 
     // Connect to console via mailbox (shmem_id from parent)
     if !console::init() {
         // No mailbox — exit (shell must be spawned by a transport)
-        userlib::uerror!("shell", "init_failed";);
-        userlib::ulog::flush();
+        libsys::uerror!("shell", "init_failed";);
+        libsys::ulog::flush();
         syscall::exit(1);
     }
 
-    userlib::uinfo!("shell", "connected";);
-    userlib::ulog::flush();
+    libsys::uinfo!("shell", "connected";);
+    libsys::ulog::flush();
 
     // Set up decoration: clear screen, scroll region, separator, status bar
     {
@@ -104,8 +104,8 @@ fn main() {
         decoration::setup(con.cols, con.rows);
     }
 
-    userlib::uinfo!("shell", "decoration_done";);
-    userlib::ulog::flush();
+    libsys::uinfo!("shell", "decoration_done";);
+    libsys::ulog::flush();
 
     // Welcome banner (prints inside scroll region after setup)
     color::set(color::BOLD);
@@ -176,11 +176,11 @@ fn main() {
             let pipe_after = console::console().pipe_writable();
             let elapsed_ms = (t1.saturating_sub(t0)) / 1_000_000;
             let bytes_out = pipe_before.saturating_sub(pipe_after);
-            userlib::udebug!("shell", "cmd_done";
+            libsys::udebug!("shell", "cmd_done";
                 elapsed_ms = elapsed_ms as u32,
                 bytes_out = bytes_out as u32,
                 pipe_free = pipe_after as u32);
-            userlib::ulog::flush();
+            libsys::ulog::flush();
         }
     }
 }
@@ -198,7 +198,7 @@ fn execute_command(cmd: &[u8]) {
     if console::console().ssh_mode {
         let cmd_str = core::str::from_utf8(cmd).unwrap_or("?");
         let log_name = if cmd_str.len() > 24 { &cmd_str[..24] } else { cmd_str };
-        userlib::udebug!("shell", "cmd_exec"; cmd = log_name, len = cmd.len() as u32);
+        libsys::udebug!("shell", "cmd_exec"; cmd = log_name, len = cmd.len() as u32);
     }
 
     // Built-in commands
@@ -928,7 +928,7 @@ fn cmd_jobs() {
 
 /// Set fan speed via PWM driver IPC
 fn cmd_fan(arg: &[u8]) {
-    use userlib::ipc::Channel;
+    use libsys::ipc::Channel;
 
     let arg = trim(arg);
 
@@ -1217,7 +1217,7 @@ fn cmd_pwd() {
 
 /// Change directory
 fn cmd_cd(path_arg: &[u8]) {
-    use userlib::vfs_proto::open_flags;
+    use libsys::vfs_proto::open_flags;
 
     let path = trim(path_arg);
 

@@ -18,7 +18,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use userlib::devd::{DevdClient, DriverState};
+//! use libsys::devd::{DevdClient, DriverState};
 //! use abi::{PortInfo, PortClass, port_subclass};
 //!
 //! // Connect to devd

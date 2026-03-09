@@ -31,16 +31,16 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall;
-use userlib::bus::{
+use libsys::syscall;
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg, ConfigKey,
     PortInfo, PortClass, port_subclass,
 };
-use userlib::bus_runtime::driver_main;
-use userlib::ring::{IoSqe, io_status};
-use userlib::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
-use userlib::{uinfo, unotice, udebug, uerror};
+use libsys::bus_runtime::driver_main;
+use libsys::ring::{IoSqe, io_status};
+use libsys::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
+use libsys::{uinfo, unotice, udebug, uerror};
 
 const FAT_CACHE_ENTRIES: usize = 8192;
 const MAX_OPEN_FILES: usize = 16;
@@ -931,12 +931,12 @@ impl FatfsDriver {
         // Process sidechannel queries
         if let Some(port) = ctx.block_port(vfs_id) {
             while let Some(entry) = port.poll_side_request() {
-                use userlib::ring::side_msg;
+                use libsys::ring::side_msg;
                 match entry.msg_type {
                     side_msg::QUERY_GEOMETRY => {
                         // Not a block device - return error
                         let mut eol = entry;
-                        eol.status = userlib::ring::side_status::EOL;
+                        eol.status = libsys::ring::side_status::EOL;
                         port.notify();
                     }
                     _ => {
@@ -1170,6 +1170,48 @@ impl Driver for FatfsDriver {
             self.process_vfs_requests(ctx);
         }
     }
+
+    fn config_keys(&self) -> &[ConfigKey] {
+        FAT_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        match key {
+            b"type" => copy_to_buf(buf, 0, if self.is_fat32 { b"FAT32" as &[u8] } else { b"FAT16" }),
+            b"mount" => copy_to_buf(buf, 0, &self.port_name[..self.port_name_len]),
+            b"cluster_size" => {
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, self.cluster_size());
+                copy_to_buf(buf, 0, &tmp[..len])
+            }
+            b"total_sectors" => {
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, self.total_sectors);
+                copy_to_buf(buf, 0, &tmp[..len])
+            }
+            b"open_files" => {
+                let count = self.open_files.iter().filter(|f| f.in_use).count() as u32;
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, count);
+                copy_to_buf(buf, 0, &tmp[..len])
+            }
+            _ => 0,
+        }
+    }
+}
+
+const FAT_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_only(b"type"),
+    ConfigKey::read_only(b"mount"),
+    ConfigKey::read_only(b"cluster_size"),
+    ConfigKey::read_only(b"total_sectors"),
+    ConfigKey::read_only(b"open_files"),
+];
+
+fn copy_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
+    let len = src.len().min(buf.len().saturating_sub(pos));
+    buf[pos..pos + len].copy_from_slice(&src[..len]);
+    pos + len
 }
 
 // =============================================================================
@@ -1181,68 +1223,7 @@ static mut DRIVER: FatfsDriver = FatfsDriver::new();
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"fatfsd", FatfsDriverWrapper(driver));
-}
-
-const FAT_CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey::read_only(b"type"),
-    ConfigKey::read_only(b"mount"),
-    ConfigKey::read_only(b"cluster_size"),
-    ConfigKey::read_only(b"total_sectors"),
-    ConfigKey::read_only(b"open_files"),
-];
-
-struct FatfsDriverWrapper(&'static mut FatfsDriver);
-
-impl FatfsDriverWrapper {
-    fn copy_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {
-        let len = src.len().min(buf.len().saturating_sub(pos));
-        buf[pos..pos + len].copy_from_slice(&src[..len]);
-        pos + len
-    }
-}
-
-impl Driver for FatfsDriverWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
-
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
-
-    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        self.0.data_ready(port, ctx)
-    }
-
-    fn config_keys(&self) -> &[ConfigKey] {
-        FAT_CONFIG_KEYS
-    }
-
-    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
-        let drv = &self.0;
-        match key {
-            b"type" => Self::copy_to_buf(buf, 0, if drv.is_fat32 { b"FAT32" as &[u8] } else { b"FAT16" }),
-            b"mount" => Self::copy_to_buf(buf, 0, &drv.port_name[..drv.port_name_len]),
-            b"cluster_size" => {
-                let mut tmp = [0u8; 16];
-                let len = format_u32(&mut tmp, drv.cluster_size());
-                Self::copy_to_buf(buf, 0, &tmp[..len])
-            }
-            b"total_sectors" => {
-                let mut tmp = [0u8; 16];
-                let len = format_u32(&mut tmp, drv.total_sectors);
-                Self::copy_to_buf(buf, 0, &tmp[..len])
-            }
-            b"open_files" => {
-                let count = drv.open_files.iter().filter(|f| f.in_use).count() as u32;
-                let mut tmp = [0u8; 16];
-                let len = format_u32(&mut tmp, count);
-                Self::copy_to_buf(buf, 0, &tmp[..len])
-            }
-            _ => 0,
-        }
-    }
+    driver_main(b"fatfsd", driver);
 }
 
 // =============================================================================

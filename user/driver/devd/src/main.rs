@@ -31,12 +31,12 @@ mod process;
 mod query;
 mod rules;
 
-use userlib::syscall;
-use userlib::{uinfo, unotice, uwarn, uerror, udebug};
-use userlib::ipc::{Port, Channel, EventLoop, ObjHandle, Mux, MuxFilter};
-use userlib::syscall::Handle;
-use userlib::error::{SysError, SysResult};
-use userlib::query::{
+use libsys::syscall;
+use libsys::{uinfo, unotice, uwarn, uerror, udebug};
+use libsys::ipc::{Port, Channel, EventLoop, ObjHandle, Mux, MuxFilter};
+use libsys::syscall::Handle;
+use libsys::error::{SysError, SysResult};
+use libsys::query::{
     QueryHeader, SpawnChildContext, msg, query_flags,
 };
 
@@ -783,7 +783,7 @@ impl Devd {
     /// to spawn the appropriate bus driver.
     fn discover_kernel_buses(&mut self) {
         let mut buses = [abi::PortInfo::empty(); 16];
-        let count = match userlib::ipc::bus_list(&mut buses) {
+        let count = match libsys::ipc::bus_list(&mut buses) {
             Ok(n) => n,
             Err(e) => {
                 uerror!("devd", "bus_list_failed"; err = e.to_errno());
@@ -916,7 +916,7 @@ impl Devd {
         };
 
         // Map the mailbox shmem for parent-side access
-        let mb_addr = match userlib::syscall::map(parent_mb_handle, 0) {
+        let mb_addr = match libsys::syscall::map(parent_mb_handle, 0) {
             Ok(addr) if addr != 0 => addr,
             _ => {
                 uwarn!("devd", "svc_mailbox_map_failed"; pid = pid);
@@ -928,7 +928,7 @@ impl Devd {
         // Watch the SuperQ handle in our EventLoop's Mux so we get woken
         // when the child sends a message — no more scanning/polling.
         if mb_addr != 0 {
-            let superq = userlib::SupervisionHandle::from_handle(parent_superq_handle);
+            let superq = libsys::SupervisionHandle::from_handle(parent_superq_handle);
             let superq_handle = superq.handle();
             match self.query_handler.add_supervision_client(
                 superq, idx as u8, pid,
@@ -1948,7 +1948,7 @@ impl Devd {
         }
 
         // 5s timeout via inline timer (tag = 0x100 | req_slot)
-        req.deadline_ns = userlib::syscall::gettime() + 5_000_000_000;
+        req.deadline_ns = libsys::syscall::gettime() + 5_000_000_000;
         // Relay mode for CONFIG queries: send each response immediately to avoid
         // accumulating into a 1024-byte buffer that can silently truncate.
         req.relay = client_seq_id == 0;
@@ -2081,7 +2081,7 @@ impl Devd {
         if client_seq_id != 0 {
             // Info query: build ServiceInfoResult with client's original seq_id.
             // Uses respond_info chunking (DevdClient handles IPC limit).
-            use userlib::query::{ServiceInfoResult, ErrorResponse, error};
+            use libsys::query::{ServiceInfoResult, ErrorResponse, error};
 
             if response_len > 0 {
                 let client_resp = ServiceInfoResult::success(client_seq_id, response_len as u16);
@@ -2159,7 +2159,7 @@ impl Devd {
 
     /// Send a QUERY_SERVICE_INFO to a driver with a forwarded seq_id.
     fn send_info_query_to_driver(&mut self, driver_slot: usize, seq_id: u32, name: &[u8]) -> bool {
-        use userlib::query::QueryServiceInfo;
+        use libsys::query::QueryServiceInfo;
         let forward_req = QueryServiceInfo::new(seq_id);
         let mut forward_buf = [0u8; 128];
         if let Some(len) = forward_req.write_to(&mut forward_buf, name) {
@@ -2259,9 +2259,9 @@ impl Devd {
             pid = pid,
             name = svc_name,
             fault = fault_name,
-            elr = userlib::ulog::hex64(elr),
-            far = userlib::ulog::hex64(far),
-            esr = userlib::ulog::hex64(esr));
+            elr = libsys::ulog::hex64(elr),
+            far = libsys::ulog::hex64(far),
+            esr = libsys::ulog::hex64(esr));
 
         // Kill the frozen child — normal restart flow will handle respawn
         let _ = syscall::exception_resume(pid, abi::exception_action::KILL);
@@ -2519,7 +2519,7 @@ impl Devd {
     /// Dispatch a query message by type.  Shared by handle_query_client_event
     /// (Mux-driven) and try_immediate_query_read (accept-driven).
     fn dispatch_query_message(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{msg, QueryHeader};
+        use libsys::query::{msg, QueryHeader};
 
         // Strip ADDRESSED route from binary messages. Text admin commands
         // (e.g., "CONFIG GET key\n") parse as QueryHeader with garbage
@@ -2795,14 +2795,14 @@ impl Devd {
     /// query client's service index. Used for routed PORT_REGISTER messages from
     /// grandchildren (e.g., nvmed registering block:0 via pcied relay).
     fn handle_port_register_info_msg(&mut self, slot: usize, buf: &[u8], owner_override: Option<u8>) {
-        use userlib::query::error;
+        use libsys::query::error;
 
         // Parse the registration message
         let mut info = match self.query_handler.parse_port_register_info(slot, buf) {
             Some(i) => i,
             None => {
                 // Permission denied or invalid format
-                if let Some(header) = userlib::query::QueryHeader::from_bytes(buf) {
+                if let Some(header) = libsys::query::QueryHeader::from_bytes(buf) {
                     self.query_handler.send_port_register_response(
                         slot, header.seq_id, error::PERMISSION_DENIED
                     );
@@ -2854,7 +2854,7 @@ impl Devd {
 
     /// Handle STATE_CHANGE for a service identified by service index.
     fn handle_state_change_for_service(&mut self, driver_idx: usize, buf: &[u8]) {
-        use userlib::query::{StateChange, driver_state};
+        use libsys::query::{StateChange, driver_state};
 
         // Parse the state change message
         let state_msg = match StateChange::from_bytes(buf) {
@@ -2921,7 +2921,7 @@ impl Devd {
     /// Returns the port name that triggered this driver's spawn,
     /// plus any context key-value pairs from rule template expansion.
     fn handle_get_spawn_context(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{QueryHeader, SpawnContextResponse, error};
+        use libsys::query::{QueryHeader, SpawnContextResponse, error};
 
         let header = match QueryHeader::from_bytes(buf) {
             Some(h) => h,
@@ -2976,7 +2976,7 @@ impl Devd {
     /// - port_id != 0xFF: lookup by port_id (unambiguous, for same-name ports)
     /// - port_id == 0xFF: lookup by name (legacy/default)
     fn handle_query_port(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{QueryPort, PortInfoResponse, port_flags, error};
+        use libsys::query::{QueryPort, PortInfoResponse, port_flags, error};
 
         let (query, port_name) = match QueryPort::from_bytes(buf) {
             Some(q) => q,
@@ -3029,7 +3029,7 @@ impl Devd {
 
     /// Handle UPDATE_PORT_SHMEM_ID message - updates shmem_id for existing port
     fn handle_update_port_shmem_id(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{UpdatePortShmemId, PortRegisterResponse, error};
+        use libsys::query::{UpdatePortShmemId, PortRegisterResponse, error};
 
         let (update, port_name) = match UpdatePortShmemId::from_bytes(buf) {
             Some(u) => u,
@@ -3064,7 +3064,7 @@ impl Devd {
 
     /// Handle SET_PORT_STATE message - transitions a port to a new state
     fn handle_set_port_state(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{SetPortState, error};
+        use libsys::query::{SetPortState, error};
 
         // Validate slot index
         if slot >= MAX_QUERY_CLIENTS {
@@ -3174,7 +3174,7 @@ impl Devd {
 
     /// Send SET_PORT_STATE response with correct msg_type
     fn send_set_port_state_response(&mut self, slot: usize, seq_id: u32, result: i32) {
-        use userlib::query::msg;
+        use libsys::query::msg;
 
         // Build response: header (8 bytes) + result (4 bytes)
         let mut resp = [0u8; 12];
@@ -3190,7 +3190,7 @@ impl Devd {
 
     /// Handle LIST_PORTS message - returns all registered ports
     fn handle_list_ports(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{QueryHeader, PortsListResponse, PortEntry, port_flags};
+        use libsys::query::{QueryHeader, PortsListResponse, PortEntry, port_flags};
 
         let header = match QueryHeader::from_bytes(buf) {
             Some(h) => h,
@@ -3282,7 +3282,7 @@ impl Devd {
 
     /// Handle LIST_SERVICES message - returns all services
     fn handle_list_services(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{QueryHeader, ServicesListResponse, ServiceEntry, service_state};
+        use libsys::query::{QueryHeader, ServicesListResponse, ServiceEntry, service_state};
 
         let header = match QueryHeader::from_bytes(buf) {
             Some(h) => h,
@@ -3371,7 +3371,7 @@ impl Devd {
 
     /// Handle QUERY_SERVICE_INFO - forward to the named service's driver (async)
     fn handle_query_service_info(&mut self, client_slot: usize, buf: &[u8]) {
-        use userlib::query::{QueryServiceInfo, ErrorResponse, error};
+        use libsys::query::{QueryServiceInfo, ErrorResponse, error};
 
         // Parse the request
         let (req, name_bytes) = match QueryServiceInfo::from_bytes(buf) {
@@ -3432,7 +3432,7 @@ impl Devd {
 
     /// Handle SERVICE_INFO_RESULT - unified matching via PendingAdminRequest
     fn handle_service_info_result(&mut self, driver_slot: usize, buf: &[u8]) {
-        use userlib::query::ServiceInfoResult;
+        use libsys::query::ServiceInfoResult;
 
         if let Some((resp, info_bytes)) = ServiceInfoResult::from_bytes(buf) {
             self.try_match_admin_response(driver_slot, resp.header.seq_id, info_bytes, resp.header.flags);
@@ -3445,7 +3445,7 @@ impl Devd {
 
     /// Handle LOG_MESSAGE from a driver
     fn handle_log_message(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::LogMessage;
+        use libsys::query::LogMessage;
 
         let (msg, text) = match LogMessage::from_bytes(buf) {
             Some(m) => m,
@@ -3466,7 +3466,7 @@ impl Devd {
 
     /// Handle LOG_QUERY - return buffered logs
     fn handle_log_query(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{LogQuery, LogHistory};
+        use libsys::query::{LogQuery, LogHistory};
 
         let req = match LogQuery::from_bytes(buf) {
             Some(r) => r,
@@ -3494,7 +3494,7 @@ impl Devd {
 
     /// Handle LOG_CONTROL - enable/disable live logging
     fn handle_log_control(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{LogControl, log_cmd, ErrorResponse, error};
+        use libsys::query::{LogControl, log_cmd, ErrorResponse, error};
 
         let req = match LogControl::from_bytes(buf) {
             Some(r) => r,
@@ -3524,7 +3524,7 @@ impl Devd {
 
     /// Handle REGISTER_MOUNT message — driver registers a mount prefix.
     fn handle_register_mount(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{RegisterMount, PortRegisterResponse, mount_transport, error};
+        use libsys::query::{RegisterMount, PortRegisterResponse, mount_transport, error};
 
         let (transport_type, prefix, port_name, shmem_id) = match RegisterMount::from_bytes(buf) {
             Some(parsed) => parsed,
@@ -3577,7 +3577,7 @@ impl Devd {
 
     /// Handle RESOLVE_PATH message — resolve path to mount transport.
     fn handle_resolve_path(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{ResolvePath, ResolvePathResponse, mount_transport};
+        use libsys::query::{ResolvePath, ResolvePathResponse, mount_transport};
 
         let path = match ResolvePath::from_bytes(buf) {
             Some(p) => p,
@@ -3613,7 +3613,7 @@ impl Devd {
 
     /// Handle LIST_MOUNTS message — return all registered mounts.
     fn handle_list_mounts(&mut self, slot: usize, buf: &[u8]) {
-        use userlib::query::{MountsListResponse, MountListEntry, mount_transport};
+        use libsys::query::{MountsListResponse, MountListEntry, mount_transport};
 
         let seq_id = QueryHeader::from_bytes(buf).map(|h| h.seq_id).unwrap_or(0);
 
@@ -4359,7 +4359,7 @@ impl Devd {
             self.poll_query_clients();
 
             // Flush structured logs so they appear on the console
-            userlib::ulog::flush();
+            libsys::ulog::flush();
         }
     }
 }
@@ -4373,7 +4373,7 @@ static mut DEVD: Devd = Devd::new();
 #[unsafe(no_mangle)]
 #[allow(static_mut_refs)]
 fn main() -> ! {
-    userlib::io::disable_stdout();
+    libsys::io::disable_stdout();
 
     let devd = unsafe { &mut DEVD };
 
@@ -4383,6 +4383,6 @@ fn main() -> ! {
     }
 
     unotice!("devd", "started"; services = devd.services.count() as u32);
-    userlib::ulog::flush();
+    libsys::ulog::flush();
     devd.run()
 }

@@ -10,8 +10,8 @@
 //!   drivers help         - Show help
 
 use core::fmt::Write;
-use userlib::devd::DevdClient;
-use userlib::query::{PortEntry, ServiceEntry, service_state, port_type, port_flags};
+use libsys::devd::DevdClient;
+use libsys::query::{PortEntry, ServiceEntry, service_state, port_type, port_flags};
 use crate::output::{CommandResult, Table, Row, Align};
 use crate::{println, cmd_eq, trim};
 
@@ -70,7 +70,7 @@ fn cmd_info(service_name: &[u8]) -> CommandResult {
             }
             CommandResult::None
         }
-        Err(userlib::error::SysError::NotFound) => {
+        Err(libsys::error::SysError::NotFound) => {
             if let Ok(name) = core::str::from_utf8(service_name) {
                 println!("Service '{}' not found", name);
             } else {

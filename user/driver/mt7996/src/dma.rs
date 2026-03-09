@@ -26,7 +26,7 @@
 
 use crate::device::Mt7996Device;
 use crate::regs;
-use userlib::{syscall, trace};
+use libsys::{syscall, trace};
 
 // Note: crate::dma_defs and crate::mt7996_defs are used via fully-qualified paths
 // in the submodules below (queue_map, wfdma, glo_cfg, dma_ctl) to provide canonical
@@ -339,33 +339,33 @@ pub mod queue_map {
     pub fn dump_queue_ids() {
         let q = &MT7996_QUEUE_IDS;
 
-        userlib::println!("[QueueMap] MT7996 Queue ID Mapping:");
-        userlib::println!("[QueueMap]   MCU TX queues:");
-        userlib::println!("[QueueMap]     FWDL: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap] MT7996 Queue ID Mapping:");
+        libsys::println!("[QueueMap]   MCU TX queues:");
+        libsys::println!("[QueueMap]     FWDL: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.mcuq_id(mcuq::FWDL), q.mcuq_ring_base(mcuq::FWDL), q.mcuq_ext_ctrl(mcuq::FWDL));
-        userlib::println!("[QueueMap]     WM:   hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]     WM:   hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.mcuq_id(mcuq::WM), q.mcuq_ring_base(mcuq::WM), q.mcuq_ext_ctrl(mcuq::WM));
-        userlib::println!("[QueueMap]     WA:   hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]     WA:   hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.mcuq_id(mcuq::WA), q.mcuq_ring_base(mcuq::WA), q.mcuq_ext_ctrl(mcuq::WA));
 
-        userlib::println!("[QueueMap]   Data TX queues:");
-        userlib::println!("[QueueMap]     BAND0: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]   Data TX queues:");
+        libsys::println!("[QueueMap]     BAND0: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.txq_id(txq::BAND0), q.txq_ring_base(txq::BAND0), q.txq_ext_ctrl(txq::BAND0));
-        userlib::println!("[QueueMap]     BAND1: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]     BAND1: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.txq_id(txq::BAND1), q.txq_ring_base(txq::BAND1), q.txq_ext_ctrl(txq::BAND1));
-        userlib::println!("[QueueMap]     BAND2: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]     BAND2: hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.txq_id(txq::BAND2), q.txq_ring_base(txq::BAND2), q.txq_ext_ctrl(txq::BAND2));
 
-        userlib::println!("[QueueMap]   RX queues:");
-        userlib::println!("[QueueMap]     MCU:        hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]   RX queues:");
+        libsys::println!("[QueueMap]     MCU:        hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.rxq_id(rxq::MCU), q.rxq_ring_base(rxq::MCU), q.rxq_ext_ctrl(rxq::MCU));
-        userlib::println!("[QueueMap]     MCU_WA:     hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]     MCU_WA:     hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.rxq_id(rxq::MCU_WA), q.rxq_ring_base(rxq::MCU_WA), q.rxq_ext_ctrl(rxq::MCU_WA));
-        userlib::println!("[QueueMap]     MAIN:       hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]     MAIN:       hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.rxq_id(rxq::MAIN), q.rxq_ring_base(rxq::MAIN), q.rxq_ext_ctrl(rxq::MAIN));
-        userlib::println!("[QueueMap]     TXFREE0:    hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]     TXFREE0:    hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.rxq_id(rxq::TXFREE_BAND0), q.rxq_ring_base(rxq::TXFREE_BAND0), q.rxq_ext_ctrl(rxq::TXFREE_BAND0));
-        userlib::println!("[QueueMap]     TXFREE2:    hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
+        libsys::println!("[QueueMap]     TXFREE2:    hw_id={} ring=0x{:03x} ext_ctrl=0x{:03x}",
             q.rxq_id(rxq::TXFREE_BAND2), q.rxq_ring_base(rxq::TXFREE_BAND2), q.rxq_ext_ctrl(rxq::TXFREE_BAND2));
     }
 }
@@ -1171,7 +1171,7 @@ impl FwdlRing {
         let desc_vaddr = syscall::mmap_dma(desc_size, &mut desc_paddr);
         // Check for error (negative) AND invalid address (0 or too low)
         if desc_vaddr <= 0 || (desc_vaddr as u64) < 0x1000 {
-            userlib::println!("[FwdlRing] desc alloc failed: ret={}, size={}", desc_vaddr, desc_size);
+            libsys::println!("[FwdlRing] desc alloc failed: ret={}, size={}", desc_vaddr, desc_size);
             return None;
         }
 
@@ -1198,7 +1198,7 @@ impl FwdlRing {
         let cmd_vaddr = syscall::mmap_dma(MCU_CMD_BUF_SIZE, &mut cmd_paddr);
         // Check for error (negative) AND invalid address (0 or too low)
         if cmd_vaddr <= 0 || (cmd_vaddr as u64) < 0x1000 {
-            userlib::println!("[FwdlRing] cmd alloc failed: ret={}, size={}", cmd_vaddr, MCU_CMD_BUF_SIZE);
+            libsys::println!("[FwdlRing] cmd alloc failed: ret={}, size={}", cmd_vaddr, MCU_CMD_BUF_SIZE);
             syscall::munmap(desc_vaddr as u64, desc_size);
             return None;
         }
@@ -1371,28 +1371,28 @@ impl RxRing {
         let desc_size = (size as usize) * core::mem::size_of::<TxDesc>();
         let buf_total = (size as usize) * RX_BUF_SIZE;
 
-        userlib::println!("[RxRing::new] size={}, desc_size={}, buf_total={}", size, desc_size, buf_total);
+        libsys::println!("[RxRing::new] size={}, desc_size={}, buf_total={}", size, desc_size, buf_total);
 
         // Allocate DMA memory for descriptors
         let mut desc_paddr: u64 = 0;
         let desc_vaddr = syscall::mmap_dma(desc_size, &mut desc_paddr);
-        userlib::println!("[RxRing::new] desc alloc: vaddr=0x{:x} paddr=0x{:x}", desc_vaddr, desc_paddr);
+        libsys::println!("[RxRing::new] desc alloc: vaddr=0x{:x} paddr=0x{:x}", desc_vaddr, desc_paddr);
         // Check for error (negative) AND invalid address (0 or too low)
         if desc_vaddr <= 0 || (desc_vaddr as u64) < 0x1000 {
-            userlib::println!("[RxRing] desc alloc failed: ret={} (0x{:x}), size={}",
+            libsys::println!("[RxRing] desc alloc failed: ret={} (0x{:x}), size={}",
                 desc_vaddr, desc_vaddr as u64, desc_size);
             return None;
         }
 
         // Allocate DMA memory for RX buffers
-        userlib::println!("[RxRing::new] about to alloc buf, size={}", buf_total);
+        libsys::println!("[RxRing::new] about to alloc buf, size={}", buf_total);
         let mut buf_paddr: u64 = 0;
-        userlib::println!("[RxRing::new] calling mmap_dma for buf...");
+        libsys::println!("[RxRing::new] calling mmap_dma for buf...");
         let buf_vaddr = syscall::mmap_dma(buf_total, &mut buf_paddr);
-        userlib::println!("[RxRing::new] buf alloc: vaddr=0x{:x} paddr=0x{:x}", buf_vaddr, buf_paddr);
+        libsys::println!("[RxRing::new] buf alloc: vaddr=0x{:x} paddr=0x{:x}", buf_vaddr, buf_paddr);
         // Check for error (negative) AND invalid address (0 or too low)
         if buf_vaddr <= 0 || (buf_vaddr as u64) < 0x1000 {
-            userlib::println!("[RxRing] buf alloc failed: ret={} (0x{:x}), size={}",
+            libsys::println!("[RxRing] buf alloc failed: ret={} (0x{:x}), size={}",
                 buf_vaddr, buf_vaddr as u64, buf_total);
             syscall::munmap(desc_vaddr as u64, desc_size);
             return None;
@@ -1424,7 +1424,7 @@ impl RxRing {
         // Debug: show first descriptor to verify population
         unsafe {
             let first = &*descs;
-            userlib::println!("[RxRing] Populated {} descriptors, first: buf0=0x{:08x} buf1=0x{:08x} ctrl=0x{:08x}",
+            libsys::println!("[RxRing] Populated {} descriptors, first: buf0=0x{:08x} buf1=0x{:08x} ctrl=0x{:08x}",
                 size, first.buf0, first.buf1, first.ctrl);
         }
 
@@ -1450,7 +1450,7 @@ impl RxRing {
         let mut desc_paddr: u64 = 0;
         let desc_vaddr = syscall::mmap_dma(desc_size, &mut desc_paddr);
         if desc_vaddr <= 0 || (desc_vaddr as u64) < 0x1000 {
-            userlib::println!("[RxRing/RRO] desc alloc failed: ret={} (0x{:x}), size={}",
+            libsys::println!("[RxRing/RRO] desc alloc failed: ret={} (0x{:x}), size={}",
                 desc_vaddr, desc_vaddr as u64, desc_size);
             return None;
         }
@@ -1459,7 +1459,7 @@ impl RxRing {
         let mut buf_paddr: u64 = 0;
         let buf_vaddr = syscall::mmap_dma(buf_total, &mut buf_paddr);
         if buf_vaddr <= 0 || (buf_vaddr as u64) < 0x1000 {
-            userlib::println!("[RxRing/RRO] buf alloc failed: ret={} (0x{:x}), size={}",
+            libsys::println!("[RxRing/RRO] buf alloc failed: ret={} (0x{:x}), size={}",
                 buf_vaddr, buf_vaddr as u64, buf_total);
             syscall::munmap(desc_vaddr as u64, desc_size);
             return None;
@@ -1486,7 +1486,7 @@ impl RxRing {
             }
         }
 
-        userlib::println!("[RxRing/RRO] Initialized {} descriptors with magic_info=0x{:08x}",
+        libsys::println!("[RxRing/RRO] Initialized {} descriptors with magic_info=0x{:08x}",
             size, magic_info);
 
         // Flush all RRO descriptors to RAM so DMA can see them
@@ -1565,7 +1565,7 @@ impl<'a> Wfdma<'a> {
         // Always use primary WFDMA base for primary device
         let wfdma0_base = wfdma::WFDMA0_BASE;
 
-        userlib::println!("[WFDMA] Using WFDMA0 base 0x{:x} (HIF2 available: {})",
+        libsys::println!("[WFDMA] Using WFDMA0 base 0x{:x} (HIF2 available: {})",
             wfdma0_base, dev.has_hif2());
 
         Self {
@@ -1649,16 +1649,16 @@ impl<'a> Wfdma<'a> {
     /// **IMPORTANT**: Uses HIF1+offset access method (not HIF2's separate BAR)
     fn reset_hif2(&self) {
         if !self.dev.has_hif2() {
-            userlib::println!("[DMA] No HIF2 available, skipping HIF2 reset");
+            libsys::println!("[DMA] No HIF2 available, skipping HIF2 reset");
             return;
         }
 
-        userlib::println!("[DMA] Resetting HIF2 WFDMA (via HIF1+0x4000)...");
+        libsys::println!("[DMA] Resetting HIF2 WFDMA (via HIF1+0x4000)...");
 
         // Read current RST value via HIF1+offset
         let rst_offset = wfdma::WFDMA0_BASE + wfdma::RST;
         let rst_before = self.dev.hif2_via_hif1_read32(rst_offset);
-        userlib::println!("[DMA]   HIF2 RST before: 0x{:08x}", rst_before);
+        libsys::println!("[DMA]   HIF2 RST before: 0x{:08x}", rst_before);
 
         // Clear RST first using RMW (same pattern as HIF1, matches Linux mt76_clear)
         let rst_mask = wfdma::RST_DMASHDL_ALL_RST | wfdma::RST_LOGIC_RST;
@@ -1666,24 +1666,24 @@ impl<'a> Wfdma<'a> {
         self.dev.hif2_via_hif1_write32(rst_offset, rst_val & !rst_mask);
         unsafe { core::arch::asm!("dsb sy"); }
         let rst_after_clear = self.dev.hif2_via_hif1_read32(rst_offset);
-        userlib::println!("[DMA]   HIF2 RST after clear: 0x{:08x}", rst_after_clear);
+        libsys::println!("[DMA]   HIF2 RST after clear: 0x{:08x}", rst_after_clear);
 
         // Short delay between clear and set
-        userlib::delay_us(100);
+        libsys::delay_us(100);
 
         // Now assert reset using RMW (matches Linux mt76_set)
         let rst_val = self.dev.hif2_via_hif1_read32(rst_offset);
         self.dev.hif2_via_hif1_write32(rst_offset, rst_val | rst_mask);
         unsafe { core::arch::asm!("dsb sy"); }
         let rst_after_set = self.dev.hif2_via_hif1_read32(rst_offset);
-        userlib::println!("[DMA]   HIF2 RST after set(0x30): 0x{:08x}", rst_after_set);
+        libsys::println!("[DMA]   HIF2 RST after set(0x30): 0x{:08x}", rst_after_set);
 
         // Actual time delay for HIF2 reset to complete
-        userlib::delay_ms(10);
+        libsys::delay_ms(10);
 
         // Read back RST
         let rst_after = self.dev.hif2_via_hif1_read32(rst_offset);
-        userlib::println!("[DMA]   HIF2 RST after 10ms: 0x{:08x}", rst_after);
+        libsys::println!("[DMA]   HIF2 RST after 10ms: 0x{:08x}", rst_after);
 
         // Clear GLO_CFG DMA enables on HIF2 - match Linux mt7996_dma_disable() exactly
         let glo_offset = wfdma::WFDMA0_BASE + wfdma::GLO_CFG;
@@ -1692,9 +1692,9 @@ impl<'a> Wfdma<'a> {
                          glo_cfg::OMIT_TX_INFO | glo_cfg::OMIT_RX_INFO | glo_cfg::OMIT_RX_INFO_PFET2;
         let glo_clean = glo & !clear_mask;  // Just clear, don't set anything back
         self.dev.hif2_via_hif1_write32(glo_offset, glo_clean);
-        userlib::println!("[DMA]   HIF2 GLO_CFG: 0x{:08x} -> 0x{:08x}", glo, glo_clean);
+        libsys::println!("[DMA]   HIF2 GLO_CFG: 0x{:08x} -> 0x{:08x}", glo, glo_clean);
 
-        userlib::println!("[DMA] HIF2 WFDMA reset complete");
+        libsys::println!("[DMA] HIF2 WFDMA reset complete");
     }
 
     /// Read register via L1 remapping (for addresses > 0x100000 but < 0x70000000)
@@ -1734,9 +1734,9 @@ impl<'a> Wfdma<'a> {
         let offset = addr & remap::CBTOP_REMAP_MASK;
         let base = (addr >> 16) & 0xffff;
 
-        userlib::println!("[DMA] CBTOP remap read: addr=0x{:08x} -> base=0x{:04x} offset=0x{:04x}",
+        libsys::println!("[DMA] CBTOP remap read: addr=0x{:08x} -> base=0x{:04x} offset=0x{:04x}",
             addr, base, offset);
-        userlib::println!("[DMA]   HIF_REMAP_CBTOP=0x{:x}, window at 0x{:x}",
+        libsys::println!("[DMA]   HIF_REMAP_CBTOP=0x{:x}, window at 0x{:x}",
             remap::HIF_REMAP_CBTOP, remap::HIF_REMAP_BASE_CBTOP);
 
         // Write base to HIF_REMAP_CBTOP register
@@ -1744,11 +1744,11 @@ impl<'a> Wfdma<'a> {
 
         // Read back to ensure write completes
         let readback = self.read_bar(remap::HIF_REMAP_CBTOP);
-        userlib::println!("[DMA]   Wrote base=0x{:04x}, readback=0x{:08x}", base, readback);
+        libsys::println!("[DMA]   Wrote base=0x{:04x}, readback=0x{:08x}", base, readback);
 
         // Read via remap window
         let result = self.read_bar(remap::HIF_REMAP_BASE_CBTOP + offset);
-        userlib::println!("[DMA]   Read from 0x{:x} = 0x{:08x}",
+        libsys::println!("[DMA]   Read from 0x{:x} = 0x{:08x}",
             remap::HIF_REMAP_BASE_CBTOP + offset, result);
         result
     }
@@ -1817,7 +1817,7 @@ impl<'a> Wfdma<'a> {
         let wa_prefetch = prefetch(&mut base, cmd_depth);
         self.write(q.mcuq_ext_ctrl(mcuq::WA), wa_prefetch);
 
-        userlib::println!("[DMA]   MCUQ prefetch @0x{:x},0x{:x},0x{:x}: FWDL=0x{:08x} WM=0x{:08x} WA=0x{:08x}",
+        libsys::println!("[DMA]   MCUQ prefetch @0x{:x},0x{:x},0x{:x}: FWDL=0x{:08x} WM=0x{:08x} WA=0x{:08x}",
             q.mcuq_ext_ctrl(mcuq::FWDL), q.mcuq_ext_ctrl(mcuq::WM), q.mcuq_ext_ctrl(mcuq::WA),
             fwdl_prefetch, wm_prefetch, wa_prefetch);
 
@@ -1829,7 +1829,7 @@ impl<'a> Wfdma<'a> {
         let tx_band0_prefetch = prefetch(&mut base, tx_data_depth);
         self.write(q.txq_ext_ctrl(txq::BAND0), tx_band0_prefetch);
 
-        userlib::println!("[DMA]   TXQ data prefetch @0x{:x}: BAND0=0x{:08x}",
+        libsys::println!("[DMA]   TXQ data prefetch @0x{:x}: BAND0=0x{:08x}",
             q.txq_ext_ctrl(txq::BAND0), tx_band0_prefetch);
 
         //---------------------------------------------------------------------
@@ -1848,7 +1848,7 @@ impl<'a> Wfdma<'a> {
         let rx_wa_tri_prefetch = prefetch(&mut base, cmd_depth);
         self.write(q.rxq_ext_ctrl(rxq::BAND2_WA), rx_wa_tri_prefetch);
 
-        userlib::println!("[DMA]   RXQ MCU prefetch @0x{:x},0x{:x},0x{:x},0x{:x}: MCU=0x{:08x} WA=0x{:08x} WA_MAIN=0x{:08x} WA_TRI=0x{:08x}",
+        libsys::println!("[DMA]   RXQ MCU prefetch @0x{:x},0x{:x},0x{:x},0x{:x}: MCU=0x{:08x} WA=0x{:08x} WA_MAIN=0x{:08x} WA_TRI=0x{:08x}",
             q.rxq_ext_ctrl(rxq::MCU), q.rxq_ext_ctrl(rxq::MCU_WA),
             q.rxq_ext_ctrl(rxq::MAIN_WA), q.rxq_ext_ctrl(rxq::BAND2_WA),
             rx_mcu_prefetch, rx_wa_prefetch, rx_wa_main_prefetch, rx_wa_tri_prefetch);
@@ -1861,7 +1861,7 @@ impl<'a> Wfdma<'a> {
         let rx_main_prefetch = prefetch(&mut base, rx_data_depth);
         self.write(q.rxq_ext_ctrl(rxq::MAIN), rx_main_prefetch);
 
-        userlib::println!("[DMA]   RXQ data prefetch @0x{:x}: MAIN=0x{:08x}",
+        libsys::println!("[DMA]   RXQ data prefetch @0x{:x}: MAIN=0x{:08x}",
             q.rxq_ext_ctrl(rxq::MAIN), rx_main_prefetch);
 
         //---------------------------------------------------------------------
@@ -1872,7 +1872,7 @@ impl<'a> Wfdma<'a> {
         let rx_txfree_prefetch = prefetch(&mut base, rx_txfree_depth);
         self.write(q.rxq_ext_ctrl(rxq::TXFREE_BAND0), rx_txfree_prefetch);
 
-        userlib::println!("[DMA]   RXQ TXFREE prefetch @0x{:x}: 0x{:08x}",
+        libsys::println!("[DMA]   RXQ TXFREE prefetch @0x{:x}: 0x{:08x}",
             q.rxq_ext_ctrl(rxq::TXFREE_BAND0), rx_txfree_prefetch);
 
         //---------------------------------------------------------------------
@@ -1882,7 +1882,7 @@ impl<'a> Wfdma<'a> {
         let rx_rro_prefetch = prefetch(&mut base, rx_data_depth);
         self.write(q.rxq_ext_ctrl(rxq::RRO_BAND0), rx_rro_prefetch);
 
-        userlib::println!("[DMA]   RXQ RRO prefetch @0x{:x}: 0x{:08x}",
+        libsys::println!("[DMA]   RXQ RRO prefetch @0x{:x}: 0x{:08x}",
             q.rxq_ext_ctrl(rxq::RRO_BAND0), rx_rro_prefetch);
 
         //---------------------------------------------------------------------
@@ -1890,83 +1890,83 @@ impl<'a> Wfdma<'a> {
         // Linux calls __mt7996_dma_prefetch() with hif2 offset, continuing base
         //---------------------------------------------------------------------
         if self.dev.has_hif2() {
-            userlib::println!("[DMA]   HIF2 prefetch configuration (continuing from base=0x{:x}):", base);
+            libsys::println!("[DMA]   HIF2 prefetch configuration (continuing from base=0x{:x}):", base);
 
             // HIF2 RX data (band2)
             let hif2_rx_data_prefetch = prefetch(&mut base, rx_data_depth);
             let hif2_rx_data_reg = wfdma::WFDMA0_BASE + q.rxq_ext_ctrl(rxq::BAND2);
             self.dev.hif2_via_hif1_write32(hif2_rx_data_reg, hif2_rx_data_prefetch);
-            userlib::println!("[DMA]     HIF2 RX data @0x{:x}: 0x{:08x}", hif2_rx_data_reg, hif2_rx_data_prefetch);
+            libsys::println!("[DMA]     HIF2 RX data @0x{:x}: 0x{:08x}", hif2_rx_data_reg, hif2_rx_data_prefetch);
 
             // HIF2 RX TXFREE (band2)
             let hif2_txfree_prefetch = prefetch(&mut base, rx_txfree_depth);
             let hif2_txfree_reg = wfdma::WFDMA0_BASE + q.rxq_ext_ctrl(rxq::TXFREE_BAND2);
             self.dev.hif2_via_hif1_write32(hif2_txfree_reg, hif2_txfree_prefetch);
-            userlib::println!("[DMA]     HIF2 TXFREE @0x{:x}: 0x{:08x}", hif2_txfree_reg, hif2_txfree_prefetch);
+            libsys::println!("[DMA]     HIF2 TXFREE @0x{:x}: 0x{:08x}", hif2_txfree_reg, hif2_txfree_prefetch);
 
             // HIF2 RX RRO (band2)
             let hif2_rro_prefetch = prefetch(&mut base, rx_data_depth);
             let hif2_rro_reg = wfdma::WFDMA0_BASE + q.rxq_ext_ctrl(rxq::RRO_BAND2);
             self.dev.hif2_via_hif1_write32(hif2_rro_reg, hif2_rro_prefetch);
-            userlib::println!("[DMA]     HIF2 RRO @0x{:x}: 0x{:08x}", hif2_rro_reg, hif2_rro_prefetch);
+            libsys::println!("[DMA]     HIF2 RRO @0x{:x}: 0x{:08x}", hif2_rro_reg, hif2_rro_prefetch);
 
             // HIF2 TX data (band1) - uses txq_ext_ctrl
             let hif2_tx_band1_prefetch = prefetch(&mut base, tx_data_depth);
             let hif2_tx_band1_reg = wfdma::WFDMA0_BASE + q.txq_ext_ctrl(txq::BAND1);
             self.dev.hif2_via_hif1_write32(hif2_tx_band1_reg, hif2_tx_band1_prefetch);
-            userlib::println!("[DMA]     HIF2 TX band1 @0x{:x}: 0x{:08x}", hif2_tx_band1_reg, hif2_tx_band1_prefetch);
+            libsys::println!("[DMA]     HIF2 TX band1 @0x{:x}: 0x{:08x}", hif2_tx_band1_reg, hif2_tx_band1_prefetch);
 
             // HIF2 TX data (band2)
             let hif2_tx_band2_prefetch = prefetch(&mut base, tx_data_depth);
             let hif2_tx_band2_reg = wfdma::WFDMA0_BASE + q.txq_ext_ctrl(txq::BAND2);
             self.dev.hif2_via_hif1_write32(hif2_tx_band2_reg, hif2_tx_band2_prefetch);
-            userlib::println!("[DMA]     HIF2 TX band2 @0x{:x}: 0x{:08x}", hif2_tx_band2_reg, hif2_tx_band2_prefetch);
+            libsys::println!("[DMA]     HIF2 TX band2 @0x{:x}: 0x{:08x}", hif2_tx_band2_reg, hif2_tx_band2_prefetch);
 
             // Set CALC_MODE on HIF2 as well
             let hif2_ext1_reg = wfdma::WFDMA0_BASE + wfdma::GLO_CFG_EXT1;
             let hif2_ext1 = self.dev.hif2_via_hif1_read32(hif2_ext1_reg);
             self.dev.hif2_via_hif1_write32(hif2_ext1_reg, hif2_ext1 | wfdma::GLO_CFG_EXT1_CALC_MODE);
-            userlib::println!("[DMA]     HIF2 GLO_CFG_EXT1 CALC_MODE set");
+            libsys::println!("[DMA]     HIF2 GLO_CFG_EXT1 CALC_MODE set");
         }
 
         // Set CALC_MODE bit in GLO_CFG_EXT1 to finalize prefetch configuration
         let ext1 = self.read(wfdma::GLO_CFG_EXT1);
         self.write(wfdma::GLO_CFG_EXT1, ext1 | wfdma::GLO_CFG_EXT1_CALC_MODE);
         let ext1_after = self.read(wfdma::GLO_CFG_EXT1);
-        userlib::println!("[DMA]   GLO_CFG_EXT1: 0x{:08x} -> 0x{:08x} (CALC_MODE={})",
+        libsys::println!("[DMA]   GLO_CFG_EXT1: 0x{:08x} -> 0x{:08x} (CALC_MODE={})",
             ext1, ext1_after, if (ext1_after & wfdma::GLO_CFG_EXT1_CALC_MODE) != 0 { "set" } else { "NOT set" });
     }
 
     /// Perform wireless subsystem reset
     pub fn wfsys_reset(&self) {
-        userlib::println!("[DMA] Performing wfsys_reset (WF_SUBSYS_RST=0x{:08x})...", remap::WF_SUBSYS_RST);
+        libsys::println!("[DMA] Performing wfsys_reset (WF_SUBSYS_RST=0x{:08x})...", remap::WF_SUBSYS_RST);
 
         // WF_SUBSYS_RST is in CBTOP1 range (0x70000000+), use CBTOP remap
-        userlib::println!("[DMA] Reading WF_SUBSYS_RST via CBTOP remap...");
+        libsys::println!("[DMA] Reading WF_SUBSYS_RST via CBTOP remap...");
         let val = self.read_remap_cbtop(remap::WF_SUBSYS_RST);
-        userlib::println!("[DMA]   WF_SUBSYS_RST initial: 0x{:08x}", val);
+        libsys::println!("[DMA]   WF_SUBSYS_RST initial: 0x{:08x}", val);
 
         // Set reset bit
-        userlib::println!("[DMA] Asserting reset (writing 0x{:08x})...", val | 0x1);
+        libsys::println!("[DMA] Asserting reset (writing 0x{:08x})...", val | 0x1);
         self.write_remap_cbtop(remap::WF_SUBSYS_RST, val | 0x1);
 
         // Readback to verify write
         let val_during = self.read_remap_cbtop(remap::WF_SUBSYS_RST);
-        userlib::println!("[DMA]   WF_SUBSYS_RST during reset: 0x{:08x}", val_during);
+        libsys::println!("[DMA]   WF_SUBSYS_RST during reset: 0x{:08x}", val_during);
 
         // Wait 50ms (reset must be held long enough)
-        userlib::delay_ms(50);
+        libsys::delay_ms(50);
 
         // Clear reset bit
-        userlib::println!("[DMA] Releasing reset (writing 0x{:08x})...", val & !0x1);
+        libsys::println!("[DMA] Releasing reset (writing 0x{:08x})...", val & !0x1);
         self.write_remap_cbtop(remap::WF_SUBSYS_RST, val & !0x1);
 
         // Wait 100ms for ROM to boot and reach download state
         // The MT7996 ROM needs time to initialize after reset
-        userlib::delay_ms(100);
+        libsys::delay_ms(100);
 
         let val_after = self.read_remap_cbtop(remap::WF_SUBSYS_RST);
-        userlib::println!("[DMA]   WF_SUBSYS_RST after: 0x{:08x}", val_after);
+        libsys::println!("[DMA]   WF_SUBSYS_RST after: 0x{:08x}", val_after);
     }
 
     /// Initialize WFDMA for firmware download
@@ -1975,22 +1975,22 @@ impl<'a> Wfdma<'a> {
 
         // Validate queue ID mappings (catches math errors at init time)
         if let Err(e) = queue_map::validate_mt7996_queue_ids() {
-            userlib::println!("[DMA] FATAL: Queue ID validation failed: {}", e);
+            libsys::println!("[DMA] FATAL: Queue ID validation failed: {}", e);
             return false;
         }
-        userlib::println!("[DMA] Queue ID validation passed");
+        libsys::println!("[DMA] Queue ID validation passed");
 
         // Validate regs.rs constants match Linux regs.h
         regs::validate_registers();
-        userlib::println!("[DMA] Register address validation passed");
+        libsys::println!("[DMA] Register address validation passed");
 
         // Validate dma.rs wfdma constants match regs.rs (catches drift)
         wfdma::validate_against_regs();
-        userlib::println!("[DMA] WFDMA constants cross-validation passed");
+        libsys::println!("[DMA] WFDMA constants cross-validation passed");
 
         // Validate interrupt bits match regs.rs
         int_mask::validate_against_regs();
-        userlib::println!("[DMA] Interrupt mask cross-validation passed");
+        libsys::println!("[DMA] Interrupt mask cross-validation passed");
 
         // === TIMING DIAGNOSTIC ===
         // Verify ARM generic timer is working correctly (if delays don't work, DMA fails)
@@ -2000,19 +2000,19 @@ impl<'a> Wfdma<'a> {
             core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
             core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
         }
-        userlib::println!("[TIMING] cntfrq_el0 = {} Hz ({} MHz)", freq, freq / 1_000_000);
-        userlib::delay_ms(100);
+        libsys::println!("[TIMING] cntfrq_el0 = {} Hz ({} MHz)", freq, freq / 1_000_000);
+        libsys::delay_ms(100);
         let end: u64;
         unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) end); }
         let elapsed_ticks = end - start;
         let expected_ticks = freq / 10; // 100ms = freq/10 ticks
-        userlib::println!("[TIMING] 100ms delay: {} ticks (expected ~{})", elapsed_ticks, expected_ticks);
+        libsys::println!("[TIMING] 100ms delay: {} ticks (expected ~{})", elapsed_ticks, expected_ticks);
         if elapsed_ticks < expected_ticks / 2 {
-            userlib::println!("[TIMING] WARNING: Delay too short! Timer may not be working!");
+            libsys::println!("[TIMING] WARNING: Delay too short! Timer may not be working!");
         } else if elapsed_ticks > expected_ticks * 2 {
-            userlib::println!("[TIMING] WARNING: Delay too long! Scheduler overhead?");
+            libsys::println!("[TIMING] WARNING: Delay too long! Scheduler overhead?");
         } else {
-            userlib::println!("[TIMING] Timer appears to be working correctly");
+            libsys::println!("[TIMING] Timer appears to be working correctly");
         }
         // === END TIMING DIAGNOSTIC ===
 
@@ -2022,13 +2022,13 @@ impl<'a> Wfdma<'a> {
         // Print BAR0 info for diagnostics
         let bar0_size = self.dev.bar0_size();
         let bar0_virt = self.dev.bar0_virt();
-        userlib::println!("[DMA] HIF1 BAR0: virt=0x{:x} size=0x{:x} ({}KB)",
+        libsys::println!("[DMA] HIF1 BAR0: virt=0x{:x} size=0x{:x} ({}KB)",
             bar0_virt, bar0_size, bar0_size / 1024);
 
         // Print HIF2 info if available
         if let Some(hif2_virt) = self.dev.hif2_bar0_virt() {
             let hif2_size = self.dev.hif2_bar0_size();
-            userlib::println!("[DMA] HIF2 BAR0: virt=0x{:x} size=0x{:x} ({}KB)",
+            libsys::println!("[DMA] HIF2 BAR0: virt=0x{:x} size=0x{:x} ({}KB)",
                 hif2_virt, hif2_size, hif2_size / 1024);
         }
 
@@ -2039,10 +2039,10 @@ impl<'a> Wfdma<'a> {
         let cmd = self.dev.command();
         let mem_space = (cmd & 0x02) != 0;
         let bus_master = (cmd & 0x04) != 0;
-        userlib::println!("[DMA] HIF1 PCI CMD: 0x{:04x} (MemSpace={} BusMaster={})",
+        libsys::println!("[DMA] HIF1 PCI CMD: 0x{:04x} (MemSpace={} BusMaster={})",
             cmd, mem_space, bus_master);
         if !bus_master {
-            userlib::println!("[DMA] ERROR: HIF1 Bus Master not enabled! DMA will not work.");
+            libsys::println!("[DMA] ERROR: HIF1 Bus Master not enabled! DMA will not work.");
         }
 
         // Print HIF2 PCI command register (bus master check)
@@ -2050,20 +2050,20 @@ impl<'a> Wfdma<'a> {
             let hif2_cmd = self.dev.hif2_command();
             let hif2_mem_space = (hif2_cmd & 0x02) != 0;
             let hif2_bus_master = (hif2_cmd & 0x04) != 0;
-            userlib::println!("[DMA] HIF2 PCI CMD: 0x{:04x} (MemSpace={} BusMaster={})",
+            libsys::println!("[DMA] HIF2 PCI CMD: 0x{:04x} (MemSpace={} BusMaster={})",
                 hif2_cmd, hif2_mem_space, hif2_bus_master);
             if !hif2_bus_master {
-                userlib::println!("[DMA] ERROR: HIF2 Bus Master not enabled! HIF2 DMA will not work.");
+                libsys::println!("[DMA] ERROR: HIF2 Bus Master not enabled! HIF2 DMA will not work.");
             }
 
             // HIF2 access method: always via HIF1 BAR + 0x4000 offset (per Linux mt76)
             // Direct HIF2 BAR access is NOT used - it may return different values and
             // doesn't control the actual hardware the same way.
-            userlib::println!("[DMA] HIF2 accessed via HIF1+0x4000 (Linux mt76 method)");
+            libsys::println!("[DMA] HIF2 accessed via HIF1+0x4000 (Linux mt76 method)");
         }
 
         // Test which register ranges are writable
-        userlib::println!("[DMA] Testing register writability (WFDMA0_BASE=0x{:x}):", self.wfdma0_base);
+        libsys::println!("[DMA] Testing register writability (WFDMA0_BASE=0x{:x}):", self.wfdma0_base);
 
         // Scan test: try writing to various offsets in 0x100-0x400 range
         // to find where writes start failing
@@ -2096,7 +2096,7 @@ impl<'a> Wfdma<'a> {
             // Restore original
             self.write(*offset, before);
             let status = if after == test_val { "OK" } else if after == before { "UNCHANGED" } else { "PARTIAL" };
-            userlib::println!("[DMA]   0x{:03x} {}: before=0x{:08x} after=0x{:08x} {}",
+            libsys::println!("[DMA]   0x{:03x} {}: before=0x{:08x} after=0x{:08x} {}",
                 offset, name, before, after, status);
         }
 
@@ -2116,10 +2116,10 @@ impl<'a> Wfdma<'a> {
         // Step 1: WFDMA reset - pulse RST then initialize control registers
         // IMPORTANT: RST pulse clears ring bases/prefetch but NOT control registers!
         // We must explicitly initialize GLO_CFG, INT_MASK, PRI_DLY_INT after RST.
-        userlib::println!("[DMA] WFDMA reset...");
+        libsys::println!("[DMA] WFDMA reset...");
 
         let rst_before = self.read(wfdma::RST);
-        userlib::println!("[DMA] RST before pulse: 0x{:08x}", rst_before);
+        libsys::println!("[DMA] RST before pulse: 0x{:08x}", rst_before);
 
         // Pulse RST: clear then set (Linux mt7996_dma_disable pattern)
         // CRITICAL: Use RMW like Linux mt76_clear/mt76_set to preserve any other bits!
@@ -2127,14 +2127,14 @@ impl<'a> Wfdma<'a> {
         let rst_val = self.read(wfdma::RST);
         self.write(wfdma::RST, rst_val & !rst_mask);  // mt76_clear
         unsafe { core::arch::asm!("dsb sy"); }
-        userlib::delay_us(100);
+        libsys::delay_us(100);
         let rst_val = self.read(wfdma::RST);
         self.write(wfdma::RST, rst_val | rst_mask);   // mt76_set
         unsafe { core::arch::asm!("dsb sy"); }
-        userlib::delay_ms(10);
+        libsys::delay_ms(10);
 
         let rst_after = self.read(wfdma::RST);
-        userlib::println!("[DMA] RST after pulse: 0x{:08x}", rst_after);
+        libsys::println!("[DMA] RST after pulse: 0x{:08x}", rst_after);
 
         // NOTE: Linux does NOT touch INT_MASK or PRI_DLY_INT in dma_disable!
         // - PRI_DLY_INT is cleared in dma_enable (after driver_own)
@@ -2149,12 +2149,12 @@ impl<'a> Wfdma<'a> {
         // Do NOT set any bits here - they get set during enable phase.
         // The transition from "all cleared" to "all set" may be important for RST auto-release.
         let glo = self.read(wfdma::GLO_CFG);
-        userlib::println!("[DMA] GLO_CFG initial: 0x{:08x}", glo);
+        libsys::println!("[DMA] GLO_CFG initial: 0x{:08x}", glo);
         let clear_mask = glo_cfg::TX_DMA_EN | glo_cfg::RX_DMA_EN |
                          glo_cfg::OMIT_TX_INFO | glo_cfg::OMIT_RX_INFO | glo_cfg::OMIT_RX_INFO_PFET2;
         let glo_clean = glo & !clear_mask;  // Just clear, don't set anything back
         self.write(wfdma::GLO_CFG, glo_clean);
-        userlib::println!("[DMA] GLO_CFG after clean: 0x{:08x}", self.read(wfdma::GLO_CFG));
+        libsys::println!("[DMA] GLO_CFG after clean: 0x{:08x}", self.read(wfdma::GLO_CFG));
 
         // Step 2b: Reset HIF2 AFTER HIF1 - this is Linux's mt7996_dma_disable() order
         // Linux: HIF1 RST → HIF1 GLO_CFG → HIF2 RST → HIF2 GLO_CFG
@@ -2165,75 +2165,75 @@ impl<'a> Wfdma<'a> {
 
         // Step 3: RST stays 0x30 during ring programming (auto-releases when GLO_CFG enables DMA)
         let rst_val = self.read(wfdma::RST);
-        userlib::println!("[DMA] RST before ring programming: 0x{:08x} (should be 0x30)", rst_val);
+        libsys::println!("[DMA] RST before ring programming: 0x{:08x} (should be 0x30)", rst_val);
 
         // State: Reset complete, ready for ring programming
         self.state = WfdmaState::Reset;
 
         // Allocate WM ring (Ring 0) - for MCU commands with TXD header
         // Linux: mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_WM, ...)
-        userlib::println!("[DMA] Allocating WM ring (Ring 0 for MCU commands)...");
+        libsys::println!("[DMA] Allocating WM ring (Ring 0 for MCU commands)...");
         self.wm_ring = FwdlRing::new();
         if self.wm_ring.is_none() {
-            userlib::println!("[DMA] Failed to allocate WM ring!");
+            libsys::println!("[DMA] Failed to allocate WM ring!");
             self.set_error();
             return false;
         }
 
         let wm_ring = self.wm_ring.as_ref().unwrap();
-        userlib::println!("[DMA] WM ring allocated: vaddr=0x{:x}, paddr=0x{:x}, cnt={}",
+        libsys::println!("[DMA] WM ring allocated: vaddr=0x{:x}, paddr=0x{:x}, cnt={}",
             wm_ring.desc_vaddr, wm_ring.desc_paddr, wm_ring.size);
 
         // Configure WM ring (hardware ring 17)
         let wm_ring_base = McuQueue::Wm.ring_offset();
-        userlib::println!("[DMA] WM Ring@WFDMA+0x{:x} programming...", wm_ring_base);
+        libsys::println!("[DMA] WM Ring@WFDMA+0x{:x} programming...", wm_ring_base);
         self.write(wm_ring_base + wfdma::RING_BASE, wm_ring.desc_paddr as u32);
         self.write(wm_ring_base + wfdma::RING_MAX_CNT, wm_ring.size);
         self.write(wm_ring_base + wfdma::RING_CPU_IDX, 0);
         self.write(wm_ring_base + wfdma::RING_DMA_IDX, 0);
         let wm_base_rb = self.read(wm_ring_base + wfdma::RING_BASE);
         let wm_cnt_rb = self.read(wm_ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA] WM Ring after write: base=0x{:08x} cnt={}", wm_base_rb, wm_cnt_rb);
+        libsys::println!("[DMA] WM Ring after write: base=0x{:08x} cnt={}", wm_base_rb, wm_cnt_rb);
 
         // Allocate WA ring (Ring 1) - for WA MCU commands (required for RST auto-release)
         // Linux: mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_WA, ...)
         // Per deepwiki: DMA engine expects ALL configured queues to have valid descriptors
-        userlib::println!("[DMA] Allocating WA ring (Ring 1 for WA MCU commands)...");
+        libsys::println!("[DMA] Allocating WA ring (Ring 1 for WA MCU commands)...");
         self.wa_ring = FwdlRing::new();
         if self.wa_ring.is_none() {
-            userlib::println!("[DMA] Failed to allocate WA ring!");
+            libsys::println!("[DMA] Failed to allocate WA ring!");
             self.set_error();
             return false;
         }
 
         let wa_ring = self.wa_ring.as_ref().unwrap();
-        userlib::println!("[DMA] WA ring allocated: vaddr=0x{:x}, paddr=0x{:x}, cnt={}",
+        libsys::println!("[DMA] WA ring allocated: vaddr=0x{:x}, paddr=0x{:x}, cnt={}",
             wa_ring.desc_vaddr, wa_ring.desc_paddr, wa_ring.size);
 
         // Configure WA ring (hardware ring 20)
         let wa_ring_base = McuQueue::Wa.ring_offset();
-        userlib::println!("[DMA] WA Ring@WFDMA+0x{:x} programming...", wa_ring_base);
+        libsys::println!("[DMA] WA Ring@WFDMA+0x{:x} programming...", wa_ring_base);
         self.write(wa_ring_base + wfdma::RING_BASE, wa_ring.desc_paddr as u32);
         self.write(wa_ring_base + wfdma::RING_MAX_CNT, wa_ring.size);
         self.write(wa_ring_base + wfdma::RING_CPU_IDX, 0);
         self.write(wa_ring_base + wfdma::RING_DMA_IDX, 0);
         let wa_base_rb = self.read(wa_ring_base + wfdma::RING_BASE);
         let wa_cnt_rb = self.read(wa_ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA] WA Ring after write: base=0x{:08x} cnt={}", wa_base_rb, wa_cnt_rb);
+        libsys::println!("[DMA] WA Ring after write: base=0x{:08x} cnt={}", wa_base_rb, wa_cnt_rb);
 
         // Allocate firmware download ring (Ring 2) - for raw FW data WITHOUT TXD
         // Linux: mt76_init_mcu_queue(&dev->mt76, MT_MCUQ_FWDL, ...)
-        userlib::println!("[DMA] Allocating FWDL ring (Ring 2 for raw FW data)...");
+        libsys::println!("[DMA] Allocating FWDL ring (Ring 2 for raw FW data)...");
         self.fwdl_ring = FwdlRing::new();
         if self.fwdl_ring.is_none() {
-            userlib::println!("[DMA] Failed to allocate FWDL ring!");
+            libsys::println!("[DMA] Failed to allocate FWDL ring!");
             self.set_error();
             return false;
         }
 
         let ring = self.fwdl_ring.as_ref().unwrap();
         let desc_bytes = (ring.size as usize) * core::mem::size_of::<TxDesc>();
-        userlib::println!("[DMA] FWDL ring allocated: vaddr=0x{:x}, paddr=0x{:x}, cnt={}, bytes={}",
+        libsys::println!("[DMA] FWDL ring allocated: vaddr=0x{:x}, paddr=0x{:x}, cnt={}, bytes={}",
             ring.desc_vaddr, ring.desc_paddr, ring.size, desc_bytes);
 
         // CRITICAL: Verify DMA addresses are below 4GB (MT7996 has 32-bit DMA on some paths)
@@ -2247,8 +2247,8 @@ impl<'a> Wfdma<'a> {
         let ring_base = McuQueue::Fwdl.ring_offset();
 
         // Debug: dump ring register space before config
-        userlib::println!("[DMA] FWDL Ring@WFDMA+0x{:x} before write:", ring_base);
-        userlib::println!("[DMA]   regs: {:08x} {:08x} {:08x} {:08x}",
+        libsys::println!("[DMA] FWDL Ring@WFDMA+0x{:x} before write:", ring_base);
+        libsys::println!("[DMA]   regs: {:08x} {:08x} {:08x} {:08x}",
             self.read(ring_base + 0x00), self.read(ring_base + 0x04),
             self.read(ring_base + 0x08), self.read(ring_base + 0x0c));
 
@@ -2261,12 +2261,12 @@ impl<'a> Wfdma<'a> {
         // Verify ring configuration
         let rb_base = self.read(ring_base + wfdma::RING_BASE);
         let rb_cnt = self.read(ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA] FWDL Ring after write: base=0x{:08x} cnt={} {}",
+        libsys::println!("[DMA] FWDL Ring after write: base=0x{:08x} cnt={} {}",
             rb_base, rb_cnt,
             if rb_base == ring.desc_paddr as u32 { "OK" } else { "FAILED!" });
 
         if rb_base != ring.desc_paddr as u32 {
-            userlib::println!("[DMA] ERROR: Ring base write failed! DMA won't work.");
+            libsys::println!("[DMA] ERROR: Ring base write failed! DMA won't work.");
             self.set_error();
             return false;
         }
@@ -2288,16 +2288,16 @@ impl<'a> Wfdma<'a> {
 
         // Step 4: Set up RX MCU queue for receiving MCU responses
         // This is required for the MCU to send responses to our commands
-        userlib::println!("[DMA] Setting up RX MCU queue...");
+        libsys::println!("[DMA] Setting up RX MCU queue...");
         self.rx_mcu_ring = RxRing::new(wfdma::RX_MCU_RING_SIZE);
         if self.rx_mcu_ring.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate RX MCU ring");
+            libsys::println!("[DMA] ERROR: Failed to allocate RX MCU ring");
             self.set_error();
             return false;
         }
 
         let rx_ring = self.rx_mcu_ring.as_ref().unwrap();
-        userlib::println!("[DMA] RX MCU ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
+        libsys::println!("[DMA] RX MCU ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
             rx_ring.desc_vaddr, rx_ring.desc_paddr, rx_ring.size);
 
         // CRITICAL: Verify DMA addresses are below 4GB
@@ -2341,22 +2341,22 @@ impl<'a> Wfdma<'a> {
 
         // Allocate RX WA ring (rx ring 1) - for receiving WA event responses
         // Per deepwiki: ALL configured queues need valid descriptors for RST auto-release
-        userlib::println!("[DMA] Allocating RX WA ring (rx ring 1)...");
+        libsys::println!("[DMA] Allocating RX WA ring (rx ring 1)...");
         self.rx_wa_ring = RxRing::new(wfdma::RX_MCU_RING_SIZE);
         if self.rx_wa_ring.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate RX WA ring");
+            libsys::println!("[DMA] ERROR: Failed to allocate RX WA ring");
             self.set_error();
             return false;
         }
 
         let rx_wa_ring = self.rx_wa_ring.as_ref().unwrap();
-        userlib::println!("[DMA] RX WA ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
+        libsys::println!("[DMA] RX WA ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
             rx_wa_ring.desc_vaddr, rx_wa_ring.desc_paddr, rx_wa_ring.size);
 
         // Configure RX WA ring registers (rx ring 1)
         // RX rings use hardware indices directly
         let rx_wa_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_MCU_WA) * 0x10;
-        userlib::println!("[DMA] RX WA Ring@WFDMA+0x{:x} programming...", rx_wa_ring_base);
+        libsys::println!("[DMA] RX WA Ring@WFDMA+0x{:x} programming...", rx_wa_ring_base);
         self.write(rx_wa_ring_base + wfdma::RING_BASE, rx_wa_ring.desc_paddr as u32);
         self.write(rx_wa_ring_base + wfdma::RING_MAX_CNT, rx_wa_ring.size);
         self.write(rx_wa_ring_base + wfdma::RING_CPU_IDX, 0);
@@ -2365,93 +2365,93 @@ impl<'a> Wfdma<'a> {
         self.write(rx_wa_ring_base + wfdma::RING_CPU_IDX, rx_wa_ring.size - 1);
         let rx_wa_base_rb = self.read(rx_wa_ring_base + wfdma::RING_BASE);
         let rx_wa_cnt_rb = self.read(rx_wa_ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA] RX WA Ring after write: base=0x{:08x} cnt={}", rx_wa_base_rb, rx_wa_cnt_rb);
+        libsys::println!("[DMA] RX WA Ring after write: base=0x{:08x} cnt={}", rx_wa_base_rb, rx_wa_cnt_rb);
 
         // Allocate RX WA MAIN ring (RXQ 2) - TXFREE via WA
         // Per deepwiki: ALL configured queues need valid descriptors for RST auto-release
-        userlib::println!("[DMA] Allocating RX WA MAIN ring (rx ring 2)...");
+        libsys::println!("[DMA] Allocating RX WA MAIN ring (rx ring 2)...");
         self.rx_wa_main_ring = RxRing::new(wfdma::RX_MCU_RING_SIZE);
         if self.rx_wa_main_ring.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate RX WA MAIN ring");
+            libsys::println!("[DMA] ERROR: Failed to allocate RX WA MAIN ring");
             self.set_error();
             return false;
         }
         let rx_wa_main = self.rx_wa_main_ring.as_ref().unwrap();
-        userlib::println!("[DMA] RX WA MAIN ring: paddr=0x{:x}, size={}", rx_wa_main.desc_paddr, rx_wa_main.size);
+        libsys::println!("[DMA] RX WA MAIN ring: paddr=0x{:x}, size={}", rx_wa_main.desc_paddr, rx_wa_main.size);
         // Configure RX WA MAIN ring - hardware queue index 2, offset 0x520
         let rx_wa_main_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_MCU_WA_MAIN * 0x10;
-        userlib::println!("[DMA] RX WA MAIN Ring@WFDMA+0x{:x} programming...", rx_wa_main_ring_base);
+        libsys::println!("[DMA] RX WA MAIN Ring@WFDMA+0x{:x} programming...", rx_wa_main_ring_base);
         self.write(rx_wa_main_ring_base + wfdma::RING_BASE, rx_wa_main.desc_paddr as u32);
         self.write(rx_wa_main_ring_base + wfdma::RING_MAX_CNT, rx_wa_main.size);
         self.write(rx_wa_main_ring_base + wfdma::RING_CPU_IDX, 0);
         self.write(rx_wa_main_ring_base + wfdma::RING_DMA_IDX, 0);
         self.write(rx_wa_main_ring_base + wfdma::RING_CPU_IDX, rx_wa_main.size - 1);
         let rb = self.read(rx_wa_main_ring_base + wfdma::RING_BASE);
-        userlib::println!("[DMA] RX WA MAIN Ring after write: base=0x{:08x}", rb);
+        libsys::println!("[DMA] RX WA MAIN Ring after write: base=0x{:08x}", rb);
 
         // Allocate RX WA TRI ring (RXQ 3) - Band2 WA events (on HIF1!)
-        userlib::println!("[DMA] Allocating RX WA TRI ring (rx ring 3)...");
+        libsys::println!("[DMA] Allocating RX WA TRI ring (rx ring 3)...");
         self.rx_wa_tri_ring = RxRing::new(wfdma::RX_MCU_RING_SIZE);
         if self.rx_wa_tri_ring.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate RX WA TRI ring");
+            libsys::println!("[DMA] ERROR: Failed to allocate RX WA TRI ring");
             self.set_error();
             return false;
         }
         let rx_wa_tri = self.rx_wa_tri_ring.as_ref().unwrap();
-        userlib::println!("[DMA] RX WA TRI ring: paddr=0x{:x}, size={}", rx_wa_tri.desc_paddr, rx_wa_tri.size);
+        libsys::println!("[DMA] RX WA TRI ring: paddr=0x{:x}, size={}", rx_wa_tri.desc_paddr, rx_wa_tri.size);
         // Configure RX WA TRI ring - hardware queue index 3, offset 0x530
         let rx_wa_tri_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_MCU_WA_TRI * 0x10;
-        userlib::println!("[DMA] RX WA TRI Ring@WFDMA+0x{:x} programming...", rx_wa_tri_ring_base);
+        libsys::println!("[DMA] RX WA TRI Ring@WFDMA+0x{:x} programming...", rx_wa_tri_ring_base);
         self.write(rx_wa_tri_ring_base + wfdma::RING_BASE, rx_wa_tri.desc_paddr as u32);
         self.write(rx_wa_tri_ring_base + wfdma::RING_MAX_CNT, rx_wa_tri.size);
         self.write(rx_wa_tri_ring_base + wfdma::RING_CPU_IDX, 0);
         self.write(rx_wa_tri_ring_base + wfdma::RING_DMA_IDX, 0);
         self.write(rx_wa_tri_ring_base + wfdma::RING_CPU_IDX, rx_wa_tri.size - 1);
         let rb = self.read(rx_wa_tri_ring_base + wfdma::RING_BASE);
-        userlib::println!("[DMA] RX WA TRI Ring after write: base=0x{:08x}", rb);
+        libsys::println!("[DMA] RX WA TRI Ring after write: base=0x{:08x}", rb);
 
         // Allocate Data TX ring (band0) - REQUIRED per deepwiki
         // All TX rings use MCU_RING_BASE + hw_idx * 0x10 (TXQ_BAND0 = 18 → offset 0x420)
-        userlib::println!("[DMA] Allocating Data TX ring (band0)...");
+        libsys::println!("[DMA] Allocating Data TX ring (band0)...");
         self.tx_data_ring = FwdlRing::new_with_size(wfdma::TX_RING_SIZE);
         if self.tx_data_ring.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate Data TX ring");
+            libsys::println!("[DMA] ERROR: Failed to allocate Data TX ring");
             self.set_error();
             return false;
         }
 
         let tx_data = self.tx_data_ring.as_ref().unwrap();
-        userlib::println!("[DMA] Data TX ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
+        libsys::println!("[DMA] Data TX ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
             tx_data.desc_vaddr, tx_data.desc_paddr, tx_data.size);
 
         // Configure Data TX ring registers (at MCU_RING_BASE + TXQ_BAND0 * 0x10 = 0x300 + 18*0x10 = 0x420)
         let tx_data_ring_base = wfdma::MCU_RING_BASE + wfdma::TXQ_BAND0 * 0x10;
-        userlib::println!("[DMA] Data TX Ring@WFDMA+0x{:x} programming...", tx_data_ring_base);
+        libsys::println!("[DMA] Data TX Ring@WFDMA+0x{:x} programming...", tx_data_ring_base);
         self.write(tx_data_ring_base + wfdma::RING_BASE, tx_data.desc_paddr as u32);
         self.write(tx_data_ring_base + wfdma::RING_MAX_CNT, tx_data.size);
         self.write(tx_data_ring_base + wfdma::RING_CPU_IDX, 0);
         self.write(tx_data_ring_base + wfdma::RING_DMA_IDX, 0);
         let tx_data_base_rb = self.read(tx_data_ring_base + wfdma::RING_BASE);
         let tx_data_cnt_rb = self.read(tx_data_ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA] Data TX Ring after write: base=0x{:08x} cnt={}", tx_data_base_rb, tx_data_cnt_rb);
+        libsys::println!("[DMA] Data TX Ring after write: base=0x{:08x} cnt={}", tx_data_base_rb, tx_data_cnt_rb);
 
         // Allocate RX MAIN data ring (band0) - REQUIRED per deepwiki
         // RX MAIN is at RX ring index 4 (RXQ_BAND0)
-        userlib::println!("[DMA] Allocating RX MAIN ring (band0)...");
+        libsys::println!("[DMA] Allocating RX MAIN ring (band0)...");
         self.rx_main_ring = RxRing::new(wfdma::RX_DATA_RING_SIZE);
         if self.rx_main_ring.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate RX MAIN ring");
+            libsys::println!("[DMA] ERROR: Failed to allocate RX MAIN ring");
             self.set_error();
             return false;
         }
 
         let rx_main = self.rx_main_ring.as_ref().unwrap();
-        userlib::println!("[DMA] RX MAIN ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
+        libsys::println!("[DMA] RX MAIN ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
             rx_main.desc_vaddr, rx_main.desc_paddr, rx_main.size);
 
         // Configure RX MAIN ring registers - hw ring 4 at offset 0x540
         let rx_main_ring_base = wfdma::RX_RING_BASE + (wfdma::RXQ_BAND0) * 0x10;
-        userlib::println!("[DMA] RX MAIN Ring@WFDMA+0x{:x} programming...", rx_main_ring_base);
+        libsys::println!("[DMA] RX MAIN Ring@WFDMA+0x{:x} programming...", rx_main_ring_base);
         self.write(rx_main_ring_base + wfdma::RING_BASE, rx_main.desc_paddr as u32);
         self.write(rx_main_ring_base + wfdma::RING_MAX_CNT, rx_main.size);
         self.write(rx_main_ring_base + wfdma::RING_CPU_IDX, 0);
@@ -2460,23 +2460,23 @@ impl<'a> Wfdma<'a> {
         self.write(rx_main_ring_base + wfdma::RING_CPU_IDX, rx_main.size - 1);
         let rx_main_base_rb = self.read(rx_main_ring_base + wfdma::RING_BASE);
         let rx_main_cnt_rb = self.read(rx_main_ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA] RX MAIN Ring after write: base=0x{:08x} cnt={}", rx_main_base_rb, rx_main_cnt_rb);
+        libsys::println!("[DMA] RX MAIN Ring after write: base=0x{:08x} cnt={}", rx_main_base_rb, rx_main_cnt_rb);
 
         // Allocate RX TXFREE ring (band0) - CRITICAL for RST auto-release!
         // HW ring 9 at offset 0x500 + 9*0x10 = 0x590
-        userlib::println!("[DMA] Allocating RX TXFREE ring (band0)...");
+        libsys::println!("[DMA] Allocating RX TXFREE ring (band0)...");
         self.rx_txfree_ring = RxRing::new(wfdma::RX_TXFREE_RING_SIZE);
         if self.rx_txfree_ring.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate RX TXFREE ring");
+            libsys::println!("[DMA] ERROR: Failed to allocate RX TXFREE ring");
             return false;
         }
         let rx_txfree = self.rx_txfree_ring.as_ref().unwrap();
-        userlib::println!("[DMA] RX TXFREE ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
+        libsys::println!("[DMA] RX TXFREE ring: vaddr=0x{:x}, paddr=0x{:x}, size={}",
             rx_txfree.desc_vaddr, rx_txfree.desc_paddr, rx_txfree.size);
 
         // Configure RX TXFREE ring registers at hw ring 9
         let rx_txfree_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_TXFREE_BAND0 * 0x10;
-        userlib::println!("[DMA] RX TXFREE Ring@WFDMA+0x{:x} programming...", rx_txfree_ring_base);
+        libsys::println!("[DMA] RX TXFREE Ring@WFDMA+0x{:x} programming...", rx_txfree_ring_base);
         self.write(rx_txfree_ring_base + wfdma::RING_BASE, rx_txfree.desc_paddr as u32);
         self.write(rx_txfree_ring_base + wfdma::RING_MAX_CNT, rx_txfree.size);
         self.write(rx_txfree_ring_base + wfdma::RING_CPU_IDX, 0);
@@ -2485,45 +2485,45 @@ impl<'a> Wfdma<'a> {
         self.write(rx_txfree_ring_base + wfdma::RING_CPU_IDX, rx_txfree.size - 1);
         let rx_txfree_base_rb = self.read(rx_txfree_ring_base + wfdma::RING_BASE);
         let rx_txfree_cnt_rb = self.read(rx_txfree_ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA] RX TXFREE Ring after write: base=0x{:08x} cnt={}", rx_txfree_base_rb, rx_txfree_cnt_rb);
+        libsys::println!("[DMA] RX TXFREE Ring after write: base=0x{:08x} cnt={}", rx_txfree_base_rb, rx_txfree_cnt_rb);
 
         // Allocate RX RRO ring (band0) - Hardware Receive Reorder
         // HW ring 8 at offset 0x500 + 8*0x10 = 0x580
-        userlib::println!("[DMA] Allocating RX RRO BAND0 ring...");
+        libsys::println!("[DMA] Allocating RX RRO BAND0 ring...");
         self.rx_rro_band0_ring = RxRing::new_rro(wfdma::RX_RRO_RING_SIZE);
         if self.rx_rro_band0_ring.is_none() {
-            userlib::println!("[DMA] ERROR: Failed to allocate RX RRO BAND0 ring");
+            libsys::println!("[DMA] ERROR: Failed to allocate RX RRO BAND0 ring");
             return false;
         }
         let rx_rro = self.rx_rro_band0_ring.as_ref().unwrap();
-        userlib::println!("[DMA] RX RRO BAND0 ring: paddr=0x{:x}, size={}", rx_rro.desc_paddr, rx_rro.size);
+        libsys::println!("[DMA] RX RRO BAND0 ring: paddr=0x{:x}, size={}", rx_rro.desc_paddr, rx_rro.size);
         // Configure RX RRO BAND0 ring at hw ring 8
         let rx_rro_ring_base = wfdma::RX_RING_BASE + wfdma::RXQ_RRO_BAND0 * 0x10;
-        userlib::println!("[DMA] RX RRO BAND0 Ring@WFDMA+0x{:x} programming...", rx_rro_ring_base);
+        libsys::println!("[DMA] RX RRO BAND0 Ring@WFDMA+0x{:x} programming...", rx_rro_ring_base);
         self.write(rx_rro_ring_base + wfdma::RING_BASE, rx_rro.desc_paddr as u32);
         self.write(rx_rro_ring_base + wfdma::RING_MAX_CNT, rx_rro.size);
         self.write(rx_rro_ring_base + wfdma::RING_CPU_IDX, 0);
         self.write(rx_rro_ring_base + wfdma::RING_DMA_IDX, 0);
         self.write(rx_rro_ring_base + wfdma::RING_CPU_IDX, rx_rro.size - 1);
         let rb = self.read(rx_rro_ring_base + wfdma::RING_BASE);
-        userlib::println!("[DMA] RX RRO BAND0 Ring after write: base=0x{:08x}", rb);
+        libsys::println!("[DMA] RX RRO BAND0 Ring after write: base=0x{:08x}", rb);
 
         // === HIF2 Ring Configuration (CRITICAL for dual-HIF RST release!) ===
         // HIF2 needs dedicated rings separate from HIF1. Without these, RST won't release.
         if self.dev.has_hif2() {
-            userlib::println!("[DMA] === HIF2 Ring Configuration ===");
+            libsys::println!("[DMA] === HIF2 Ring Configuration ===");
 
             // Allocate HIF2 RX TXFREE ring (band2)
             // Hardware queue index 7 (RXQ_TXFREE_BAND2), ring offset = 0x500 + 7*0x10 = 0x570
-            userlib::println!("[DMA] Allocating HIF2 RX TXFREE ring (band2)...");
+            libsys::println!("[DMA] Allocating HIF2 RX TXFREE ring (band2)...");
             self.hif2_rx_txfree_ring = RxRing::new(wfdma::RX_TXFREE_RING_SIZE);
             if let Some(ref hif2_txfree) = self.hif2_rx_txfree_ring {
-                userlib::println!("[DMA] HIF2 TXFREE ring: paddr=0x{:x}, size={}",
+                libsys::println!("[DMA] HIF2 TXFREE ring: paddr=0x{:x}, size={}",
                     hif2_txfree.desc_paddr, hif2_txfree.size);
 
                 // Configure HIF2 RX TXFREE ring via HIF1+0x4000 offset
                 let hif2_txfree_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + wfdma::RXQ_TXFREE_BAND2 * 0x10;
-                userlib::println!("[DMA] HIF2 TXFREE Ring@0x{:x} programming (via HIF1+0x4000)...", hif2_txfree_ring_base);
+                libsys::println!("[DMA] HIF2 TXFREE Ring@0x{:x} programming (via HIF1+0x4000)...", hif2_txfree_ring_base);
                 self.dev.hif2_via_hif1_write32(hif2_txfree_ring_base + wfdma::RING_BASE, hif2_txfree.desc_paddr as u32);
                 self.dev.hif2_via_hif1_write32(hif2_txfree_ring_base + wfdma::RING_MAX_CNT, hif2_txfree.size);
                 self.dev.hif2_via_hif1_write32(hif2_txfree_ring_base + wfdma::RING_CPU_IDX, 0);
@@ -2531,22 +2531,22 @@ impl<'a> Wfdma<'a> {
                 self.dev.hif2_via_hif1_write32(hif2_txfree_ring_base + wfdma::RING_CPU_IDX, hif2_txfree.size - 1);
 
                 let base_rb = self.dev.hif2_via_hif1_read32(hif2_txfree_ring_base + wfdma::RING_BASE);
-                userlib::println!("[DMA] HIF2 TXFREE Ring readback: base=0x{:08x}", base_rb);
+                libsys::println!("[DMA] HIF2 TXFREE Ring readback: base=0x{:08x}", base_rb);
             } else {
-                userlib::println!("[DMA] WARNING: Failed to allocate HIF2 TXFREE ring");
+                libsys::println!("[DMA] WARNING: Failed to allocate HIF2 TXFREE ring");
             }
 
             // Allocate HIF2 RX data ring (band2)
             // Hardware queue index 5 (RXQ_BAND2), ring offset = 0x500 + 5*0x10 = 0x550
-            userlib::println!("[DMA] Allocating HIF2 RX data ring (band2)...");
+            libsys::println!("[DMA] Allocating HIF2 RX data ring (band2)...");
             self.hif2_rx_data_ring = RxRing::new(wfdma::RX_DATA_RING_SIZE);
             if let Some(ref hif2_rx_data) = self.hif2_rx_data_ring {
-                userlib::println!("[DMA] HIF2 RX data ring: paddr=0x{:x}, size={}",
+                libsys::println!("[DMA] HIF2 RX data ring: paddr=0x{:x}, size={}",
                     hif2_rx_data.desc_paddr, hif2_rx_data.size);
 
                 // Configure HIF2 RX data ring via HIF1+0x4000 offset
                 let hif2_rx_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + wfdma::RXQ_BAND2 * 0x10;
-                userlib::println!("[DMA] HIF2 RX data Ring@0x{:x} programming...", hif2_rx_ring_base);
+                libsys::println!("[DMA] HIF2 RX data Ring@0x{:x} programming...", hif2_rx_ring_base);
                 self.dev.hif2_via_hif1_write32(hif2_rx_ring_base + wfdma::RING_BASE, hif2_rx_data.desc_paddr as u32);
                 self.dev.hif2_via_hif1_write32(hif2_rx_ring_base + wfdma::RING_MAX_CNT, hif2_rx_data.size);
                 self.dev.hif2_via_hif1_write32(hif2_rx_ring_base + wfdma::RING_CPU_IDX, 0);
@@ -2554,66 +2554,66 @@ impl<'a> Wfdma<'a> {
                 self.dev.hif2_via_hif1_write32(hif2_rx_ring_base + wfdma::RING_CPU_IDX, hif2_rx_data.size - 1);
 
                 let base_rb = self.dev.hif2_via_hif1_read32(hif2_rx_ring_base + wfdma::RING_BASE);
-                userlib::println!("[DMA] HIF2 RX data Ring readback: base=0x{:08x}", base_rb);
+                libsys::println!("[DMA] HIF2 RX data Ring readback: base=0x{:08x}", base_rb);
             } else {
-                userlib::println!("[DMA] WARNING: Failed to allocate HIF2 RX data ring");
+                libsys::println!("[DMA] WARNING: Failed to allocate HIF2 RX data ring");
             }
 
             // Allocate HIF2 TX data ring (band1) - ring 19
             // Ring 19: MCU_RING_BASE + 19*0x10 = 0x300 + 0x130 = 0x430
-            userlib::println!("[DMA] Allocating HIF2 TX data ring (band1, ring19)...");
+            libsys::println!("[DMA] Allocating HIF2 TX data ring (band1, ring19)...");
             self.hif2_tx_band1_ring = FwdlRing::new_with_size(wfdma::TX_RING_SIZE);
             if let Some(ref hif2_tx_band1) = self.hif2_tx_band1_ring {
-                userlib::println!("[DMA] HIF2 TX band1 ring: paddr=0x{:x}, size={}",
+                libsys::println!("[DMA] HIF2 TX band1 ring: paddr=0x{:x}, size={}",
                     hif2_tx_band1.desc_paddr, hif2_tx_band1.size);
 
                 // Configure HIF2 TX ring via HIF1+0x4000 offset
                 let hif2_tx_band1_base = wfdma::WFDMA0_BASE + wfdma::MCU_RING_BASE + wfdma::TXQ_BAND1 * 0x10;
-                userlib::println!("[DMA] HIF2 TX band1 Ring@0x{:x} programming...", hif2_tx_band1_base);
+                libsys::println!("[DMA] HIF2 TX band1 Ring@0x{:x} programming...", hif2_tx_band1_base);
                 self.dev.hif2_via_hif1_write32(hif2_tx_band1_base + wfdma::RING_BASE, hif2_tx_band1.desc_paddr as u32);
                 self.dev.hif2_via_hif1_write32(hif2_tx_band1_base + wfdma::RING_MAX_CNT, hif2_tx_band1.size);
                 self.dev.hif2_via_hif1_write32(hif2_tx_band1_base + wfdma::RING_CPU_IDX, 0);
                 self.dev.hif2_via_hif1_write32(hif2_tx_band1_base + wfdma::RING_DMA_IDX, 0);
 
                 let base_rb = self.dev.hif2_via_hif1_read32(hif2_tx_band1_base + wfdma::RING_BASE);
-                userlib::println!("[DMA] HIF2 TX band1 Ring readback: base=0x{:08x}", base_rb);
+                libsys::println!("[DMA] HIF2 TX band1 Ring readback: base=0x{:08x}", base_rb);
             } else {
-                userlib::println!("[DMA] WARNING: Failed to allocate HIF2 TX band1 ring");
+                libsys::println!("[DMA] WARNING: Failed to allocate HIF2 TX band1 ring");
             }
 
             // Allocate HIF2 TX data ring (band2) - ring 21
             // Ring 21: MCU_RING_BASE + 21*0x10 = 0x300 + 0x150 = 0x450
-            userlib::println!("[DMA] Allocating HIF2 TX data ring (band2, ring21)...");
+            libsys::println!("[DMA] Allocating HIF2 TX data ring (band2, ring21)...");
             self.hif2_tx_band2_ring = FwdlRing::new_with_size(wfdma::TX_RING_SIZE);
             if let Some(ref hif2_tx_band2) = self.hif2_tx_band2_ring {
-                userlib::println!("[DMA] HIF2 TX band2 ring: paddr=0x{:x}, size={}",
+                libsys::println!("[DMA] HIF2 TX band2 ring: paddr=0x{:x}, size={}",
                     hif2_tx_band2.desc_paddr, hif2_tx_band2.size);
 
                 // Configure HIF2 TX ring via HIF1+0x4000 offset
                 let hif2_tx_band2_base = wfdma::WFDMA0_BASE + wfdma::MCU_RING_BASE + wfdma::TXQ_BAND2 * 0x10;
-                userlib::println!("[DMA] HIF2 TX band2 Ring@0x{:x} programming...", hif2_tx_band2_base);
+                libsys::println!("[DMA] HIF2 TX band2 Ring@0x{:x} programming...", hif2_tx_band2_base);
                 self.dev.hif2_via_hif1_write32(hif2_tx_band2_base + wfdma::RING_BASE, hif2_tx_band2.desc_paddr as u32);
                 self.dev.hif2_via_hif1_write32(hif2_tx_band2_base + wfdma::RING_MAX_CNT, hif2_tx_band2.size);
                 self.dev.hif2_via_hif1_write32(hif2_tx_band2_base + wfdma::RING_CPU_IDX, 0);
                 self.dev.hif2_via_hif1_write32(hif2_tx_band2_base + wfdma::RING_DMA_IDX, 0);
 
                 let base_rb = self.dev.hif2_via_hif1_read32(hif2_tx_band2_base + wfdma::RING_BASE);
-                userlib::println!("[DMA] HIF2 TX band2 Ring readback: base=0x{:08x}", base_rb);
+                libsys::println!("[DMA] HIF2 TX band2 Ring readback: base=0x{:08x}", base_rb);
             } else {
-                userlib::println!("[DMA] WARNING: Failed to allocate HIF2 TX band2 ring");
+                libsys::println!("[DMA] WARNING: Failed to allocate HIF2 TX band2 ring");
             }
 
             // Allocate HIF2 RX RRO ring (band2) - Hardware Receive Reorder
             // Hardware queue index 6 (RXQ_RRO_BAND2), ring offset = 0x500 + 6*0x10 = 0x560
-            userlib::println!("[DMA] Allocating HIF2 RX RRO ring (band2)...");
+            libsys::println!("[DMA] Allocating HIF2 RX RRO ring (band2)...");
             self.hif2_rx_rro_band2_ring = RxRing::new_rro(wfdma::RX_RRO_RING_SIZE);
             if let Some(ref hif2_rro) = self.hif2_rx_rro_band2_ring {
-                userlib::println!("[DMA] HIF2 RRO band2 ring: paddr=0x{:x}, size={}",
+                libsys::println!("[DMA] HIF2 RRO band2 ring: paddr=0x{:x}, size={}",
                     hif2_rro.desc_paddr, hif2_rro.size);
 
                 // Configure HIF2 RX RRO ring via HIF1+0x4000 offset
                 let hif2_rro_ring_base = wfdma::WFDMA0_BASE + wfdma::RX_RING_BASE + wfdma::RXQ_RRO_BAND2 * 0x10;
-                userlib::println!("[DMA] HIF2 RRO band2 Ring@0x{:x} programming (via HIF1+0x4000)...", hif2_rro_ring_base);
+                libsys::println!("[DMA] HIF2 RRO band2 Ring@0x{:x} programming (via HIF1+0x4000)...", hif2_rro_ring_base);
                 self.dev.hif2_via_hif1_write32(hif2_rro_ring_base + wfdma::RING_BASE, hif2_rro.desc_paddr as u32);
                 self.dev.hif2_via_hif1_write32(hif2_rro_ring_base + wfdma::RING_MAX_CNT, hif2_rro.size);
                 self.dev.hif2_via_hif1_write32(hif2_rro_ring_base + wfdma::RING_CPU_IDX, 0);
@@ -2621,12 +2621,12 @@ impl<'a> Wfdma<'a> {
                 self.dev.hif2_via_hif1_write32(hif2_rro_ring_base + wfdma::RING_CPU_IDX, hif2_rro.size - 1);
 
                 let base_rb = self.dev.hif2_via_hif1_read32(hif2_rro_ring_base + wfdma::RING_BASE);
-                userlib::println!("[DMA] HIF2 RRO band2 Ring readback: base=0x{:08x}", base_rb);
+                libsys::println!("[DMA] HIF2 RRO band2 Ring readback: base=0x{:08x}", base_rb);
             } else {
-                userlib::println!("[DMA] WARNING: Failed to allocate HIF2 RRO band2 ring");
+                libsys::println!("[DMA] WARNING: Failed to allocate HIF2 RRO band2 ring");
             }
 
-            userlib::println!("[DMA] HIF2 ring configuration complete");
+            libsys::println!("[DMA] HIF2 ring configuration complete");
         }
 
         // NOTE: All the following moved to enable phase (after HIF_MISC poll) per Linux order:
@@ -2635,8 +2635,8 @@ impl<'a> Wfdma<'a> {
         // - HOST_CONFIG, AXI_R2A_CTRL, RX_INT_PCIE_SEL
 
         // Dump ALL rings BEFORE enabling DMA
-        userlib::println!("[DMA] Ring dump BEFORE enable:");
-        userlib::println!("[DMA]   TX MCU rings:");
+        libsys::println!("[DMA] Ring dump BEFORE enable:");
+        libsys::println!("[DMA]   TX MCU rings:");
         // FWDL=16, WM=17, WA=20 (using hw_ring_idx from McuQueue)
         for queue in [McuQueue::Fwdl, McuQueue::Wm, McuQueue::Wa] {
             let rbase = queue.ring_offset();
@@ -2647,17 +2647,17 @@ impl<'a> Wfdma<'a> {
                 McuQueue::Wm => "WM",
                 McuQueue::Wa => "WA",
             };
-            userlib::println!("[DMA]     {} (hw ring {}) @0x{:x}: base=0x{:08x} cnt={}",
+            libsys::println!("[DMA]     {} (hw ring {}) @0x{:x}: base=0x{:08x} cnt={}",
                 name, queue.hw_ring_idx(), rbase, base, cnt);
         }
-        userlib::println!("[DMA]   TX Data ring BAND0 (hw ring 18):");
+        libsys::println!("[DMA]   TX Data ring BAND0 (hw ring 18):");
         {
             let rbase = wfdma::MCU_RING_BASE + wfdma::TXQ_BAND0 * 0x10;
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
-            userlib::println!("[DMA]     BAND0 @0x{:x}: base=0x{:08x} cnt={}", rbase, base, cnt);
+            libsys::println!("[DMA]     BAND0 @0x{:x}: base=0x{:08x} cnt={}", rbase, base, cnt);
         }
-        userlib::println!("[DMA]   RX MCU rings (hw indices 0-3):");
+        libsys::println!("[DMA]   RX MCU rings (hw indices 0-3):");
         for i in 0..4u32 {
             // MCU RX rings use hardware indices 0, 1, 2, 3 directly
             let rbase = wfdma::RX_RING_BASE + i * 0x10;
@@ -2665,9 +2665,9 @@ impl<'a> Wfdma<'a> {
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
             let name = match i { 0 => "MCU", 1 => "WA", 2 => "WA_MAIN", 3 => "WA_TRI", _ => "?" };
-            userlib::println!("[DMA]     {} (ring{}) @0x{:x}: base=0x{:08x} cnt={} cpu={}", name, i, rbase, base, cnt, cpu);
+            libsys::println!("[DMA]     {} (ring{}) @0x{:x}: base=0x{:08x} cnt={} cpu={}", name, i, rbase, base, cnt, cpu);
         }
-        userlib::println!("[DMA]   RX Data rings:");
+        libsys::println!("[DMA]   RX Data rings:");
         {
             // MAIN at hw ring 4 → 0x540
             let rbase = wfdma::RX_RING_BASE + wfdma::RXQ_BAND0 * 0x10;
@@ -2675,7 +2675,7 @@ impl<'a> Wfdma<'a> {
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
             let ring_num = wfdma::RXQ_BAND0;
-            userlib::println!("[DMA]     MAIN (ring{}) @0x{:x}: base=0x{:08x} cnt={} cpu={}", ring_num, rbase, base, cnt, cpu);
+            libsys::println!("[DMA]     MAIN (ring{}) @0x{:x}: base=0x{:08x} cnt={} cpu={}", ring_num, rbase, base, cnt, cpu);
         }
         {
             // TXFREE at hw ring 9 → 0x590
@@ -2683,7 +2683,7 @@ impl<'a> Wfdma<'a> {
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
-            userlib::println!("[DMA]     TXFREE (rx12) @0x{:x}: base=0x{:08x} cnt={} cpu={}", rbase, base, cnt, cpu);
+            libsys::println!("[DMA]     TXFREE (rx12) @0x{:x}: base=0x{:08x} cnt={} cpu={}", rbase, base, cnt, cpu);
         }
         {
             // RRO BAND0 at hw ring 8 → 0x580
@@ -2691,20 +2691,20 @@ impl<'a> Wfdma<'a> {
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
-            userlib::println!("[DMA]     RRO_B0 (rx11) @0x{:x}: base=0x{:08x} cnt={} cpu={}", rbase, base, cnt, cpu);
+            libsys::println!("[DMA]     RRO_B0 (rx11) @0x{:x}: base=0x{:08x} cnt={} cpu={}", rbase, base, cnt, cpu);
         }
 
         // RST should still be 0x30 (Linux keeps it asserted during ring programming)
         let rst_val = self.read(wfdma::RST);
-        userlib::println!("[DMA] RST after ring programming: 0x{:08x} (should be 0x30)", rst_val);
+        libsys::println!("[DMA] RST after ring programming: 0x{:08x} (should be 0x30)", rst_val);
 
         // === HIF2 band-to-PCIe mapping (per Linux dma_init, NOT dma_enable!) ===
         // These are configured in mt7996_dma_init() before driver ownership
         if self.dev.has_hif2() {
             // MT_WFDMA_HOST_CONFIG (0xd7030) - band-to-PCIe mapping
-            userlib::println!("[DMA] Configuring WFDMA_HOST_CONFIG (init phase)...");
+            libsys::println!("[DMA] Configuring WFDMA_HOST_CONFIG (init phase)...");
             let host_cfg = self.dev.read32_raw(wfdma::HOST_CONFIG);
-            userlib::println!("[DMA]   HOST_CONFIG before: 0x{:08x}", host_cfg);
+            libsys::println!("[DMA]   HOST_CONFIG before: 0x{:08x}", host_cfg);
             let host_cfg_step1 = host_cfg | wfdma::HOST_CONFIG_PDMA_BAND;
             self.dev.write32_raw(wfdma::HOST_CONFIG, host_cfg_step1);
             let clear_mask = wfdma::HOST_CONFIG_BAND0_PCIE1 |
@@ -2715,23 +2715,23 @@ impl<'a> Wfdma<'a> {
             let host_cfg_final = self.dev.read32_raw(wfdma::HOST_CONFIG) | wfdma::HOST_CONFIG_BAND2_PCIE1;
             self.dev.write32_raw(wfdma::HOST_CONFIG, host_cfg_final);
             let host_cfg_verify = self.dev.read32_raw(wfdma::HOST_CONFIG);
-            userlib::println!("[DMA]   HOST_CONFIG after: 0x{:08x} (expected 0x400001)", host_cfg_verify);
+            libsys::println!("[DMA]   HOST_CONFIG after: 0x{:08x} (expected 0x400001)", host_cfg_verify);
 
             // MT_WFDMA_AXI_R2A_CTRL (0xd7500)
-            userlib::println!("[DMA] Configuring WFDMA_AXI_R2A_CTRL (init phase)...");
+            libsys::println!("[DMA] Configuring WFDMA_AXI_R2A_CTRL (init phase)...");
             let axi_ctrl = self.dev.read32_raw(wfdma::AXI_R2A_CTRL);
-            userlib::println!("[DMA]   AXI_R2A_CTRL before: 0x{:08x}", axi_ctrl);
+            libsys::println!("[DMA]   AXI_R2A_CTRL before: 0x{:08x}", axi_ctrl);
             let axi_ctrl_new = (axi_ctrl & !wfdma::AXI_R2A_CTRL_OUTSTAND_MASK) | 0x14;
             self.dev.write32_raw(wfdma::AXI_R2A_CTRL, axi_ctrl_new);
-            userlib::println!("[DMA]   AXI_R2A_CTRL after: 0x{:08x}", self.dev.read32_raw(wfdma::AXI_R2A_CTRL));
+            libsys::println!("[DMA]   AXI_R2A_CTRL after: 0x{:08x}", self.dev.read32_raw(wfdma::AXI_R2A_CTRL));
 
             // MT_WFDMA0_RX_INT_PCIE_SEL (0xd4154)
-            userlib::println!("[DMA] Configuring RX_INT_PCIE_SEL (init phase)...");
+            libsys::println!("[DMA] Configuring RX_INT_PCIE_SEL (init phase)...");
             let rx_int_sel = self.read(wfdma::RX_INT_PCIE_SEL);
-            userlib::println!("[DMA]   RX_INT_PCIE_SEL before: 0x{:08x}", rx_int_sel);
+            libsys::println!("[DMA]   RX_INT_PCIE_SEL before: 0x{:08x}", rx_int_sel);
             let rx_int_sel_new = rx_int_sel | wfdma::RX_INT_SEL_RING3;
             self.write(wfdma::RX_INT_PCIE_SEL, rx_int_sel_new);
-            userlib::println!("[DMA]   RX_INT_PCIE_SEL after: 0x{:08x}", self.read(wfdma::RX_INT_PCIE_SEL));
+            libsys::println!("[DMA]   RX_INT_PCIE_SEL after: 0x{:08x}", self.read(wfdma::RX_INT_PCIE_SEL));
         }
 
         // IMPORTANT: Do NOT manually clear RST bits!
@@ -2741,7 +2741,7 @@ impl<'a> Wfdma<'a> {
 
         // Ring allocation complete - caller should call enable() after driver ownership
         self.state = WfdmaState::Reset;
-        userlib::println!("[DMA] Ring allocation complete. Call enable() after driver ownership.");
+        libsys::println!("[DMA] Ring allocation complete. Call enable() after driver ownership.");
         true
     }
 
@@ -2750,25 +2750,25 @@ impl<'a> Wfdma<'a> {
     /// Linux order: dma_enable() is called AFTER driver_own() in load_firmware()
     /// This function completes the DMA initialization sequence.
     pub fn enable(&mut self) -> bool {
-        userlib::println!("[DMA] Enabling WFDMA (after driver ownership)...");
+        libsys::println!("[DMA] Enabling WFDMA (after driver ownership)...");
 
         // FWDL ring base for debugging (hw ring 16 = offset 0x100 from MCU_RING_BASE)
         let ring_base = McuQueue::Fwdl.ring_offset();
 
         // STEP 1: Write RST_DTX_PTR first (resets DMA indices)
-        userlib::println!("[DMA] Writing RST_DTX_PTR=0xFFFFFFFF (both interfaces)...");
+        libsys::println!("[DMA] Writing RST_DTX_PTR=0xFFFFFFFF (both interfaces)...");
         self.write(wfdma::RST_DTX_PTR, 0xFFFF_FFFF);
         if self.dev.has_hif2() {
             self.dev.hif2_via_hif1_write32(wfdma::WFDMA0_BASE + wfdma::RST_DTX_PTR, 0xFFFF_FFFF);
-            userlib::println!("[DMA]   HIF2 RST_DTX_PTR written");
+            libsys::println!("[DMA]   HIF2 RST_DTX_PTR written");
         }
 
         // Check FWDL ring state after RST_DTX_PTR (should still be intact)
         let fwdl_after_dtp = self.read(ring_base + wfdma::RING_BASE);
-        userlib::println!("[DMA] FWDL ring base after RST_DTX_PTR: 0x{:08x}", fwdl_after_dtp);
+        libsys::println!("[DMA] FWDL ring base after RST_DTX_PTR: 0x{:08x}", fwdl_after_dtp);
 
         // STEP 2: Clear delay interrupt configs (per deepwiki dma.c:368-377)
-        userlib::println!("[DMA] Clearing PRI_DLY_INT_CFG0/1/2...");
+        libsys::println!("[DMA] Clearing PRI_DLY_INT_CFG0/1/2...");
         self.write(wfdma::PRI_DLY_INT_CFG0, 0);
         self.write(wfdma::PRI_DLY_INT_CFG1, 0);
         self.write(wfdma::PRI_DLY_INT_CFG2, 0);
@@ -2779,15 +2779,15 @@ impl<'a> Wfdma<'a> {
         }
 
         // STEP 3: Configure prefetch (per Linux mt7996_dma_enable -> mt7996_dma_prefetch)
-        userlib::println!("[DMA] Configuring prefetch (Linux order: after PRI_DLY_INT clear)...");
+        libsys::println!("[DMA] Configuring prefetch (Linux order: after PRI_DLY_INT clear)...");
         self.configure_prefetch();
 
         // STEP 4: Configure BUSY_ENA (per deepwiki: AFTER prefetch, BEFORE HIF_MISC_BUSY wait)
-        userlib::println!("[DMA] Configuring BUSY_ENA...");
+        libsys::println!("[DMA] Configuring BUSY_ENA...");
         let busy_bits = wfdma::BUSY_ENA_TX_FIFO0 | wfdma::BUSY_ENA_TX_FIFO1 | wfdma::BUSY_ENA_RX_FIFO;
         let busy_old = self.read(wfdma::BUSY_ENA);
         self.write(wfdma::BUSY_ENA, busy_old | busy_bits);
-        userlib::println!("[DMA] BUSY_ENA: 0x{:08x} -> 0x{:08x}", busy_old, self.read(wfdma::BUSY_ENA));
+        libsys::println!("[DMA] BUSY_ENA: 0x{:08x} -> 0x{:08x}", busy_old, self.read(wfdma::BUSY_ENA));
 
         // Configure BUSY_ENA on HIF2 as well (PCIE1 uses different RX_FIFO bit!)
         if self.dev.has_hif2() {
@@ -2798,56 +2798,56 @@ impl<'a> Wfdma<'a> {
             let hif2_busy_old = self.dev.hif2_via_hif1_read32(hif2_busy_offset);
             self.dev.hif2_via_hif1_write32(hif2_busy_offset, hif2_busy_old | hif2_busy_bits);
             let hif2_busy_new = self.dev.hif2_via_hif1_read32(hif2_busy_offset);
-            userlib::println!("[DMA] HIF2 BUSY_ENA: 0x{:08x} -> 0x{:08x}", hif2_busy_old, hif2_busy_new);
+            libsys::println!("[DMA] HIF2 BUSY_ENA: 0x{:08x} -> 0x{:08x}", hif2_busy_old, hif2_busy_new);
         }
 
         // Wait for HIF_MISC_BUSY to clear (prerequisite for RST auto-release)
         // Per deepwiki: DMA engine must be idle before RST bits will auto-clear
         // Pattern: delay FIRST, then check (avoids tight loops starving hardware)
-        userlib::println!("[DMA] Waiting for HIF_MISC_BUSY to clear...");
+        libsys::println!("[DMA] Waiting for HIF_MISC_BUSY to clear...");
         let hif_misc_addr = wfdma::EXT_CSR_HIF_MISC;
         let mut busy_timeout = false;
         for i in 0..1000 {
-            userlib::delay_ms(1);  // Delay FIRST before checking
+            libsys::delay_ms(1);  // Delay FIRST before checking
             let hif_misc = self.read_bar(hif_misc_addr);
             if (hif_misc & wfdma::EXT_CSR_HIF_MISC_BUSY) == 0 {
-                userlib::println!("[DMA] HIF_MISC idle after {}ms: 0x{:08x}", i + 1, hif_misc);
+                libsys::println!("[DMA] HIF_MISC idle after {}ms: 0x{:08x}", i + 1, hif_misc);
                 break;
             }
             if i == 999 {
-                userlib::println!("[DMA] WARNING: HIF_MISC_BUSY timeout: 0x{:08x}", hif_misc);
+                libsys::println!("[DMA] WARNING: HIF_MISC_BUSY timeout: 0x{:08x}", hif_misc);
                 busy_timeout = true;
             }
         }
 
         // Also check HIF2's HIF_MISC_BUSY (CRITICAL for dual-HIF RST release!)
         if self.dev.has_hif2() {
-            userlib::println!("[DMA] Waiting for HIF2 HIF_MISC_BUSY to clear...");
+            libsys::println!("[DMA] Waiting for HIF2 HIF_MISC_BUSY to clear...");
             let hif2_hif_misc_offset = wfdma::EXT_CSR_HIF_MISC;
             for i in 0..1000 {
-                userlib::delay_ms(1);  // Delay FIRST before checking
+                libsys::delay_ms(1);  // Delay FIRST before checking
                 let hif2_misc = self.dev.hif2_via_hif1_read32(hif2_hif_misc_offset);
                 if (hif2_misc & wfdma::EXT_CSR_HIF_MISC_BUSY) == 0 {
-                    userlib::println!("[DMA] HIF2 HIF_MISC idle after {}ms: 0x{:08x}", i + 1, hif2_misc);
+                    libsys::println!("[DMA] HIF2 HIF_MISC idle after {}ms: 0x{:08x}", i + 1, hif2_misc);
                     break;
                 }
                 if i == 999 {
-                    userlib::println!("[DMA] WARNING: HIF2 HIF_MISC_BUSY timeout: 0x{:08x}", hif2_misc);
+                    libsys::println!("[DMA] WARNING: HIF2 HIF_MISC_BUSY timeout: 0x{:08x}", hif2_misc);
                 }
             }
         }
 
         // STEP 6: Configure GLO_CFG_EXT0/EXT1 (per Linux mt7996_dma_enable: AFTER HIF_MISC poll)
-        userlib::println!("[DMA] Configuring GLO_CFG_EXT0/EXT1 (Linux order: after HIF_MISC poll)...");
+        libsys::println!("[DMA] Configuring GLO_CFG_EXT0/EXT1 (Linux order: after HIF_MISC poll)...");
         let ext0 = self.read(wfdma::GLO_CFG_EXT0);
-        userlib::println!("[DMA]   GLO_CFG_EXT0 before: 0x{:08x}", ext0);
+        libsys::println!("[DMA]   GLO_CFG_EXT0 before: 0x{:08x}", ext0);
         let ext0_new = ext0 | wfdma::GLO_CFG_EXT0_RX_WB_RXD | wfdma::GLO_CFG_EXT0_WED_MERGE_MODE;
         self.write(wfdma::GLO_CFG_EXT0, ext0_new);
         let ext0_after = self.read(wfdma::GLO_CFG_EXT0);
-        userlib::println!("[DMA]   GLO_CFG_EXT0 after: 0x{:08x} (set RX_WB_RXD+WED_MERGE_MODE)", ext0_after);
+        libsys::println!("[DMA]   GLO_CFG_EXT0 after: 0x{:08x} (set RX_WB_RXD+WED_MERGE_MODE)", ext0_after);
         let ext1 = self.read(wfdma::GLO_CFG_EXT1);
         self.write(wfdma::GLO_CFG_EXT1, ext1 | wfdma::GLO_CFG_EXT1_TX_FCTRL_MODE);
-        userlib::println!("[DMA]   GLO_CFG_EXT1: 0x{:08x} -> 0x{:08x}",
+        libsys::println!("[DMA]   GLO_CFG_EXT1: 0x{:08x} -> 0x{:08x}",
             ext1, self.read(wfdma::GLO_CFG_EXT1));
 
         // Configure HIF2 GLO_CFG_EXT0/EXT1 as well (Linux dma.c:413-420)
@@ -2861,11 +2861,11 @@ impl<'a> Wfdma<'a> {
             self.dev.hif2_via_hif1_write32(ext0_offset, hif2_ext0_new);
             let hif2_ext1 = self.dev.hif2_via_hif1_read32(ext1_offset);
             self.dev.hif2_via_hif1_write32(ext1_offset, hif2_ext1 | wfdma::GLO_CFG_EXT1_TX_FCTRL_MODE);
-            userlib::println!("[DMA] HIF2 GLO_CFG_EXT0/EXT1 configured");
+            libsys::println!("[DMA] HIF2 GLO_CFG_EXT0/EXT1 configured");
         }
 
         // STEP 7: Set RX pause thresholds (per Linux mt7996_dma_enable: AFTER GLO_CFG_EXT)
-        userlib::println!("[DMA] Setting RX pause thresholds (Linux values from dma.c:407-410)...");
+        libsys::println!("[DMA] Setting RX pause thresholds (Linux values from dma.c:407-410)...");
         self.write(wfdma::PAUSE_RX_Q_45_TH, 0xc000c);
         self.write(wfdma::PAUSE_RX_Q_67_TH, 0x10008);
         self.write(wfdma::PAUSE_RX_Q_89_TH, 0x10008);
@@ -2878,21 +2878,21 @@ impl<'a> Wfdma<'a> {
             self.dev.hif2_via_hif1_write32(hif1_ofs + wfdma::PAUSE_RX_Q_67_TH, 0x10008);
             self.dev.hif2_via_hif1_write32(hif1_ofs + wfdma::PAUSE_RX_Q_89_TH, 0x10008);
             self.dev.hif2_via_hif1_write32(hif1_ofs + wfdma::PAUSE_RX_Q_RRO_TH, 0x20);
-            userlib::println!("[DMA] HIF2 RX pause thresholds set");
+            libsys::println!("[DMA] HIF2 RX pause thresholds set");
         }
 
         // STEP 8: Enable DMA - hardware auto-releases RST when GLO_CFG enables DMA
         // CRITICAL: mt76 uses mt76_set() which only ORs in bits, never clears.
         // Do NOT use & !BYTE_SWAP or any clearing - that can gate reset FSM completion.
         // NOTE: HOST_CONFIG, AXI_R2A_CTRL, RX_INT_PCIE_SEL already configured in init()
-        userlib::println!("[DMA] Enabling DMA engines (both interfaces)...");
+        libsys::println!("[DMA] Enabling DMA engines (both interfaces)...");
 
         // Check RST before GLO_CFG enable (should still be 0x30)
         let rst_before = self.read(wfdma::RST);
-        userlib::println!("[DMA] RST before GLO_CFG enable: 0x{:08x} (expected 0x30)", rst_before);
+        libsys::println!("[DMA] RST before GLO_CFG enable: 0x{:08x} (expected 0x30)", rst_before);
 
         let glo_val = self.read(wfdma::GLO_CFG);
-        userlib::println!("[DMA] HIF1 GLO_CFG before enable: 0x{:08x}", glo_val);
+        libsys::println!("[DMA] HIF1 GLO_CFG before enable: 0x{:08x}", glo_val);
         // EXACT bits from Linux mt7996_dma_start() dma.c:555-560
         let enable_bits = glo_cfg::TX_DMA_EN | glo_cfg::RX_DMA_EN |
                           glo_cfg::OMIT_TX_INFO | glo_cfg::OMIT_RX_INFO_PFET2 |
@@ -2903,7 +2903,7 @@ impl<'a> Wfdma<'a> {
 
         // Read back HIF1's ACTUAL value - hardware may modify bits
         let hif1_final = self.read(wfdma::GLO_CFG);
-        userlib::println!("[DMA] HIF1 GLO_CFG after enable: 0x{:08x}", hif1_final);
+        libsys::println!("[DMA] HIF1 GLO_CFG after enable: 0x{:08x}", hif1_final);
 
         // Enable GLO_CFG on HIF2 as well (Linux does this in mt7996_dma_start)
         // CRITICAL: Do RMW on HIF2's own current value, NOT copy HIF1's value!
@@ -2911,32 +2911,32 @@ impl<'a> Wfdma<'a> {
         if self.dev.has_hif2() {
             let hif2_glo_offset = wfdma::WFDMA0_BASE + wfdma::GLO_CFG;
             let hif2_glo_before = self.dev.hif2_via_hif1_read32(hif2_glo_offset);
-            userlib::println!("[DMA] HIF2 GLO_CFG before enable: 0x{:08x}", hif2_glo_before);
+            libsys::println!("[DMA] HIF2 GLO_CFG before enable: 0x{:08x}", hif2_glo_before);
             // Same enable bits as HIF1, applied to HIF2's current value
             let hif2_glo_new = hif2_glo_before | enable_bits;
             self.dev.hif2_via_hif1_write32(hif2_glo_offset, hif2_glo_new);
             unsafe { core::arch::asm!("dsb sy"); }
             let hif2_glo_after = self.dev.hif2_via_hif1_read32(hif2_glo_offset);
-            userlib::println!("[DMA] HIF2 GLO_CFG after enable: 0x{:08x}", hif2_glo_after);
+            libsys::println!("[DMA] HIF2 GLO_CFG after enable: 0x{:08x}", hif2_glo_after);
         }
 
         // Give hardware time to process GLO_CFG enable and auto-release RST
         // (USB driver had similar issues with tight loops preventing HW completion)
         // Using 500ms to rule out timing issues - if this works, timing is the culprit
-        userlib::println!("[DMA] Waiting 500ms after GLO_CFG enable for hardware to settle...");
-        userlib::delay_ms(500);
+        libsys::println!("[DMA] Waiting 500ms after GLO_CFG enable for hardware to settle...");
+        libsys::delay_ms(500);
 
         // Check ring state after GLO_CFG enable (hardware should have auto-released RST)
         let ring2_after_glo = self.read(ring_base + wfdma::RING_BASE);
         let rst_after_glo = self.read(wfdma::RST);
-        userlib::println!("[DMA] Ring2 base after GLO_CFG enable: 0x{:08x}", ring2_after_glo);
-        userlib::println!("[DMA] HIF1 RST after GLO_CFG enable: 0x{:08x} (expected 0x00)", rst_after_glo);
+        libsys::println!("[DMA] Ring2 base after GLO_CFG enable: 0x{:08x}", ring2_after_glo);
+        libsys::println!("[DMA] HIF1 RST after GLO_CFG enable: 0x{:08x} (expected 0x00)", rst_after_glo);
 
         // Also check HIF2's RST status - both need to auto-release
         let hif2_rst = if self.dev.has_hif2() {
             let rst_offset = wfdma::WFDMA0_BASE + wfdma::RST;
             let hif2_rst_val = self.dev.hif2_via_hif1_read32(rst_offset);
-            userlib::println!("[DMA] HIF2 RST after GLO_CFG enable: 0x{:08x} (expected 0x00)", hif2_rst_val);
+            libsys::println!("[DMA] HIF2 RST after GLO_CFG enable: 0x{:08x} (expected 0x00)", hif2_rst_val);
             hif2_rst_val
         } else {
             0
@@ -2948,41 +2948,41 @@ impl<'a> Wfdma<'a> {
         // If RST stays 0x30, it means we're missing a prerequisite, NOT that we should force it.
         // Forcing RST clear would mask the real problem and likely cause other issues.
         if rst_after_glo != 0 || hif2_rst != 0 {
-            userlib::println!("[DMA] WARNING: RST didn't auto-release! HIF1=0x{:08x} HIF2=0x{:08x}",
+            libsys::println!("[DMA] WARNING: RST didn't auto-release! HIF1=0x{:08x} HIF2=0x{:08x}",
                 rst_after_glo, hif2_rst);
-            userlib::println!("[DMA]   This means a prerequisite is missing. Check:");
-            userlib::println!("[DMA]   - All required rings programmed with valid descriptors");
-            userlib::println!("[DMA]   - Prefetch configuration complete");
-            userlib::println!("[DMA]   - HIF_MISC_BUSY cleared");
-            userlib::println!("[DMA]   - BUSY_ENA configured");
-            userlib::println!("[DMA]   - GLO_CFG_EXT0/EXT1 configured");
+            libsys::println!("[DMA]   This means a prerequisite is missing. Check:");
+            libsys::println!("[DMA]   - All required rings programmed with valid descriptors");
+            libsys::println!("[DMA]   - Prefetch configuration complete");
+            libsys::println!("[DMA]   - HIF_MISC_BUSY cleared");
+            libsys::println!("[DMA]   - BUSY_ENA configured");
+            libsys::println!("[DMA]   - GLO_CFG_EXT0/EXT1 configured");
         }
 
         // Dump ALL MCU TX rings AFTER enabling DMA
-        userlib::println!("[DMA] Ring dump AFTER enable:");
+        libsys::println!("[DMA] Ring dump AFTER enable:");
         for i in 0..5u32 {
             let rbase = wfdma::MCU_RING_BASE + i * 0x10;
             let base = self.read(rbase);
             let cnt = self.read(rbase + 4);
             let cpu = self.read(rbase + 8);
             let dma = self.read(rbase + 12);
-            userlib::println!("[DMA]   Ring{} @0x{:x}: base=0x{:08x} cnt={} cpu={} dma={}",
+            libsys::println!("[DMA]   Ring{} @0x{:x}: base=0x{:08x} cnt={} cpu={} dma={}",
                 i, rbase, base, cnt, cpu, dma);
         }
 
         // Final check on FWDL ring
         let rb_final = self.read(ring_base + wfdma::RING_BASE);
         if rb_final == 0 {
-            userlib::println!("[DMA] ERROR: FWDL ring base is 0!");
+            libsys::println!("[DMA] ERROR: FWDL ring base is 0!");
         }
 
         // STEP 3: Enable interrupts - LAST step per Linux mt7996_dma_start()
         // This must be done AFTER GLO_CFG enable for proper DMA operation
-        userlib::println!("[DMA] Enabling interrupts (final step)...");
+        libsys::println!("[DMA] Enabling interrupts (final step)...");
         let int_mask_old = self.read(wfdma::INT_MASK);
         let int_mask_new = int_mask_old | int_mask::MCU_FULL;
         self.write(wfdma::INT_MASK, int_mask_new);
-        userlib::println!("[DMA] INT_MASK: 0x{:08x} -> 0x{:08x}",
+        libsys::println!("[DMA] INT_MASK: 0x{:08x} -> 0x{:08x}",
             int_mask_old, self.read(wfdma::INT_MASK));
 
         // Also enable interrupts on HIF2 if present
@@ -2991,17 +2991,17 @@ impl<'a> Wfdma<'a> {
             let hif2_int_old = self.dev.hif2_via_hif1_read32(hif2_int_mask_offset);
             self.dev.hif2_via_hif1_write32(hif2_int_mask_offset, hif2_int_old | int_mask::MCU_FULL);
             let hif2_int_new = self.dev.hif2_via_hif1_read32(hif2_int_mask_offset);
-            userlib::println!("[DMA] HIF2 INT_MASK: 0x{:08x} -> 0x{:08x}", hif2_int_old, hif2_int_new);
+            libsys::println!("[DMA] HIF2 INT_MASK: 0x{:08x} -> 0x{:08x}", hif2_int_old, hif2_int_new);
         }
 
         // FINAL RST CHECK: After all configuration including interrupts
         // (User requested: "could we check the RST status AFTER the interrupt config?")
-        userlib::delay_ms(5);  // Give hardware time to settle
+        libsys::delay_ms(5);  // Give hardware time to settle
         let rst_final = self.read(wfdma::RST);
-        userlib::println!("[DMA] **FINAL** RST after INT_MASK enable: 0x{:08x} (expected 0x00)", rst_final);
+        libsys::println!("[DMA] **FINAL** RST after INT_MASK enable: 0x{:08x} (expected 0x00)", rst_final);
         if self.dev.has_hif2() {
             let hif2_rst_final = self.dev.hif2_via_hif1_read32(wfdma::WFDMA0_BASE + wfdma::RST);
-            userlib::println!("[DMA] **FINAL** HIF2 RST after INT_MASK enable: 0x{:08x} (expected 0x00)", hif2_rst_final);
+            libsys::println!("[DMA] **FINAL** HIF2 RST after INT_MASK enable: 0x{:08x} (expected 0x00)", hif2_rst_final);
         }
 
         // State: Ready for transfers
@@ -3134,9 +3134,9 @@ impl<'a> Wfdma<'a> {
             *desc = TxDesc::for_firmware(cmd_paddr, cmd_len, true);
 
             // Debug: dump descriptor content before flush
-            userlib::println!("[DMA] Desc[{}]: buf0=0x{:08x} ctrl=0x{:08x} buf1=0x{:08x} info=0x{:08x}",
+            libsys::println!("[DMA] Desc[{}]: buf0=0x{:08x} ctrl=0x{:08x} buf1=0x{:08x} info=0x{:08x}",
                 cpu_idx, desc.buf0, desc.ctrl, desc.buf1, desc.info);
-            userlib::println!("[DMA]   desc_vaddr=0x{:x} desc_paddr=0x{:x}",
+            libsys::println!("[DMA]   desc_vaddr=0x{:x} desc_paddr=0x{:x}",
                 desc as *const _ as u64, ring.desc_paddr + (cpu_idx as u64) * 16);
 
             // Flush descriptor to RAM so DMA can see it
@@ -3172,7 +3172,7 @@ impl<'a> Wfdma<'a> {
         let cpu_idx = match self.wm_ring.as_ref() {
             Some(r) => r.cpu_idx,
             None => {
-                userlib::println!("[DMA] send_command_wm: no WM ring!");
+                libsys::println!("[DMA] send_command_wm: no WM ring!");
                 return false;
             }
         };
@@ -3187,7 +3187,7 @@ impl<'a> Wfdma<'a> {
             *desc = TxDesc::for_firmware(cmd_paddr, cmd_len, true);
 
             // Debug: dump descriptor content before flush
-            userlib::println!("[DMA] WM Desc[{}]: buf0=0x{:08x} ctrl=0x{:08x} buf1=0x{:08x} info=0x{:08x}",
+            libsys::println!("[DMA] WM Desc[{}]: buf0=0x{:08x} ctrl=0x{:08x} buf1=0x{:08x} info=0x{:08x}",
                 cpu_idx, desc.buf0, desc.ctrl, desc.buf1, desc.info);
 
             // Flush descriptor to RAM so DMA can see it
@@ -3221,7 +3221,7 @@ impl<'a> Wfdma<'a> {
             ring.build_init_download(addr, len, mode)
         };
 
-        userlib::println!("[DMA] init_download: addr=0x{:08x} len={} mode=0x{:x} cmd_paddr=0x{:x}",
+        libsys::println!("[DMA] init_download: addr=0x{:08x} len={} mode=0x{:x} cmd_paddr=0x{:x}",
             addr, len, mode, cmd_paddr);
         self.send_command(cmd_paddr, cmd_len, "TARGET_ADDRESS_LEN_REQ")
     }
@@ -3234,7 +3234,7 @@ impl<'a> Wfdma<'a> {
             let ring = match self.wm_ring.as_mut() {
                 Some(r) => r,
                 None => {
-                    userlib::println!("[DMA] send_patch_sem_ctrl: no WM ring!");
+                    libsys::println!("[DMA] send_patch_sem_ctrl: no WM ring!");
                     return false;
                 }
             };
@@ -3274,7 +3274,7 @@ impl<'a> Wfdma<'a> {
 
         for i in 0..(timeout_ms * 10) {
             // Delay FIRST before checking (avoids tight loops starving hardware)
-            userlib::delay_us(100);
+            libsys::delay_us(100);
 
             // Check TX DMA progress
             let tx_dma_idx = self.read(tx_ring_base + wfdma::RING_DMA_IDX);
@@ -3317,16 +3317,16 @@ impl<'a> Wfdma<'a> {
         let mcu_cmd = self.read(wfdma::MCU_CMD);
         let glo_cfg = self.read(wfdma::GLO_CFG);
 
-        userlib::println!("[DMA] Timeout after {}ms:", timeout_ms);
-        userlib::println!("[DMA]   TX: cpu_idx={}, dma_idx={}", ring.cpu_idx, tx_dma_idx);
-        userlib::println!("[DMA]   RX: dma_idx={}", rx_dma_idx);
-        userlib::println!("[DMA]   INT_SRC=0x{:08x} MCU_CMD=0x{:08x} GLO_CFG=0x{:08x}",
+        libsys::println!("[DMA] Timeout after {}ms:", timeout_ms);
+        libsys::println!("[DMA]   TX: cpu_idx={}, dma_idx={}", ring.cpu_idx, tx_dma_idx);
+        libsys::println!("[DMA]   RX: dma_idx={}", rx_dma_idx);
+        libsys::println!("[DMA]   INT_SRC=0x{:08x} MCU_CMD=0x{:08x} GLO_CFG=0x{:08x}",
             int_src, mcu_cmd, glo_cfg);
 
         // Also check ring base configuration
         let ring_base = self.read(tx_ring_base + wfdma::RING_BASE);
         let ring_cnt = self.read(tx_ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA]   TX ring: base=0x{:08x}, cnt={}", ring_base, ring_cnt);
+        libsys::println!("[DMA]   TX ring: base=0x{:08x}, cnt={}", ring_base, ring_cnt);
 
         // Return false on timeout - DMA didn't complete
         false
@@ -3337,7 +3337,7 @@ impl<'a> Wfdma<'a> {
         let ring = match self.wm_ring.as_ref() {
             Some(r) => r,
             None => {
-                userlib::println!("[DMA] wait_dma_done_wm: no WM ring!");
+                libsys::println!("[DMA] wait_dma_done_wm: no WM ring!");
                 return false;
             }
         };
@@ -3350,7 +3350,7 @@ impl<'a> Wfdma<'a> {
 
         for i in 0..(timeout_ms * 10) {
             // Delay FIRST before checking (avoids tight loops starving hardware)
-            userlib::delay_us(100);
+            libsys::delay_us(100);
 
             let tx_dma_idx = self.read(tx_ring_base + wfdma::RING_DMA_IDX);
             let rx_dma_idx = self.read(rx_ring_base + wfdma::RING_DMA_IDX);
@@ -3377,14 +3377,14 @@ impl<'a> Wfdma<'a> {
         let glo_cfg = self.read(wfdma::GLO_CFG);
         let rst = self.read(wfdma::RST);
 
-        userlib::println!("[DMA] WM Timeout after {}ms:", timeout_ms);
-        userlib::println!("[DMA]   TX: cpu_idx={}, dma_idx={}", ring.cpu_idx, tx_dma_idx);
-        userlib::println!("[DMA]   INT_SRC=0x{:08x} MCU_CMD=0x{:08x} GLO_CFG=0x{:08x} RST=0x{:08x}",
+        libsys::println!("[DMA] WM Timeout after {}ms:", timeout_ms);
+        libsys::println!("[DMA]   TX: cpu_idx={}, dma_idx={}", ring.cpu_idx, tx_dma_idx);
+        libsys::println!("[DMA]   INT_SRC=0x{:08x} MCU_CMD=0x{:08x} GLO_CFG=0x{:08x} RST=0x{:08x}",
             int_src, mcu_cmd, glo_cfg, rst);
 
         let ring_base = self.read(tx_ring_base + wfdma::RING_BASE);
         let ring_cnt = self.read(tx_ring_base + wfdma::RING_MAX_CNT);
-        userlib::println!("[DMA]   WM ring: base=0x{:08x}, cnt={}", ring_base, ring_cnt);
+        libsys::println!("[DMA]   WM ring: base=0x{:08x}, cnt={}", ring_base, ring_cnt);
 
         false
     }

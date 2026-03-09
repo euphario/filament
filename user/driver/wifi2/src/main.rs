@@ -7,16 +7,16 @@
 #![no_std]
 #![no_main]
 
-use userlib::{uinfo, unotice, uwarn, uerror, udebug, ulog};
-use userlib::mmio::{MmioRegion, DmaPool};
-use userlib::ipc::{Msi, Irq};
-use userlib::bus::{
+use libsys::{uinfo, unotice, uwarn, uerror, udebug, ulog};
+use libsys::mmio::{MmioRegion, DmaPool};
+use libsys::ipc::{Msi, Irq};
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, ConfigKey,
     PortInfo, PortClass, NetworkMetadata, port_subclass,
     BlockPortConfig, PortId,
 };
-use userlib::bus_runtime::driver_main;
-use userlib::ring::{IoSqe, IoCqe, SideEntry, io_op, io_status, side_msg, side_status};
+use libsys::bus_runtime::driver_main;
+use libsys::ring::{IoSqe, IoCqe, SideEntry, io_op, io_status, side_msg, side_status};
 
 #[allow(dead_code)]
 mod regs;
@@ -2186,7 +2186,7 @@ impl Driver for Wifi2 {
 
         // Start poll timer — begins in normal (50ms) mode
         ctx.start_timer(TAG_WIFI_TIMER, NORMAL_INTERVAL_NS)?;
-        self.last_housekeeping = userlib::syscall::gettime();
+        self.last_housekeeping = libsys::syscall::gettime();
 
         unotice!("wifi2", "ready"; state = self.state.name());
         Ok(())
@@ -2196,7 +2196,7 @@ impl Driver for Wifi2 {
         Disposition::Forward
     }
 
-    fn handle_event(&mut self, tag: u32, _handle: userlib::syscall::Handle, ctx: &mut dyn BusCtx) {
+    fn handle_event(&mut self, tag: u32, _handle: libsys::syscall::Handle, ctx: &mut dyn BusCtx) {
         let is_timer = tag == TAG_WIFI_TIMER;
         let is_irq = tag == TAG_WIFI_IRQ;
         if !is_timer && !is_irq { return; }
@@ -2282,7 +2282,7 @@ impl Driver for Wifi2 {
             }
 
             // Slow tick: wall-clock based (works at any timer interval)
-            let now = userlib::syscall::gettime();
+            let now = libsys::syscall::gettime();
             if now.wrapping_sub(self.last_housekeeping) >= SLOW_TICK_NS {
                 self.last_housekeeping = now;
                 self.tick = self.tick.wrapping_add(1);

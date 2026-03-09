@@ -1,11 +1,11 @@
 //! libf — Filament Standard Library
 //!
-//! The programming interface for Filament OS. Wraps userlib's raw syscalls
+//! The programming interface for Filament OS. Wraps libsys's raw syscalls
 //! into higher-level abstractions: formatting, string operations, number
 //! parsing, and alloc re-exports.
 //!
-//! Relationship to userlib: just as libc wraps kernel syscalls into printf/malloc/FILE*,
-//! libf wraps userlib's raw syscalls into StackStr/trim/parse_u32.
+//! Relationship to libsys: just as libc wraps kernel syscalls into printf/malloc/FILE*,
+//! libf wraps libsys's raw syscalls into StackStr/trim/parse_u32.
 
 #![no_std]
 
@@ -38,6 +38,6 @@ pub mod prelude {
     pub use crate::str::{trim, eq_ignore_ascii_case};
     pub use crate::parse::parse_u32;
 
-    // userlib essentials
-    pub use userlib::error::{SysError, SysResult};
+    // libsys essentials
+    pub use libsys::error::{SysError, SysResult};
 }

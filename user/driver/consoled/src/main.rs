@@ -18,16 +18,16 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall::{self, Handle, ObjectType};
-use userlib::ipc::{Timer, ObjHandle};
+use libsys::syscall::{self, Handle, ObjectType};
+use libsys::ipc::{Timer, ObjHandle};
 use libf::sync::SharedPipe;
-use userlib::supervision::SupervisionHandle;
-use userlib::bus::{
+use libsys::supervision::SupervisionHandle;
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition,
     PortInfo, PortClass, PortState, port_subclass,
 };
-use userlib::bus_runtime::driver_main;
-use userlib::{uinfo, unotice, uerror};
+use libsys::bus_runtime::driver_main;
+use libsys::{uinfo, unotice, uerror};
 
 // =============================================================================
 // Handle Tags
@@ -42,7 +42,7 @@ const TAG_SUPERQ: u32 = 6;
 // =============================================================================
 
 mod ansi {
-    use userlib::syscall::{self, Handle};
+    use libsys::syscall::{self, Handle};
 
     /// Query terminal size using cursor position report (CPR)
     /// Returns (cols, rows) or None if detection fails
@@ -180,7 +180,7 @@ impl ConsoledDriver {
         mailbox[68..70].copy_from_slice(&self.cols.to_le_bytes());
         mailbox[70..72].copy_from_slice(&self.rows.to_le_bytes());
 
-        let caps = userlib::devd::caps::USER_ADMIN;
+        let caps = libsys::devd::caps::USER_ADMIN;
         match syscall::exec_with_mailbox("shell", caps, &mailbox) {
             Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
                 // Grant child access to the ring shmem
@@ -638,7 +638,7 @@ impl Driver for ConsoledDriver {
     }
 
     fn signal(&mut self, signal_event: u16, signal_value: u64, ctx: &mut dyn BusCtx) {
-        if signal_event as u32 & userlib::syscall::signal_event::CHILD_EXIT != 0 {
+        if signal_event as u32 & libsys::syscall::signal_event::CHILD_EXIT != 0 {
             let child_pid = (signal_value >> 32) as u32;
             if self.shell_pid == Some(child_pid) {
                 self.handle_child_exit(ctx);
@@ -724,26 +724,6 @@ fn format_u16(buf: &mut [u8], n: u16) -> usize {
 // Wrapper for driver_main
 // =============================================================================
 
-struct ConsoledWrapper(&'static mut ConsoledDriver);
-
-impl Driver for ConsoledWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
-
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
-
-    fn signal(&mut self, signal_event: u16, signal_value: u64, ctx: &mut dyn BusCtx) {
-        self.0.signal(signal_event, signal_value, ctx)
-    }
-
-    fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
-        self.0.handle_event(tag, handle, ctx)
-    }
-}
-
 // =============================================================================
 // Main
 // =============================================================================
@@ -753,5 +733,5 @@ static mut DRIVER: ConsoledDriver = ConsoledDriver::new();
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"consoled", ConsoledWrapper(driver));
+    driver_main(b"consoled", driver);
 }

@@ -7,7 +7,7 @@
 use smoltcp::wire::{
     DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, IpAddress, IpEndpoint, Ipv4Address,
 };
-use userlib::{uinfo, udebug};
+use libsys::{uinfo, udebug};
 
 const LEASE_SECS: u32 = 3600;
 const POOL_START: u8 = 100;
@@ -47,7 +47,7 @@ impl DhcpServer {
         let packet = DhcpPacket::new_checked(data).ok()?;
         let repr = DhcpRepr::parse(&packet).ok()?;
 
-        let now_ns = userlib::syscall::gettime();
+        let now_ns = libsys::syscall::gettime();
 
         let msg_type_num = match repr.message_type {
             DhcpMessageType::Discover => 1u32,

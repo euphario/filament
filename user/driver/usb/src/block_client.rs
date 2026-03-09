@@ -25,8 +25,8 @@
 //! let data = block.data();  // Zero-copy access
 //! ```
 
-use userlib::ring::{BlockRing, BlockRequest, BlockResponse};
-use userlib::syscall;
+use libsys::ring::{BlockRing, BlockRequest, BlockResponse};
+use libsys::syscall;
 
 /// Block device client
 ///

@@ -7,8 +7,8 @@
 //! - A shared 4KB shmem page with birth context (MailboxHeader + spawn metadata)
 //! - A kernel SupervisionQueue for bidirectional parent↔child messaging
 
-use userlib::error::SysError;
-use userlib::syscall;
+use libsys::error::SysError;
+use libsys::syscall;
 
 // =============================================================================
 // ProcessManager Trait

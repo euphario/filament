@@ -270,7 +270,7 @@ impl WakeChannel {
 ## Migration Path
 
 1. Add `WakeChannel` kernel object type
-2. Add `CommandRing` to userlib
+2. Add `CommandRing` to libsys
 3. Update devd ↔ partd to use rings (test case)
 4. Update devd ↔ fatfsd
 5. Update devd ↔ xhcid

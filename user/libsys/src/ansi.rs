@@ -4,7 +4,7 @@
 //!
 //! # Usage
 //! ```
-//! use userlib::ansi::{Color, Style};
+//! use libsys::ansi::{Color, Style};
 //!
 //! // Direct color codes
 //! println!("{}Error:{} Something failed", Color::RED, Color::RESET);

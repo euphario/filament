@@ -800,6 +800,92 @@ pub trait BusCtx {
     /// Associates a path prefix with a DataPort shmem_id so clients can
     /// resolve paths via devd-query.
     fn register_mount(&mut self, prefix: &[u8], shmem_id: u32) -> Result<(), BusError>;
+
+    // =========================================================================
+    // Default convenience methods
+    // =========================================================================
+
+    /// Connect to the trigger port as a block consumer.
+    ///
+    /// Combines: spawn_context → discover_port → connect_block_port.
+    fn connect_trigger(&mut self) -> Result<PortId, BusError> {
+        let shmem_id = self.discover_port()?;
+        self.connect_block_port(shmem_id)
+    }
+
+    /// Get typed PCI metadata from spawn context.
+    fn pci_metadata(&mut self) -> Result<PciMetadata, BusError> {
+        let meta = self.spawn_context()?.metadata();
+        PciMetadata::from_bytes(meta).ok_or(BusError::NotPresent)
+    }
+
+    /// Respond to QUERY_INFO, trimming trailing zeros.
+    fn respond_info_trimmed(&mut self, seq_id: u32, buf: &[u8]) -> Result<(), BusError> {
+        let len = buf.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
+        self.respond_info(seq_id, &buf[..len])
+    }
+
+    /// Copy data between two ports' pools via stack buffer.
+    ///
+    /// Copies `len` bytes from `src_port`'s pool at `src_offset` to
+    /// `dst_port`'s pool at `dst_offset`. Uses a 512-byte stack buffer
+    /// (can't hold two `block_port` borrows at once).
+    fn copy_pool(
+        &mut self,
+        src_port: PortId, src_offset: u32,
+        dst_port: PortId, dst_offset: u32,
+        len: u32,
+    ) -> bool {
+        let mut tmp = [0u8; 512];
+        let mut copied = 0u32;
+        while copied < len {
+            let chunk = ((len - copied) as usize).min(512);
+            // Read from source
+            let ok = if let Some(port) = self.block_port(src_port) {
+                if let Some(src) = port.pool_slice(src_offset + copied, chunk as u32) {
+                    tmp[..chunk].copy_from_slice(src);
+                    true
+                } else { false }
+            } else { false };
+            if !ok { return false; }
+            // Write to destination
+            let ok = if let Some(port) = self.block_port(dst_port) {
+                port.pool_write(dst_offset + copied, &tmp[..chunk])
+            } else { false };
+            if !ok { return false; }
+            copied += chunk as u32;
+        }
+        true
+    }
+}
+
+// ============================================================================
+// PCI Metadata
+// ============================================================================
+
+/// Typed PCI metadata from spawn context.
+///
+/// Parsed from the 12-byte metadata that pcied embeds when registering
+/// device ports: `[bar0_phys: u64 LE, bar0_size: u32 LE]`.
+#[derive(Clone, Copy, Debug)]
+pub struct PciMetadata {
+    pub bar0_addr: u64,
+    pub bar0_size: u32,
+}
+
+impl PciMetadata {
+    /// Parse from raw metadata bytes. Returns None if too short.
+    pub fn from_bytes(meta: &[u8]) -> Option<Self> {
+        if meta.len() < 12 { return None; }
+        let bar0_addr = u64::from_le_bytes([
+            meta[0], meta[1], meta[2], meta[3],
+            meta[4], meta[5], meta[6], meta[7],
+        ]);
+        let bar0_size = u32::from_le_bytes([
+            meta[8], meta[9], meta[10], meta[11],
+        ]);
+        Some(Self { bar0_addr, bar0_size })
+    }
 }
 
 // ============================================================================
@@ -994,6 +1080,102 @@ pub trait BlockTransport {
 
     /// Number of pending SQ entries (submitted but not yet consumed by provider).
     fn sq_pending(&self) -> u32;
+
+    // =========================================================================
+    // Default convenience methods
+    // =========================================================================
+
+    /// Complete with error and notify peer.
+    fn fail(&self, tag: u32, status: u16) {
+        self.complete_error(tag, status);
+        self.notify();
+    }
+
+    /// Complete with success and notify peer.
+    fn succeed(&self, tag: u32, transferred: u32) {
+        self.complete_ok(tag, transferred);
+        self.notify();
+    }
+
+    /// Synchronous block read: alloc, submit, wait, copy, free.
+    ///
+    /// For init-time reads (MBR scan, BPB parsing). Not for data-path use.
+    fn read_sync(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), PortError> {
+        let len = buf.len() as u32;
+        let offset = self.alloc(len).ok_or(PortError::NoSpace)?;
+
+        let tag = match self.submit_read(lba, offset, len) {
+            Ok(t) => t,
+            Err(e) => { self.free(offset); return Err(e); }
+        };
+        self.notify();
+
+        for _ in 0..1000 {
+            if let Some(cqe) = self.poll_completion() {
+                if cqe.tag == tag {
+                    if cqe.status == crate::ring::io_status::OK as u16 {
+                        if let Some(src) = self.pool_slice(offset, len) {
+                            buf.copy_from_slice(src);
+                            self.free(offset);
+                            return Ok(());
+                        }
+                    }
+                    self.free(offset);
+                    return Err(PortError::Invalid);
+                }
+            }
+            self.wait(10);
+        }
+        self.free(offset);
+        Err(PortError::NotConnected)
+    }
+
+    /// Drain pending SQEs into caller's buffer. Returns count.
+    fn drain_requests(&self, out: &mut [Option<crate::ring::IoSqe>]) -> usize {
+        let mut count = 0;
+        for slot in out.iter_mut() {
+            match self.recv_request() {
+                Some(sqe) => { *slot = Some(sqe); count += 1; }
+                None => break,
+            }
+        }
+        count
+    }
+
+    /// Drain pending sidechannel entries. Returns count.
+    fn drain_side_requests(&self, out: &mut [Option<crate::ring::SideEntry>]) -> usize {
+        let mut count = 0;
+        for slot in out.iter_mut() {
+            match self.poll_side_request() {
+                Some(entry) => { *slot = Some(entry); count += 1; }
+                None => break,
+            }
+        }
+        count
+    }
+}
+
+// ============================================================================
+// Blanket Driver Impl
+// ============================================================================
+
+/// Blanket impl so `&'static mut D` satisfies `Driver` when `D: Driver`.
+///
+/// This eliminates the need for wrapper structs in driver `main()` functions.
+/// Instead of `driver_main(b"foo", FooWrapper(driver))`, drivers can write
+/// `driver_main(b"foo", driver)` where `driver: &'static mut FooDriver`.
+impl<D: Driver + ?Sized> Driver for &'static mut D {
+    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> { (**self).reset(ctx) }
+    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition { (**self).command(msg, ctx) }
+    fn port_event(&mut self, port: PortId, state: PortState, ctx: &mut dyn BusCtx) { (**self).port_event(port, state, ctx) }
+    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) { (**self).data_ready(port, ctx) }
+    fn deadline(&mut self, seq_id: u32, ctx: &mut dyn BusCtx) { (**self).deadline(seq_id, ctx) }
+    fn handle_event(&mut self, tag: u32, handle: crate::syscall::Handle, ctx: &mut dyn BusCtx) { (**self).handle_event(tag, handle, ctx) }
+    fn signal(&mut self, signal_event: u16, signal_value: u64, ctx: &mut dyn BusCtx) { (**self).signal(signal_event, signal_value, ctx) }
+    fn bus_event(&mut self, id: KernelBusId, msg_type: u8, data: &[u8], ctx: &mut dyn BusCtx) { (**self).bus_event(id, msg_type, data, ctx) }
+    fn config_keys(&self) -> &[ConfigKey] { (**self).config_keys() }
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize { (**self).config_get(key, buf) }
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize { (**self).config_set(key, value, buf, ctx) }
 }
 
 /// Stream data transport (byte ring pattern).

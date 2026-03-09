@@ -21,12 +21,12 @@
 use smoltcp::iface::SocketSet;
 use smoltcp::socket::tcp;
 
-use userlib::bus::BlockPortConfig;
-use userlib::data_port::DataPort;
-use userlib::ipc::{Channel, Port};
-use userlib::ring::{io_op, io_status, IoCqe};
-use userlib::syscall::Handle;
-use userlib::{udebug, uerror, uinfo};
+use libsys::bus::BlockPortConfig;
+use libsys::data_port::DataPort;
+use libsys::ipc::{Channel, Port};
+use libsys::ring::{io_op, io_status, IoCqe};
+use libsys::syscall::Handle;
+use libsys::{udebug, uerror, uinfo};
 
 // =============================================================================
 // Constants

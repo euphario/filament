@@ -16,7 +16,7 @@
 //! Shell always renders its own input line using direct ANSI escapes
 //! through the TX ring.
 
-use userlib::syscall;
+use libsys::syscall;
 use crate::console;
 
 /// Maximum command line length

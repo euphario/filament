@@ -25,7 +25,7 @@
 use crate::device::Mt7996Device;
 use crate::dma::{Wfdma, mcu_cmd, mcu, PatchHeader, PatchSection};
 use crate::firmware::{Firmware, FirmwareError};
-use userlib::{syscall, trace, trace_err, poll_until};
+use libsys::{syscall, trace, trace_err, poll_until};
 
 /// TOP register block (for driver ownership and firmware state)
 mod top {
@@ -148,7 +148,7 @@ impl<'a> Mcu<'a> {
     /// Linux: mt7996_driver_own(dev, band)
     /// Band 0 = primary interface, Band 1 = HIF2 (secondary interface)
     fn driver_own_band(&self, band: u8) -> bool {
-        use userlib::println;
+        use libsys::println;
 
         // Select registers based on band
         // Linux: MT_TOP_LPCR_HOST_BAND(band) = MT_TOP(0x10 + (band * 0x10))
@@ -222,7 +222,7 @@ impl<'a> Mcu<'a> {
     /// 4. Driver ownership - in mcu_init_firmware (mcu.c:3304-3312)
     /// 5. Load firmware
     pub fn reset(&mut self) -> bool {
-        use userlib::println;
+        use libsys::println;
 
         // Step 1: wfsys_reset() - unconditional per Linux
         println!("[MCU] Performing wfsys_reset...");
@@ -331,7 +331,7 @@ impl<'a> Mcu<'a> {
 
     /// Load ROM patch firmware via DMA
     pub fn load_rom_patch(&mut self, fw: &Firmware) -> Result<(), FirmwareError> {
-        use userlib::{println, print};
+        use libsys::{println, print};
         trace!(FW, "loading ROM patch ({} bytes)...", fw.size);
 
         // Step 1: Acquire patch semaphore (MANDATORY per deepwiki)
@@ -577,7 +577,7 @@ impl<'a> Mcu<'a> {
     /// Tries ramfs first, falls back to USB via fatfs
     pub fn load_firmware(&mut self) -> Result<(), FirmwareError> {
         use crate::firmware::check_firmware_files;
-        use userlib::println;
+        use libsys::println;
 
         // Check if firmware is available in ramfs (embedded in initrd)
         if check_firmware_files() {
@@ -593,7 +593,7 @@ impl<'a> Mcu<'a> {
     /// Load firmware from ramfs (embedded in initrd)
     fn load_firmware_ramfs(&mut self) -> Result<(), FirmwareError> {
         use crate::firmware::{paths, Firmware};
-        use userlib::println;
+        use libsys::println;
 
         // Reset MCU and init WFDMA
         println!("[MT7996] Resetting MCU...");
@@ -642,8 +642,8 @@ impl<'a> Mcu<'a> {
     /// Load firmware from USB via fatfs
     fn load_firmware_usb(&mut self) -> Result<(), FirmwareError> {
         use crate::firmware::{usb_names, UsbFirmware};
-        use userlib::firmware::FirmwareClient;
-        use userlib::println;
+        use libsys::firmware::FirmwareClient;
+        use libsys::println;
 
         println!("[MT7996] === Loading Firmware from USB ===");
 
@@ -741,7 +741,7 @@ impl<'a> Mcu<'a> {
 
     /// Load ROM patch from USB firmware buffer
     fn load_rom_patch_usb(&mut self, fw: &crate::firmware::UsbFirmware) -> Result<(), FirmwareError> {
-        use userlib::println;
+        use libsys::println;
         use crate::dma::PatchHeader;
 
         // Step 1: Acquire patch semaphore (MANDATORY per deepwiki)
@@ -855,7 +855,7 @@ impl<'a> Mcu<'a> {
 
     /// Load WM firmware from USB buffer
     fn load_wm_usb(&mut self, fw: &crate::firmware::UsbFirmware) -> Result<(), FirmwareError> {
-        use userlib::println;
+        use libsys::println;
 
         if self.state != McuState::Patched {
             println!("[MT7996] WARNING: Loading WM without ROM patch");
@@ -880,7 +880,7 @@ impl<'a> Mcu<'a> {
 
     /// Load WA firmware from USB buffer
     fn load_wa_usb(&mut self, fw: &crate::firmware::UsbFirmware) -> Result<(), FirmwareError> {
-        use userlib::println;
+        use libsys::println;
 
         if self.state != McuState::WmLoaded {
             println!("[MT7996] WARNING: Loading WA without WM");

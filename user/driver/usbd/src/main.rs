@@ -45,15 +45,15 @@ impl BlockInfo {
     }
 }
 
-use userlib::syscall;
-use userlib::{uinfo, unotice, udebug, uerror};
-use userlib::bus::{
+use libsys::syscall;
+use libsys::{uinfo, unotice, udebug, uerror};
+use libsys::bus::{
     Driver, BusCtx, Disposition, BusError, BusMsg, bus_msg,
     BlockPortConfig, BlockGeometry, PortId,
     PortInfo, PortClass, port_subclass,
 };
-use userlib::driver_main;
-use userlib::ring::{io_op, io_status, side_msg, side_status};
+use libsys::driver_main;
+use libsys::ring::{io_op, io_status, side_msg, side_status};
 use usb::{MmioRegion, DmaPool, XhciController, XhciCaps};
 use usb::soc::{GenericSoc, SocUsb, SocError};
 use usb::soc::mt7988a::{Mt7988aSoc, addrs as mt_addrs};
@@ -2276,10 +2276,7 @@ fn log_always(msg: &str) {
 // Bus Framework Driver Implementation
 // =============================================================================
 
-/// Wrapper for bus framework integration.
-struct UsbdWrapper(&'static mut UsbDriver);
-
-impl Driver for UsbdWrapper {
+impl Driver for UsbDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
         unotice!("usbd", "starting";);
 
@@ -2308,8 +2305,8 @@ impl Driver for UsbdWrapper {
         unotice!("usbd", "device_found"; bar0 = bar0_addr, size = bar0_size as u32);
 
         // Configure and initialize xHCI hardware
-        self.0.configure(bar0_addr, bar0_size);
-        self.0.init().map_err(|reason| {
+        self.configure(bar0_addr, bar0_size);
+        self.init().map_err(|reason| {
             log_always(reason);
             uerror!("usbd", "xhci_init_failed";);
             // Map hardware-absent conditions to NotPresent (exit code 0, no respawn)
@@ -2323,19 +2320,19 @@ impl Driver for UsbdWrapper {
         })?;
 
         // Enumerate all connected USB devices
-        self.0.enumerate_all_devices();
-        self.0.detect_all_msc();
+        self.enumerate_all_devices();
+        self.detect_all_msc();
 
         // Test MSC devices
         for slot_idx in 0..8 {
-            let slot_id = match &self.0.devices[slot_idx] {
+            let slot_id = match &self.devices[slot_idx] {
                 Some(d) if d.is_msc => d.slot_id,
                 _ => continue,
             };
-            self.0.test_block_stack(slot_id);
+            self.test_block_stack(slot_id);
         }
 
-        if !self.0.partition_info.is_valid() {
+        if !self.partition_info.is_valid() {
             unotice!("usbd", "ready_no_disks";);
             return Ok(());
         }
@@ -2351,7 +2348,7 @@ impl Driver for UsbdWrapper {
         if let Some(port) = ctx.block_port(port_id) {
             port.set_public();
         }
-        self.0.block_port_id = Some(port_id);
+        self.block_port_id = Some(port_id);
 
         // Register block port with devd using unified PortInfo
         let shmem_id = ctx.block_port(port_id).map(|p| p.shmem_id()).unwrap_or(0);
@@ -2367,7 +2364,7 @@ impl Driver for UsbdWrapper {
     fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
         match msg.msg_type {
             bus_msg::QUERY_INFO => {
-                let info = self.0.format_info();
+                let info = self.format_info();
                 let len = info.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0);
                 let _ = ctx.respond_info(msg.seq_id, &info[..len]);
                 Disposition::Handled
@@ -2377,12 +2374,12 @@ impl Driver for UsbdWrapper {
     }
 
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        if self.0.block_port_id != Some(port) {
+        if self.block_port_id != Some(port) {
             return;
         }
 
-        let block_size = self.0.partition_info.block_size;
-        let block_count = self.0.partition_info.block_count;
+        let block_size = self.partition_info.block_size;
+        let block_count = self.partition_info.block_count;
 
         // Process SQ entries
         loop {
@@ -2411,7 +2408,7 @@ impl Driver for UsbdWrapper {
                         transport.pool_phys()
                     };
 
-                    let result = self.0.read_blocks_to_pool(
+                    let result = self.read_blocks_to_pool(
                         sqe.lba,
                         count,
                         core::ptr::null_mut(), // vaddr unused by read_blocks_to_pool
@@ -2443,7 +2440,7 @@ impl Driver for UsbdWrapper {
                         transport.pool_phys()
                     };
 
-                    let result = self.0.write_blocks_from_pool(
+                    let result = self.write_blocks_from_pool(
                         sqe.lba,
                         count,
                         pool_phys,
@@ -2510,7 +2507,7 @@ static mut DRIVER: UsbDriver = UsbDriver::new_empty();
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"usbd", UsbdWrapper(driver));
+    driver_main(b"usbd", driver);
 }
 
 // =============================================================================

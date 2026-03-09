@@ -7,8 +7,8 @@
 #![no_std]
 #![no_main]
 
-use userlib::syscall;
-use userlib::ipc::{Channel, Mux, Timer, MuxFilter};
+use libsys::syscall;
+use libsys::ipc::{Channel, Mux, Timer, MuxFilter};
 
 fn log(msg: &[u8]) {
     syscall::debug_write(msg);
@@ -79,7 +79,7 @@ fn phase1_timers() -> bool {
                     }
                 }
             }
-            Err(userlib::SysError::Timeout) => {
+            Err(libsys::SysError::Timeout) => {
                 log(b"  phase1: FAIL - timeout before all timers fired\r\n");
                 return false;
             }
@@ -176,7 +176,7 @@ fn phase2_channels() -> bool {
                     }
                 }
             }
-            Err(userlib::SysError::Timeout) => {
+            Err(libsys::SysError::Timeout) => {
                 log(b"  phase2: FAIL - timeout\r\n");
                 return false;
             }
@@ -320,7 +320,7 @@ fn phase3_mixed() -> bool {
                     }
                 }
             }
-            Err(userlib::SysError::Timeout) => {
+            Err(libsys::SysError::Timeout) => {
                 log(b"  phase3: FAIL - timeout\r\n");
                 return false;
             }

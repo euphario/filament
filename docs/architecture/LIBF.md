@@ -2,14 +2,14 @@
 
 ## What libf Is
 
-libf is the Filament equivalent of libc. It sits between raw kernel syscalls (userlib) and application code, providing the programming interface every program needs.
+libf is the Filament equivalent of libc. It sits between raw kernel syscalls (libsys) and application code, providing the programming interface every program needs.
 
 ```
 Application code (shell, drivers, daemons)
         ↓ uses
 libf                ← programming interface (fmt, str, parse, fs, net...)
         ↓ uses
-userlib             ← kernel interface (raw syscalls, IPC primitives, bus framework)
+libsys             ← kernel interface (raw syscalls, IPC primitives, bus framework)
         ↓ calls
 Kernel              ← 5 unified syscalls (open/read/write/map/close)
 ```
@@ -55,11 +55,11 @@ The key insight: libf's implementations *become* the `std::sys::filament` platfo
 ### `libf::fmt` — Formatting
 
 - `StackStr` — 64-byte stack buffer implementing `core::fmt::Write` + `Display`
-  - `StackStr::from_u32(val)`, `from_u64(val)`, `from_hex32(val)`, `from_hex64(val)`
+  - `StackStr::from_u32(val)`, `from_u64(val)`
 - `format_u32_into(buf, val) -> usize` — write decimal into caller's buffer
 - `format_u64_into(buf, val) -> usize`
-- `format_hex32_into(buf, val) -> usize` — with `0x` prefix, minimal digits
-- `format_hex64_into(buf, val) -> usize`
+- `BufWriter` — `core::fmt::Write` wrapper for `&mut [u8]` with `put()`, `kv()`, `u32()`, `u64()`
+  - For hex: use `write!(w, "{:x}", val)` via core's `LowerHex`/`UpperHex` impls
 
 ### `libf::str` — Byte-slice String Operations
 
@@ -80,7 +80,7 @@ The key insight: libf's implementations *become* the `std::sys::filament` platfo
 
 ### `libf::prelude` — Convenience Re-exports
 
-Re-exports alloc types (`String`, `Vec`, `Box`, `format!`) and common libf/userlib symbols.
+Re-exports alloc types (`String`, `Vec`, `Box`, `format!`) and common libf/libsys symbols.
 
 ## Future Modules (Planned)
 

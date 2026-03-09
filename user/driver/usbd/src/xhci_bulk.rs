@@ -185,7 +185,7 @@ impl<'a> XhciBulk<'a> {
                             6 => b"[xhci_bulk] Stall\n",
                             _ => b"[xhci_bulk] Protocol error\n",
                         };
-                        userlib::syscall::debug_write(msg);
+                        libsys::syscall::debug_write(msg);
                     }
 
                     match cc {
@@ -199,7 +199,7 @@ impl<'a> XhciBulk<'a> {
             self.xhci.update_erdp(0, self.evt_ring.erdp());
             core::hint::spin_loop();
         }
-        userlib::syscall::debug_write(b"[xhci_bulk] timeout\n");
+        libsys::syscall::debug_write(b"[xhci_bulk] timeout\n");
         Err(TransportError::Timeout)
     }
 }

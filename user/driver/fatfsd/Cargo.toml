@@ -5,7 +5,7 @@ edition = "2024"
 description = "FAT16 filesystem driver"
 
 [dependencies]
-userlib = { path = "../../userlib" }
+libsys = { path = "../../libsys" }
 
 [profile.release]
 opt-level = "z"

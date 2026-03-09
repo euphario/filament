@@ -7,5 +7,5 @@
 
 #[unsafe(no_mangle)]
 fn main() {
-    userlib::syscall::exit(0);
+    libsys::syscall::exit(0);
 }

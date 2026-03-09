@@ -15,8 +15,8 @@
 #![no_std]
 #![no_main]
 
-use userlib::{println, print, syscall, Stdin, uinfo, uerror};
-use userlib::ipc::protocols::PcieClient;
+use libsys::{println, print, syscall, Stdin, uinfo, uerror};
+use libsys::ipc::protocols::PcieClient;
 
 /// Default device to access (MT7996 HIF1)
 const DEFAULT_PORT: u8 = 0;

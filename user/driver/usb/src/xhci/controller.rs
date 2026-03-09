@@ -20,7 +20,7 @@
 use crate::mmio::MmioRegion;
 use crate::transfer::dsb;
 use super::regs::*;
-use userlib::{print, println};
+use libsys::{print, println};
 
 /// xHCI capability information read from hardware
 #[derive(Debug, Clone)]
@@ -448,7 +448,7 @@ impl Controller {
     ///
     /// Returns the first port with a connection, or None if timeout.
     pub fn wait_for_connection(&self, timeout_us: u32) -> Option<u8> {
-        use userlib::print;
+        use libsys::print;
         print!(" [W:iter={}]", timeout_us / 1000);
         let iterations = timeout_us / 1000;
         for i in 0..iterations {

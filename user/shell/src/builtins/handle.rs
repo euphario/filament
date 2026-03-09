@@ -2,8 +2,8 @@
 //!
 //! Tests the unified handle API (Timer, Channel, Mux).
 
-use userlib::ipc::{Channel, Timer, Mux, MuxFilter};
-use userlib::syscall::gettime;
+use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
+use libsys::syscall::gettime;
 use crate::output::Output;
 
 /// Run handle test command

@@ -1,10 +1,10 @@
 #![no_std]
 #![no_main]
 
-extern crate userlib;
+extern crate libsys;
 
-use userlib::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
-use userlib::bus_runtime::driver_main;
+use libsys::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
+use libsys::bus_runtime::driver_main;
 
 const MAX_CPUS: usize = 4;
 const MAX_OPPS: usize = 8;

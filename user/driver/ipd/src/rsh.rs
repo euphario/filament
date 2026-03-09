@@ -15,8 +15,8 @@ use smoltcp::iface::SocketSet;
 use smoltcp::socket::tcp;
 use smoltcp::iface::SocketHandle;
 
-use userlib::ipc::Channel;
-use userlib::syscall::{self, ProcessInfo, Handle};
+use libsys::ipc::Channel;
+use libsys::syscall::{self, ProcessInfo, Handle};
 
 /// Remote shell state.
 #[derive(Clone, Copy, PartialEq, Eq)]

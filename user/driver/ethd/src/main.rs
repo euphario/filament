@@ -9,17 +9,17 @@
 mod uboot_mtk_eth;
 
 use uboot_mtk_eth::*;
-use userlib::syscall::Handle;
-use userlib::mmio::{MmioRegion, DmaPool, delay_us, cache_clean, cache_invalidate};
-use userlib::ipc::{Timer, Irq};
-use userlib::bus::{
+use libsys::syscall::Handle;
+use libsys::mmio::{MmioRegion, DmaPool, delay_us, cache_clean, cache_invalidate};
+use libsys::ipc::{Timer, Irq};
+use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
     PortInfo, PortClass, port_subclass, NetworkMetadata,
 };
-use userlib::bus_runtime::driver_main;
-use userlib::ring::{IoSqe, IoCqe, io_op, io_status, side_msg, side_status, SideEntry};
-use userlib::{uinfo, unotice, udebug, uerror, uwarn};
+use libsys::bus_runtime::driver_main;
+use libsys::ring::{IoSqe, IoCqe, io_op, io_status, side_msg, side_status, SideEntry};
+use libsys::{uinfo, unotice, udebug, uerror, uwarn};
 
 // =============================================================================
 // Hardware Constants
@@ -483,7 +483,7 @@ const RX_RING_OFF: usize = TX_RING_SIZE;
 const TX_BUF_OFF: usize = TX_RING_SIZE + RX_RING_SIZE;
 const RX_BUF_OFF: usize = TX_RING_SIZE + RX_RING_SIZE + TX_BUF_SIZE;
 
-// Network opcodes: use io_op::NET_SEND from userlib::ring (already imported)
+// Network opcodes: use io_op::NET_SEND from libsys::ring (already imported)
 
 // =============================================================================
 // V2 Descriptor Structures (32 bytes each)
@@ -769,7 +769,7 @@ impl EthDriver {
 
         // Read current reset state
         let rst = ethwarp.read32(ETHWARP_RST_OFS);
-        udebug!("ethd", "ethwarp_rst_before"; val = userlib::ulog::hex32(rst));
+        udebug!("ethd", "ethwarp_rst_before"; val = libsys::ulog::hex32(rst));
 
         // Assert reset (set bit 9)
         ethwarp.write32(ETHWARP_RST_OFS, rst | ETHWARP_RST_SWITCH_BIT);
@@ -782,7 +782,7 @@ impl EthDriver {
         delay_us(100_000);  // 100ms should be enough
 
         let rst_after = ethwarp.read32(ETHWARP_RST_OFS);
-        udebug!("ethd", "reset_switch_done"; val = userlib::ulog::hex32(rst_after));
+        udebug!("ethd", "reset_switch_done"; val = libsys::ulog::hex32(rst_after));
     }
 
     // =========================================================================
@@ -908,9 +908,9 @@ impl EthDriver {
         pc.write32(PINCTRL_LED_REG_OFS, new_val);
         let verify = pc.read32(PINCTRL_LED_REG_OFS);
 
-        udebug!("ethd", "pinctrl_led_mux"; reg_ofs = userlib::ulog::hex32(PINCTRL_LED_REG_OFS as u32),
-               old = userlib::ulog::hex32(old_val), new = userlib::ulog::hex32(new_val),
-               verify = userlib::ulog::hex32(verify));
+        udebug!("ethd", "pinctrl_led_mux"; reg_ofs = libsys::ulog::hex32(PINCTRL_LED_REG_OFS as u32),
+               old = libsys::ulog::hex32(old_val), new = libsys::ulog::hex32(new_val),
+               verify = libsys::ulog::hex32(verify));
     }
 
     // Configure PHY LEDs for link/activity indication
@@ -966,8 +966,8 @@ impl EthDriver {
             self.mmd_write(phy, MDIO_MMD_VEND2, LED1_BLINK_CTRL, led1_blink);
 
             let new_led0 = self.mmd_read(phy, MDIO_MMD_VEND2, LED0_ON_CTRL).unwrap_or(0);
-            udebug!("ethd", "phy_led_init"; phy = phy, old = userlib::ulog::hex32(old_led0 as u32),
-                   new = userlib::ulog::hex32(new_led0 as u32));
+            udebug!("ethd", "phy_led_init"; phy = phy, old = libsys::ulog::hex32(old_led0 as u32),
+                   new = libsys::ulog::hex32(new_led0 as u32));
         }
 
         udebug!("ethd", "phy_leds_enabled";);
@@ -993,17 +993,17 @@ impl EthDriver {
         let pll_7504 = self.gsw_read(0x7504);  // PLL config
         let clk_7508 = self.gsw_read(0x7508);  // Clock config
         let misc_7804 = self.gsw_read(0x7804); // Trap register
-        udebug!("ethd", "switch_regs"; sys = userlib::ulog::hex32(sys_ctrl), pll0 = userlib::ulog::hex32(pll_7500),
-               pll1 = userlib::ulog::hex32(pll_7504), clk = userlib::ulog::hex32(clk_7508), misc = userlib::ulog::hex32(misc_7804));
+        udebug!("ethd", "switch_regs"; sys = libsys::ulog::hex32(sys_ctrl), pll0 = libsys::ulog::hex32(pll_7500),
+               pll1 = libsys::ulog::hex32(pll_7504), clk = libsys::ulog::hex32(clk_7508), misc = libsys::ulog::hex32(misc_7804));
 
         // PRESERVE U-Boot's configuration - just read and log, don't write!
         // U-Boot should have already configured MDC and MUX_TO_ESW
         let mac_misc = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + 0x10)).unwrap_or(0);
         let ppsc = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + 0x00)).unwrap_or(0);
-        udebug!("ethd", "mac_misc_v3_uboot"; val = userlib::ulog::hex32(mac_misc),
+        udebug!("ethd", "mac_misc_v3_uboot"; val = libsys::ulog::hex32(mac_misc),
                mux_to_esw = if mac_misc & 1 != 0 { 1u32 } else { 0u32 },
                mdc_turbo = if mac_misc & 0x10 != 0 { 1u32 } else { 0u32 });
-        udebug!("ethd", "ppsc_uboot"; val = userlib::ulog::hex32(ppsc));
+        udebug!("ethd", "ppsc_uboot"; val = libsys::ulog::hex32(ppsc));
 
         // Probe and initialize internal PHYs via MDIO (addresses 0-3 for ports 0-3)
         // PHY register definitions (IEEE 802.3):
@@ -1033,12 +1033,12 @@ impl EthDriver {
             // Read status register (reg 1) - bit 2 = link status
             let status = self.mdio_read(phy, BMSR).unwrap_or(0);
             let link = (status & 0x04) != 0;
-            udebug!("ethd", "phy"; addr = phy, id1 = userlib::ulog::hex32(id1 as u32), id2 = userlib::ulog::hex32(id2 as u32),
-                   status = userlib::ulog::hex32(status as u32), link = if link { 1u32 } else { 0u32 });
+            udebug!("ethd", "phy"; addr = phy, id1 = libsys::ulog::hex32(id1 as u32), id2 = libsys::ulog::hex32(id2 as u32),
+                   status = libsys::ulog::hex32(status as u32), link = if link { 1u32 } else { 0u32 });
 
             // Read current BMCR
             let bmcr = self.mdio_read(phy, BMCR).unwrap_or(0);
-            udebug!("ethd", "phy_bmcr"; addr = phy, bmcr = userlib::ulog::hex32(bmcr as u32),
+            udebug!("ethd", "phy_bmcr"; addr = phy, bmcr = libsys::ulog::hex32(bmcr as u32),
                    power_down = if (bmcr & BMCR_POWER_DOWN) != 0 { 1u32 } else { 0u32 },
                    autoneg = if (bmcr & BMCR_AUTONEG_EN) != 0 { 1u32 } else { 0u32 });
 
@@ -1081,12 +1081,12 @@ impl EthDriver {
         // Just log current state for debugging
         let cpu_pcr = self.gsw_read(MT7530_PCR_P(MT7531_CPU_PORT));
         let cpu_pmcr = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
-        udebug!("ethd", "cpu_port_uboot"; pcr = userlib::ulog::hex32(cpu_pcr), pmcr = userlib::ulog::hex32(cpu_pmcr));
+        udebug!("ethd", "cpu_port_uboot"; pcr = libsys::ulog::hex32(cpu_pcr), pmcr = libsys::ulog::hex32(cpu_pmcr));
 
         for port in 0..4 {
             let pcr = self.gsw_read(MT7530_PCR_P(port));
             let pmcr = self.gsw_read(MT7530_PMCR_P(port));
-            udebug!("ethd", "user_port_uboot"; port = port, pcr = userlib::ulog::hex32(pcr), pmcr = userlib::ulog::hex32(pmcr));
+            udebug!("ethd", "user_port_uboot"; port = port, pcr = libsys::ulog::hex32(pcr), pmcr = libsys::ulog::hex32(pmcr));
         }
 
         // Configure switch CPU port (port 6) following Linux mt7530 driver
@@ -1102,8 +1102,8 @@ impl EthDriver {
         let mfc_before = self.gsw_read(MT753X_MFC);
         self.gsw_write(MT753X_MFC, mfc_before | mfc_val);
         let mfc_after = self.gsw_read(MT753X_MFC);
-        udebug!("ethd", "mfc_configured"; before = userlib::ulog::hex32(mfc_before),
-               after = userlib::ulog::hex32(mfc_after));
+        udebug!("ethd", "mfc_configured"; before = libsys::ulog::hex32(mfc_before),
+               after = libsys::ulog::hex32(mfc_after));
 
         // Step 2: DON'T modify CFC - U-Boot leaves it at 0x00000000
         // U-Boot: pfc/cfc=0x00000000
@@ -1111,8 +1111,8 @@ impl EthDriver {
         let cfc_before = self.gsw_read(MT7531_CFC);
         // Don't modify - keep U-Boot's setting
         let cfc_after = cfc_before;
-        udebug!("ethd", "cfc_configured"; before = userlib::ulog::hex32(cfc_before),
-               after = userlib::ulog::hex32(cfc_after));
+        udebug!("ethd", "cfc_configured"; before = libsys::ulog::hex32(cfc_before),
+               after = libsys::ulog::hex32(cfc_after));
 
         // Step 3: Enable PORT_SPEC_TAG on CPU port 6 PVC register
         // This makes the switch insert a 4-byte MTK special tag after the source MAC
@@ -1122,8 +1122,8 @@ impl EthDriver {
         let pvc_before = self.gsw_read(MT7530_PVC_P(MT7531_CPU_PORT));
         self.gsw_write(MT7530_PVC_P(MT7531_CPU_PORT), pvc_before | PORT_SPEC_TAG);
         let pvc_after = self.gsw_read(MT7530_PVC_P(MT7531_CPU_PORT));
-        udebug!("ethd", "pvc_configured"; before = userlib::ulog::hex32(pvc_before),
-               after = userlib::ulog::hex32(pvc_after));
+        udebug!("ethd", "pvc_configured"; before = libsys::ulog::hex32(pvc_before),
+               after = libsys::ulog::hex32(pvc_after));
 
         // Step 4: Configure PCR - connect CPU port to ports 0-5 (matching U-Boot)
         // U-Boot: pcr=0x003f0000 → PORT_MATRIX = 0x3f (ports 0-5), no VLAN mode
@@ -1132,8 +1132,8 @@ impl EthDriver {
         let pcr_val = pcr_matrix(port_matrix);  // No FALLBACK_MODE
         self.gsw_write(MT7530_PCR_P(MT7531_CPU_PORT), pcr_val);
         let pcr_after = self.gsw_read(MT7530_PCR_P(MT7531_CPU_PORT));
-        udebug!("ethd", "cpu_pcr_configured"; val = userlib::ulog::hex32(pcr_val),
-               readback = userlib::ulog::hex32(pcr_after));
+        udebug!("ethd", "cpu_pcr_configured"; val = libsys::ulog::hex32(pcr_val),
+               readback = libsys::ulog::hex32(pcr_after));
 
         // Step 5: Configure CPU port PMCR for internal 10G link
         // U-Boot leaves PMCR at 0x80000000 (only MT7531_FORCE_MODE_LNK).
@@ -1150,8 +1150,8 @@ impl EthDriver {
         let pmcr_new = MT7531_FORCE_MODE_LNK | PMCR_TX_EN | PMCR_RX_EN | PMCR_FORCE_LNK;
         self.gsw_write(MT7530_PMCR_P(MT7531_CPU_PORT), pmcr_new);
         let pmcr_after = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
-        udebug!("ethd", "cpu_pmcr_configured"; before = userlib::ulog::hex32(pmcr_before),
-               after = userlib::ulog::hex32(pmcr_after),
+        udebug!("ethd", "cpu_pmcr_configured"; before = libsys::ulog::hex32(pmcr_before),
+               after = libsys::ulog::hex32(pmcr_after),
                tx_en = if pmcr_after & PMCR_TX_EN != 0 { 1u32 } else { 0 },
                rx_en = if pmcr_after & PMCR_RX_EN != 0 { 1u32 } else { 0 });
 
@@ -1162,8 +1162,8 @@ impl EthDriver {
             let port_pcr = self.gsw_read(MT7530_PCR_P(port));
             // Don't modify - keep U-Boot's setting
             udebug!("ethd", "user_pcr_configured"; port = port,
-                   before = userlib::ulog::hex32(port_pcr),
-                   after = userlib::ulog::hex32(port_pcr));
+                   before = libsys::ulog::hex32(port_pcr),
+                   after = libsys::ulog::hex32(port_pcr));
         }
 
         udebug!("ethd", "cpu_port_config_done";);
@@ -1179,8 +1179,8 @@ impl EthDriver {
 
         let led_en_before = self.gsw_read(LED_EN_REG);
         let led_io_before = self.gsw_read(LED_IO_MODE_REG);
-        udebug!("ethd", "switch_led_before"; led_en = userlib::ulog::hex32(led_en_before),
-               led_io = userlib::ulog::hex32(led_io_before));
+        udebug!("ethd", "switch_led_before"; led_en = libsys::ulog::hex32(led_en_before),
+               led_io = libsys::ulog::hex32(led_io_before));
 
         // Enable LEDs and set to PHY mode (not GPIO)
         self.gsw_write(LED_EN_REG, 0xFFFFFFFF);      // Enable all LED outputs
@@ -1188,8 +1188,8 @@ impl EthDriver {
 
         let led_en_after = self.gsw_read(LED_EN_REG);
         let led_io_after = self.gsw_read(LED_IO_MODE_REG);
-        udebug!("ethd", "switch_led_after"; led_en = userlib::ulog::hex32(led_en_after),
-               led_io = userlib::ulog::hex32(led_io_after));
+        udebug!("ethd", "switch_led_after"; led_en = libsys::ulog::hex32(led_en_after),
+               led_io = libsys::ulog::hex32(led_io_after));
 
         udebug!("ethd", "switch_init_done";);
     }
@@ -1225,9 +1225,9 @@ impl EthDriver {
             self.buf_paddr = dma.paddr();
 
             udebug!("ethd", "fifo_init_sram";
-                   sram_vaddr = userlib::ulog::hex64(self.sram_vaddr),
-                   sram_paddr = userlib::ulog::hex64(self.sram_paddr),
-                   buf_paddr = userlib::ulog::hex64(self.buf_paddr));
+                   sram_vaddr = libsys::ulog::hex64(self.sram_vaddr),
+                   sram_paddr = libsys::ulog::hex64(self.sram_paddr),
+                   buf_paddr = libsys::ulog::hex64(self.buf_paddr));
         } else {
             // Use DMA memory for both rings and buffers (like U-Boot)
             if USE_SRAM_FOR_RINGS {
@@ -1248,9 +1248,9 @@ impl EthDriver {
             self.buf_paddr = dma.paddr() + DMA_RINGS_SIZE as u64;
 
             udebug!("ethd", "fifo_init_dma";
-                   tx_ring_paddr = userlib::ulog::hex64(tx_ring_paddr),
-                   rx_ring_paddr = userlib::ulog::hex64(rx_ring_paddr),
-                   buf_paddr = userlib::ulog::hex64(self.buf_paddr));
+                   tx_ring_paddr = libsys::ulog::hex64(tx_ring_paddr),
+                   rx_ring_paddr = libsys::ulog::hex64(rx_ring_paddr),
+                   buf_paddr = libsys::ulog::hex64(self.buf_paddr));
         }
 
         udebug!("ethd", "ring_sizes";
@@ -1268,7 +1268,7 @@ impl EthDriver {
         // 5. Re-enable DMA (done later in eth_start)
 
         let glo_before = self.pdma_read(PDMA_GLO_CFG_REG);
-        udebug!("ethd", "pdma_stop_start"; glo = userlib::ulog::hex32(glo_before));
+        udebug!("ethd", "pdma_stop_start"; glo = libsys::ulog::hex32(glo_before));
 
         // Step 1: Disable DMA
         self.pdma_rmw(PDMA_GLO_CFG_REG, TX_DMA_EN | RX_DMA_EN, 0);
@@ -1288,7 +1288,7 @@ impl EthDriver {
         delay_us(100);
 
         let glo_after = self.pdma_read(PDMA_GLO_CFG_REG);
-        udebug!("ethd", "pdma_stopped"; glo = userlib::ulog::hex32(glo_after));
+        udebug!("ethd", "pdma_stopped"; glo = libsys::ulog::hex32(glo_after));
 
         // Zero descriptor rings
         if use_sram {
@@ -1400,17 +1400,17 @@ impl EthDriver {
         let verify_rx_max = self.pdma_read(rx_max_cnt_reg(0));
 
         udebug!("ethd", "fifo_init_done";
-               tx_ring = userlib::ulog::hex64(tx_ring_paddr),
-               rx_ring = userlib::ulog::hex64(rx_ring_paddr));
+               tx_ring = libsys::ulog::hex64(tx_ring_paddr),
+               rx_ring = libsys::ulog::hex64(rx_ring_paddr));
 
         if DEBUG_VERBOSE {
             udebug!("ethd", "verify_tx";
-                   base = userlib::ulog::hex32(verify_tx_base),
+                   base = libsys::ulog::hex32(verify_tx_base),
                    max = verify_tx_max,
                    ctx = verify_tx_ctx,
                    dtx = verify_tx_dtx);
             udebug!("ethd", "verify_rx";
-                   base = userlib::ulog::hex32(verify_rx_base),
+                   base = libsys::ulog::hex32(verify_rx_base),
                    max = verify_rx_max);
 
             // Verify ring writes by reading back first TX descriptor
@@ -1425,10 +1425,10 @@ impl EthDriver {
                 let txd3 = core::ptr::read_volatile(&(*txd).txd3);
                 let txd5 = core::ptr::read_volatile(&(*txd).txd5);
                 udebug!("ethd", "verify_tx0";
-                       txd1 = userlib::ulog::hex32(txd1),
-                       txd2 = userlib::ulog::hex32(txd2),
-                       txd3 = userlib::ulog::hex32(txd3),
-                       txd5 = userlib::ulog::hex32(txd5));
+                       txd1 = libsys::ulog::hex32(txd1),
+                       txd2 = libsys::ulog::hex32(txd2),
+                       txd3 = libsys::ulog::hex32(txd3),
+                       txd5 = libsys::ulog::hex32(txd5));
 
                 // Also verify RX descriptor 0
                 if USE_STREAMING_DMA && !USE_SRAM_FOR_RINGS {
@@ -1438,8 +1438,8 @@ impl EthDriver {
                 let rxd1 = core::ptr::read_volatile(&(*rxd).rxd1);
                 let rxd2 = core::ptr::read_volatile(&(*rxd).rxd2);
                 udebug!("ethd", "verify_rx0";
-                       rxd1 = userlib::ulog::hex32(rxd1),
-                       rxd2 = userlib::ulog::hex32(rxd2));
+                       rxd1 = libsys::ulog::hex32(rxd1),
+                       rxd2 = libsys::ulog::hex32(rxd2));
             }
         }
     }
@@ -1452,7 +1452,7 @@ impl EthDriver {
     /// Must be called before reconfiguring QDMA.
     fn qdma_stop(&mut self) {
         let glo_before = self.qdma_read(QDMA_GLO_CFG);
-        udebug!("ethd", "qdma_stop_start"; glo = userlib::ulog::hex32(glo_before));
+        udebug!("ethd", "qdma_stop_start"; glo = libsys::ulog::hex32(glo_before));
 
         // Disable TX DMA
         self.qdma_rmw(QDMA_GLO_CFG, QDMA_TX_DMA_EN | QDMA_RX_DMA_EN, 0);
@@ -1476,7 +1476,7 @@ impl EthDriver {
         delay_us(100);
 
         let glo_after = self.qdma_read(QDMA_GLO_CFG);
-        udebug!("ethd", "qdma_stopped"; glo = userlib::ulog::hex32(glo_after));
+        udebug!("ethd", "qdma_stopped"; glo = libsys::ulog::hex32(glo_after));
     }
 
     /// Initialize QDMA Free Queue (FQ) - scratch memory for QDMA internal buffer management.
@@ -1548,8 +1548,8 @@ impl EthDriver {
         self.qdma_fq_count = QDMA_FQ_NUM_DESCS;
 
         udebug!("ethd", "qdma_fq_init";
-               fq_head = userlib::ulog::hex64(fq_ring_paddr),
-               fq_tail = userlib::ulog::hex64(fq_tail_paddr),
+               fq_head = libsys::ulog::hex64(fq_ring_paddr),
+               fq_tail = libsys::ulog::hex64(fq_tail_paddr),
                count = QDMA_FQ_NUM_DESCS as u32);
     }
 
@@ -1638,17 +1638,17 @@ impl EthDriver {
         self.qdma_write(QDMA_TX_SCH_RATE, tx_sch_val);
         self.qdma_write(QDMA_TX_SCH_RATE + 4, tx_sch_val);  // NETSYS V3 has two rate registers
 
-        udebug!("ethd", "qdma_tx_sch"; qtx_sch = userlib::ulog::hex32(
+        udebug!("ethd", "qdma_tx_sch"; qtx_sch = libsys::ulog::hex32(
             MTK_QTX_SCH_MIN_RATE_EN | (1 << MTK_QTX_SCH_MIN_RATE_MAN_SHIFT)
             | (4 << MTK_QTX_SCH_MIN_RATE_EXP_SHIFT) | MTK_QTX_SCH_LEAKY_BUCKET_SIZE),
-            tx_sch_rate = userlib::ulog::hex32(tx_sch_val));
+            tx_sch_rate = libsys::ulog::hex32(tx_sch_val));
 
         self.qdma_tx_paddr = tx_ring_paddr;
         self.qdma_tx_next = tx_ring_paddr as u32;
 
         udebug!("ethd", "qdma_tx_init";
-               tx_ring = userlib::ulog::hex64(tx_ring_paddr),
-               ctx_ptr = userlib::ulog::hex32(tx_ring_paddr as u32),
+               tx_ring = libsys::ulog::hex64(tx_ring_paddr),
+               ctx_ptr = libsys::ulog::hex32(tx_ring_paddr as u32),
                num_desc = NUM_TX_DESC as u32);
     }
 
@@ -1656,7 +1656,7 @@ impl EthDriver {
     fn qdma_start(&mut self) {
         // Read current GLO_CFG
         let glo = self.qdma_read(QDMA_GLO_CFG);
-        udebug!("ethd", "qdma_start_before"; glo = userlib::ulog::hex32(glo));
+        udebug!("ethd", "qdma_start_before"; glo = libsys::ulog::hex32(glo));
 
         // Enable TX DMA with all the bits Linux uses:
         // - TX_DMA_EN: enable TX
@@ -1668,7 +1668,7 @@ impl EthDriver {
         self.qdma_rmw(QDMA_GLO_CFG, 0, enable_bits);
 
         let glo_after = self.qdma_read(QDMA_GLO_CFG);
-        udebug!("ethd", "qdma_start_after"; glo = userlib::ulog::hex32(glo_after));
+        udebug!("ethd", "qdma_start_after"; glo = libsys::ulog::hex32(glo_after));
     }
 
     /// Send a packet via QDMA TX.
@@ -1777,9 +1777,9 @@ impl EthDriver {
         };
 
         udebug!("ethd", "qdma_tx_sent"; idx = self.tx_idx as u32, len = packet.len() as u32,
-               dtx = userlib::ulog::hex32(dtx), ctx = userlib::ulog::hex32(ctx),
-               txd1 = userlib::ulog::hex32(txd1), txd2 = userlib::ulog::hex32(txd2),
-               txd3 = userlib::ulog::hex32(txd3), txd4 = userlib::ulog::hex32(txd4));
+               dtx = libsys::ulog::hex32(dtx), ctx = libsys::ulog::hex32(ctx),
+               txd1 = libsys::ulog::hex32(txd1), txd2 = libsys::ulog::hex32(txd2),
+               txd3 = libsys::ulog::hex32(txd3), txd4 = libsys::ulog::hex32(txd4));
 
         true
     }
@@ -1799,8 +1799,8 @@ impl EthDriver {
         // FE global
         let fe_glo_misc = self.fe_read(FE_GLO_MISC_REG);
         let fe_glo_cfg = self.fe_read(0x00);  // FE_GLO_CFG at 0x00
-        udebug!("ethd", "dump_fe_glo"; prefix = prefix, glo_misc = userlib::ulog::hex32(fe_glo_misc),
-               glo_cfg = userlib::ulog::hex32(fe_glo_cfg));
+        udebug!("ethd", "dump_fe_glo"; prefix = prefix, glo_misc = libsys::ulog::hex32(fe_glo_misc),
+               glo_cfg = libsys::ulog::hex32(fe_glo_cfg));
 
         // PSE registers (Packet Switching Engine)
         let pse_fqfc = self.fe_read(0x100);   // PSE_FQFC_CFG
@@ -1808,16 +1808,16 @@ impl EthDriver {
         let pse_drop = self.fe_read(0x108);   // PSE_DROP_CFG
         let pse_dumy = self.fe_read(0x10c);   // PSE_DUMY_REQ
         let pse_buf_ctrl = self.fe_read(0x110); // PSE_BUF_CTRL
-        udebug!("ethd", "dump_pse"; prefix = prefix, fqfc = userlib::ulog::hex32(pse_fqfc),
-               iqfc = userlib::ulog::hex32(pse_iqfc), drop = userlib::ulog::hex32(pse_drop),
-               dumy = userlib::ulog::hex32(pse_dumy));
-        udebug!("ethd", "dump_pse2"; prefix = prefix, buf_ctrl = userlib::ulog::hex32(pse_buf_ctrl));
+        udebug!("ethd", "dump_pse"; prefix = prefix, fqfc = libsys::ulog::hex32(pse_fqfc),
+               iqfc = libsys::ulog::hex32(pse_iqfc), drop = libsys::ulog::hex32(pse_drop),
+               dumy = libsys::ulog::hex32(pse_dumy));
+        udebug!("ethd", "dump_pse2"; prefix = prefix, buf_ctrl = libsys::ulog::hex32(pse_buf_ctrl));
 
         // PSE IQ_REV registers (free buffer thresholds per port)
         for i in 0..9u32 {
             let iq_rev = self.fe_read(0x118 + i * 4);
             if iq_rev != 0 {
-                udebug!("ethd", "dump_pse_iq"; prefix = prefix, idx = i, val = userlib::ulog::hex32(iq_rev));
+                udebug!("ethd", "dump_pse_iq"; prefix = prefix, idx = i, val = libsys::ulog::hex32(iq_rev));
             }
         }
 
@@ -1825,8 +1825,8 @@ impl EthDriver {
         let pse_oq0 = self.fe_read(0x1a0);  // PSE_OQ_STA0
         let pse_oq1 = self.fe_read(0x1a4);  // PSE_OQ_STA1
         let pse_oq2 = self.fe_read(0x1b0);  // PSE_OQ_STA2
-        udebug!("ethd", "dump_pse_oq"; prefix = prefix, oq0 = userlib::ulog::hex32(pse_oq0),
-               oq1 = userlib::ulog::hex32(pse_oq1), oq2 = userlib::ulog::hex32(pse_oq2));
+        udebug!("ethd", "dump_pse_oq"; prefix = prefix, oq0 = libsys::ulog::hex32(pse_oq0),
+               oq1 = libsys::ulog::hex32(pse_oq1), oq2 = libsys::ulog::hex32(pse_oq2));
 
         // GDM registers (all 3)
         for gdm in 0..3u32 {
@@ -1839,34 +1839,34 @@ impl EthDriver {
             let eg = self.fe_read(base + GDMA_EG_CTRL_REG);
             let fwd = self.fe_read(base + 0x00);  // Forward config
             let shp = self.fe_read(base + 0x04);  // Shaper config
-            udebug!("ethd", "dump_gdm"; prefix = prefix, gdm = gdm, ig = userlib::ulog::hex32(ig),
-                   eg = userlib::ulog::hex32(eg), fwd = userlib::ulog::hex32(fwd), shp = userlib::ulog::hex32(shp));
+            udebug!("ethd", "dump_gdm"; prefix = prefix, gdm = gdm, ig = libsys::ulog::hex32(ig),
+                   eg = libsys::ulog::hex32(eg), fwd = libsys::ulog::hex32(fwd), shp = libsys::ulog::hex32(shp));
         }
 
         // GMAC MCR and related (all 3 ports)
         for port in 0..3u32 {
             let mcr_ofs = GMAC_BASE as usize + gmac_port_mcr(port) as usize;
             let mcr = self.fe.as_ref().map(|fe| fe.read32(mcr_ofs)).unwrap_or(0);
-            udebug!("ethd", "dump_gmac"; prefix = prefix, port = port, mcr = userlib::ulog::hex32(mcr));
+            udebug!("ethd", "dump_gmac"; prefix = prefix, port = port, mcr = libsys::ulog::hex32(mcr));
         }
 
         // MAC_MISC registers (including MUX_TO_ESW)
         let mac_misc_v3 = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + 0x10)).unwrap_or(0);
         let ppsc = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + 0x00)).unwrap_or(0);
-        udebug!("ethd", "dump_mac_misc"; prefix = prefix, mac_misc = userlib::ulog::hex32(mac_misc_v3),
-               ppsc = userlib::ulog::hex32(ppsc));
+        udebug!("ethd", "dump_mac_misc"; prefix = prefix, mac_misc = libsys::ulog::hex32(mac_misc_v3),
+               ppsc = libsys::ulog::hex32(ppsc));
 
         // FE reset and clock state
         let fe_rst = self.fe_read(0x04);  // FE_RST_GLO
         let fe_crc = self.fe_read(0x20);  // FE CRC config
-        udebug!("ethd", "dump_fe_rst"; prefix = prefix, rst = userlib::ulog::hex32(fe_rst),
-               crc = userlib::ulog::hex32(fe_crc));
+        udebug!("ethd", "dump_fe_rst"; prefix = prefix, rst = libsys::ulog::hex32(fe_rst),
+               crc = libsys::ulog::hex32(fe_crc));
 
         // SGMII/path control (for GMAC to switch connection)
         // Linux: MTK_MAC_MISC = 0x10010 within FE (not GMAC offset)
         // Contains MUX_TO_ESW, path selection bits
         let mac_misc_fe = self.fe_read(0x10010);
-        udebug!("ethd", "dump_path"; prefix = prefix, mac_misc_fe = userlib::ulog::hex32(mac_misc_fe));
+        udebug!("ethd", "dump_path"; prefix = prefix, mac_misc_fe = libsys::ulog::hex32(mac_misc_fe));
 
         // XGMAC registers for internal 10G link diagnostics
         // MTK_XGMAC_STS(0) = 0x1000C - status/force bits
@@ -1874,8 +1874,8 @@ impl EthDriver {
         let xgmac_sts = self.fe_read(0x1000C);
         let gsw_cfg = self.fe_read(0x10080);
         udebug!("ethd", "dump_xgmac"; prefix = prefix,
-               sts = userlib::ulog::hex32(xgmac_sts),
-               gsw_cfg = userlib::ulog::hex32(gsw_cfg),
+               sts = libsys::ulog::hex32(xgmac_sts),
+               gsw_cfg = libsys::ulog::hex32(gsw_cfg),
                link = if xgmac_sts & 1 != 0 { 1u32 } else { 0 },
                force_link = if xgmac_sts & (1 << 11) != 0 { 1u32 } else { 0 },
                force_mode = if xgmac_sts & (1 << 15) != 0 { 1u32 } else { 0 });
@@ -1894,7 +1894,7 @@ impl EthDriver {
         // Ethwarp reset state
         if let Some(ew) = &self.ethwarp {
             let ew_rst = ew.read32(ETHWARP_RST_OFS);
-            udebug!("ethd", "dump_ethwarp"; prefix = prefix, rst = userlib::ulog::hex32(ew_rst));
+            udebug!("ethd", "dump_ethwarp"; prefix = prefix, rst = libsys::ulog::hex32(ew_rst));
         }
 
         // PDMA global config
@@ -1902,16 +1902,16 @@ impl EthDriver {
         let pdma_rst = self.pdma_read(PDMA_RST_IDX_REG);
         let pdma_int_sta = self.pdma_read(PDMA_INT_STATUS);
         let pdma_int_en = self.pdma_read(PDMA_INT_MASK);
-        udebug!("ethd", "dump_pdma"; prefix = prefix, glo = userlib::ulog::hex32(pdma_glo),
-               rst = userlib::ulog::hex32(pdma_rst), int_sta = userlib::ulog::hex32(pdma_int_sta),
-               int_en = userlib::ulog::hex32(pdma_int_en));
+        udebug!("ethd", "dump_pdma"; prefix = prefix, glo = libsys::ulog::hex32(pdma_glo),
+               rst = libsys::ulog::hex32(pdma_rst), int_sta = libsys::ulog::hex32(pdma_int_sta),
+               int_en = libsys::ulog::hex32(pdma_int_en));
 
         // PDMA TX ring 0 state
         let tx_base = self.pdma_read(tx_base_ptr_reg(0));
         let tx_max = self.pdma_read(tx_max_cnt_reg(0));
         let tx_ctx = self.pdma_read(tx_ctx_idx_reg(0));
         let tx_dtx = self.pdma_read(tx_dtx_idx_reg(0));
-        udebug!("ethd", "dump_tx_ring"; prefix = prefix, base = userlib::ulog::hex32(tx_base),
+        udebug!("ethd", "dump_tx_ring"; prefix = prefix, base = libsys::ulog::hex32(tx_base),
                max = tx_max, ctx = tx_ctx, dtx = tx_dtx);
 
         // QDMA registers (at FE_BASE + 0x4400) - maybe U-Boot uses QDMA for TX?
@@ -1921,8 +1921,8 @@ impl EthDriver {
         let qdma_tx_max = self.fe_read(QDMA_BASE + 0x304);   // TX_MAX_CNT_0
         let qdma_tx_ctx = self.fe_read(QDMA_BASE + 0x308);   // TX_CTX_IDX_0
         let qdma_tx_dtx = self.fe_read(QDMA_BASE + 0x30c);   // TX_DTX_IDX_0
-        udebug!("ethd", "dump_qdma"; prefix = prefix, glo = userlib::ulog::hex32(qdma_glo),
-               tx_base = userlib::ulog::hex32(qdma_tx_base), tx_max = qdma_tx_max,
+        udebug!("ethd", "dump_qdma"; prefix = prefix, glo = libsys::ulog::hex32(qdma_glo),
+               tx_base = libsys::ulog::hex32(qdma_tx_base), tx_max = qdma_tx_max,
                tx_ctx = qdma_tx_ctx, tx_dtx = qdma_tx_dtx);
 
         // Switch CPU port (6) state
@@ -1930,23 +1930,23 @@ impl EthDriver {
             let cpu_pcr = self.gsw_read(MT7530_PCR_P(MT7531_CPU_PORT));
             let cpu_pmcr = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
             let cpu_pvc = self.gsw_read(MT7530_PVC_P(MT7531_CPU_PORT));
-            udebug!("ethd", "dump_sw_cpu"; prefix = prefix, pcr = userlib::ulog::hex32(cpu_pcr),
-                   pmcr = userlib::ulog::hex32(cpu_pmcr), pvc = userlib::ulog::hex32(cpu_pvc));
+            udebug!("ethd", "dump_sw_cpu"; prefix = prefix, pcr = libsys::ulog::hex32(cpu_pcr),
+                   pmcr = libsys::ulog::hex32(cpu_pmcr), pvc = libsys::ulog::hex32(cpu_pvc));
 
             // User ports 0-3
             for port in 0..4u32 {
                 let pcr = self.gsw_read(MT7530_PCR_P(port));
                 let pmcr = self.gsw_read(MT7530_PMCR_P(port));
                 udebug!("ethd", "dump_sw_port"; prefix = prefix, port = port,
-                       pcr = userlib::ulog::hex32(pcr), pmcr = userlib::ulog::hex32(pmcr));
+                       pcr = libsys::ulog::hex32(pcr), pmcr = libsys::ulog::hex32(pmcr));
             }
 
             // Switch system registers
             let sys_ctrl = self.gsw_read(0x7000);
             let mfc = self.gsw_read(0x0010);  // MFC - frame control
             let pfc = self.gsw_read(0x0004);  // PFC - PHY indirect
-            udebug!("ethd", "dump_sw_sys"; prefix = prefix, sys = userlib::ulog::hex32(sys_ctrl),
-                   mfc = userlib::ulog::hex32(mfc), pfc = userlib::ulog::hex32(pfc));
+            udebug!("ethd", "dump_sw_sys"; prefix = prefix, sys = libsys::ulog::hex32(sys_ctrl),
+                   mfc = libsys::ulog::hex32(mfc), pfc = libsys::ulog::hex32(pfc));
         }
     }
 
@@ -1988,7 +1988,7 @@ impl EthDriver {
         const ETHSYS_RSTCTRL: usize = 0x34;
         if let Some(ref ethsys) = self.ethsys {
             let rst_state = ethsys.read32(ETHSYS_RSTCTRL);
-            udebug!("ethd", "fe_reset_skipped"; rst_state = userlib::ulog::hex32(rst_state),
+            udebug!("ethd", "fe_reset_skipped"; rst_state = libsys::ulog::hex32(rst_state),
                    reason = "preserve_uboot_state");
         }
 
@@ -2025,13 +2025,13 @@ impl EthDriver {
         // Our gdma_write(0, ...) uses GDMA1_BASE, gdma_write(1, ...) uses GDMA2_BASE
         let gdm1_ig = self.fe_read(GDMA1_BASE + GDMA_IG_CTRL_REG);  // GDM1 at 0x500 (FPORT=1 target)
         let gdm1_eg = self.fe_read(GDMA1_BASE + GDMA_EG_CTRL_REG);
-        udebug!("ethd", "gdm1_0x500_configured"; ig = userlib::ulog::hex32(gdm1_ig),
-               eg = userlib::ulog::hex32(gdm1_eg));
+        udebug!("ethd", "gdm1_0x500_configured"; ig = libsys::ulog::hex32(gdm1_ig),
+               eg = libsys::ulog::hex32(gdm1_eg));
 
         let gdm2_ig = self.fe_read(GDMA2_BASE + GDMA_IG_CTRL_REG);  // GDM2 at 0x1500
         let gdm2_eg = self.fe_read(GDMA2_BASE + GDMA_EG_CTRL_REG);
-        udebug!("ethd", "gdm2_0x1500_configured"; ig = userlib::ulog::hex32(gdm2_ig),
-               eg = userlib::ulog::hex32(gdm2_eg));
+        udebug!("ethd", "gdm2_0x1500_configured"; ig = libsys::ulog::hex32(gdm2_ig),
+               eg = libsys::ulog::hex32(gdm2_eg));
 
         // Initialize switch and PHYs (this now does PHY autoneg restart)
         self.switch_init();
@@ -2040,7 +2040,7 @@ impl EthDriver {
         if self.sw.is_some() {
             let cpu_pcr = self.gsw_read(MT7530_PCR_P(MT7531_CPU_PORT));
             let cpu_pmcr = self.gsw_read(MT7530_PMCR_P(MT7531_CPU_PORT));
-            udebug!("ethd", "switch_cpu_port"; pcr = userlib::ulog::hex32(cpu_pcr), pmcr = userlib::ulog::hex32(cpu_pmcr));
+            udebug!("ethd", "switch_cpu_port"; pcr = libsys::ulog::hex32(cpu_pcr), pmcr = libsys::ulog::hex32(cpu_pmcr));
         }
 
         // Initialize DMA rings
@@ -2068,7 +2068,7 @@ impl EthDriver {
         {
             let mcr0_addr = GMAC_BASE as usize + gmac_port_mcr(0) as usize;
             let mcr0 = self.fe.as_ref().map(|fe| fe.read32(mcr0_addr)).unwrap_or(0);
-            udebug!("ethd", "gmac0_mcr_before"; mcr = userlib::ulog::hex32(mcr0));
+            udebug!("ethd", "gmac0_mcr_before"; mcr = libsys::ulog::hex32(mcr0));
 
             // For XGMII/internal 10G mode: set ONLY FORCE_MODE, nothing else!
             // This forces the 1G MAC link DOWN while XGMAC handles traffic.
@@ -2082,7 +2082,7 @@ impl EthDriver {
             self.fe.as_ref().map(|fe| fe.write32(mcr0_addr, new_mcr0));
 
             let mcr0_after = self.fe.as_ref().map(|fe| fe.read32(mcr0_addr)).unwrap_or(0);
-            udebug!("ethd", "gmac0_mcr_after"; mcr = userlib::ulog::hex32(mcr0_after),
+            udebug!("ethd", "gmac0_mcr_after"; mcr = libsys::ulog::hex32(mcr0_after),
                    tx_en = if mcr0_after & MAC_TX_EN != 0 { 1u32 } else { 0 },
                    rx_en = if mcr0_after & MAC_RX_EN != 0 { 1u32 } else { 0 },
                    force_link = if mcr0_after & MAC_FORCE_LINK != 0 { 1u32 } else { 0 });
@@ -2100,8 +2100,8 @@ impl EthDriver {
             let xgmac_new = xgmac_before | XGMAC_FORCE_MODE | XGMAC_FORCE_LINK;
             self.fe.as_ref().map(|fe| fe.write32(XGMAC_STS_REG, xgmac_new));
             let xgmac_after = self.fe.as_ref().map(|fe| fe.read32(XGMAC_STS_REG)).unwrap_or(0);
-            udebug!("ethd", "xgmac_sts"; before = userlib::ulog::hex32(xgmac_before),
-                   after = userlib::ulog::hex32(xgmac_after),
+            udebug!("ethd", "xgmac_sts"; before = libsys::ulog::hex32(xgmac_before),
+                   after = libsys::ulog::hex32(xgmac_after),
                    force_mode = if xgmac_after & XGMAC_FORCE_MODE != 0 { 1u32 } else { 0 },
                    force_link = if xgmac_after & XGMAC_FORCE_LINK != 0 { 1u32 } else { 0 });
 
@@ -2118,13 +2118,13 @@ impl EthDriver {
                         | (GSW_IPG_11 << 16) | (GSW_IPG_11 << 0);
             self.fe.as_ref().map(|fe| fe.write32(GSW_CFG_REG, gsw_new));
             let gsw_after = self.fe.as_ref().map(|fe| fe.read32(GSW_CFG_REG)).unwrap_or(0);
-            udebug!("ethd", "gsw_cfg"; before = userlib::ulog::hex32(gsw_before),
-                   after = userlib::ulog::hex32(gsw_after));
+            udebug!("ethd", "gsw_cfg"; before = libsys::ulog::hex32(gsw_before),
+                   after = libsys::ulog::hex32(gsw_after));
         }
 
         for i in 1..3u32 {
             let mcr = self.fe.as_ref().map(|fe| fe.read32(GMAC_BASE as usize + gmac_port_mcr(i) as usize)).unwrap_or(0);
-            udebug!("ethd", "gmac_mcr_other"; port = i, mcr = userlib::ulog::hex32(mcr));
+            udebug!("ethd", "gmac_mcr_other"; port = i, mcr = libsys::ulog::hex32(mcr));
         }
 
         // Enable DMA
@@ -2137,15 +2137,15 @@ impl EthDriver {
             let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
             let qdma_glo = self.qdma_read(QDMA_GLO_CFG);
             udebug!("ethd", "dma_enabled_qdma";
-                   pdma_glo = userlib::ulog::hex32(pdma_glo),
-                   qdma_glo = userlib::ulog::hex32(qdma_glo));
+                   pdma_glo = libsys::ulog::hex32(pdma_glo),
+                   qdma_glo = libsys::ulog::hex32(qdma_glo));
         } else {
             // PDMA for both TX and RX (U-Boot style)
             self.pdma_rmw(PDMA_GLO_CFG_REG, 0, TX_WB_DDONE | RX_DMA_EN | TX_DMA_EN);
             delay_us(500);
 
             let glo_cfg = self.pdma_read(PDMA_GLO_CFG_REG);
-            udebug!("ethd", "dma_enabled"; glo_cfg = userlib::ulog::hex32(glo_cfg));
+            udebug!("ethd", "dma_enabled"; glo_cfg = libsys::ulog::hex32(glo_cfg));
         }
 
         // LAST: Dump state AFTER all our changes
@@ -3421,7 +3421,7 @@ impl Driver for EthDriver {
         // Test using FE_GLO_MISC at offset 0x124
         {
             let glo_misc = fe.read32(FE_GLO_MISC_REG as usize);
-            udebug!("ethd", "fe_glo_misc_uboot"; val = userlib::ulog::hex32(glo_misc),
+            udebug!("ethd", "fe_glo_misc_uboot"; val = libsys::ulog::hex32(glo_misc),
                    pdma_v2 = if (glo_misc & PDMA_VER_V2) != 0 { 1u32 } else { 0u32 });
 
             // Test: Try setting BIT(4) if not already set
@@ -3429,7 +3429,7 @@ impl Driver for EthDriver {
                 udebug!("ethd", "set_pdma_v2"; reason = "not_set_by_uboot");
                 fe.write32(FE_GLO_MISC_REG as usize, glo_misc | PDMA_VER_V2);
                 let glo_misc_after = fe.read32(FE_GLO_MISC_REG as usize);
-                udebug!("ethd", "fe_glo_misc_after"; val = userlib::ulog::hex32(glo_misc_after),
+                udebug!("ethd", "fe_glo_misc_after"; val = libsys::ulog::hex32(glo_misc_after),
                        pdma_v2 = if (glo_misc_after & PDMA_VER_V2) != 0 { 1u32 } else { 0u32 });
             }
 
@@ -3438,8 +3438,8 @@ impl Driver for EthDriver {
             let pse_dumy_before = fe.read32(0x10c);
             fe.write32(0x10c, 0x12345678);
             let pse_dumy_after = fe.read32(0x10c);
-            udebug!("ethd", "fe_write_test"; reg = "pse_dumy", before = userlib::ulog::hex32(pse_dumy_before),
-                   wrote = userlib::ulog::hex32(0x12345678), after = userlib::ulog::hex32(pse_dumy_after));
+            udebug!("ethd", "fe_write_test"; reg = "pse_dumy", before = libsys::ulog::hex32(pse_dumy_before),
+                   wrote = libsys::ulog::hex32(0x12345678), after = libsys::ulog::hex32(pse_dumy_after));
 
             // Restore original value
             fe.write32(0x10c, pse_dumy_before);
@@ -3453,11 +3453,11 @@ impl Driver for EthDriver {
         // Map Internal Switch MMIO (separate region at 0x15020000)
         match MmioRegion::open(SWITCH_BASE, SWITCH_SIZE) {
             Some(sw) => {
-                udebug!("ethd", "switch_mmio_ok"; base = userlib::ulog::hex64(SWITCH_BASE));
+                udebug!("ethd", "switch_mmio_ok"; base = libsys::ulog::hex64(SWITCH_BASE));
                 self.sw = Some(sw);
             }
             None => {
-                uwarn!("ethd", "switch_mmio_failed"; base = userlib::ulog::hex64(SWITCH_BASE));
+                uwarn!("ethd", "switch_mmio_failed"; base = libsys::ulog::hex64(SWITCH_BASE));
                 // Continue without switch - SFP+ might still work
             }
         }
@@ -3465,11 +3465,11 @@ impl Driver for EthDriver {
         // Map Ethwarp reset controller (0x15031000)
         match MmioRegion::open(ETHWARP_BASE, ETHWARP_SIZE) {
             Some(ew) => {
-                udebug!("ethd", "ethwarp_mmio_ok"; base = userlib::ulog::hex64(ETHWARP_BASE));
+                udebug!("ethd", "ethwarp_mmio_ok"; base = libsys::ulog::hex64(ETHWARP_BASE));
                 self.ethwarp = Some(ew);
             }
             None => {
-                uwarn!("ethd", "ethwarp_mmio_failed"; base = userlib::ulog::hex64(ETHWARP_BASE));
+                uwarn!("ethd", "ethwarp_mmio_failed"; base = libsys::ulog::hex64(ETHWARP_BASE));
             }
         }
 
@@ -3477,11 +3477,11 @@ impl Driver for EthDriver {
         // Reference: Linux clk-mt7988-eth.c for clock gate definitions
         match MmioRegion::open(ETHSYS_BASE, ETHSYS_SIZE) {
             Some(es) => {
-                udebug!("ethd", "ethsys_mmio_ok"; base = userlib::ulog::hex64(ETHSYS_BASE));
+                udebug!("ethd", "ethsys_mmio_ok"; base = libsys::ulog::hex64(ETHSYS_BASE));
 
                 // Read current clock gate status
                 let clk_gate_before = es.read32(ETHSYS_CLK_GATE_REG);
-                udebug!("ethd", "ethsys_clk_gate_before"; val = userlib::ulog::hex32(clk_gate_before));
+                udebug!("ethd", "ethsys_clk_gate_before"; val = libsys::ulog::hex32(clk_gate_before));
 
                 // Enable all necessary clocks for Ethernet + SRAM
                 // Linux enables these via mtk_clk_enable() in mtk_hw_init()
@@ -3500,7 +3500,7 @@ impl Driver for EthDriver {
 
                 // Verify the write took effect
                 let clk_gate_after = es.read32(ETHSYS_CLK_GATE_REG);
-                udebug!("ethd", "ethsys_clk_gate_after"; val = userlib::ulog::hex32(clk_gate_after),
+                udebug!("ethd", "ethsys_clk_gate_after"; val = libsys::ulog::hex32(clk_gate_after),
                        fe_en = if (clk_gate_after & ETHSYS_CLK_FE_EN) != 0 { 1u32 } else { 0u32 },
                        esw_en = if (clk_gate_after & ETHSYS_CLK_ESW_EN) != 0 { 1u32 } else { 0u32 });
 
@@ -3511,24 +3511,24 @@ impl Driver for EthDriver {
                 let dummy_reg = es.read32(ETHSYS_DUMMY_REG);
                 let sys_cfg = es.read32(0x10);   // ETHSYS_SYSCFG
                 let sys_cfg0 = es.read32(0x14);  // ETHSYS_SYSCFG0
-                udebug!("ethd", "ethsys_regs"; dummy = userlib::ulog::hex32(dummy_reg),
-                       syscfg = userlib::ulog::hex32(sys_cfg), syscfg0 = userlib::ulog::hex32(sys_cfg0));
+                udebug!("ethd", "ethsys_regs"; dummy = libsys::ulog::hex32(dummy_reg),
+                       syscfg = libsys::ulog::hex32(sys_cfg), syscfg0 = libsys::ulog::hex32(sys_cfg0));
 
                 self.ethsys = Some(es);
             }
             None => {
-                uwarn!("ethd", "ethsys_mmio_failed"; base = userlib::ulog::hex64(ETHSYS_BASE));
+                uwarn!("ethd", "ethsys_mmio_failed"; base = libsys::ulog::hex64(ETHSYS_BASE));
             }
         }
 
         // Map Pinctrl (GPIO) for LED pin muxing
         match MmioRegion::open(PINCTRL_BASE, PINCTRL_SIZE) {
             Some(pc) => {
-                udebug!("ethd", "pinctrl_mmio_ok"; base = userlib::ulog::hex64(PINCTRL_BASE));
+                udebug!("ethd", "pinctrl_mmio_ok"; base = libsys::ulog::hex64(PINCTRL_BASE));
                 self.pinctrl = Some(pc);
             }
             None => {
-                uwarn!("ethd", "pinctrl_mmio_failed"; base = userlib::ulog::hex64(PINCTRL_BASE));
+                uwarn!("ethd", "pinctrl_mmio_failed"; base = libsys::ulog::hex64(PINCTRL_BASE));
             }
         }
 
@@ -3543,27 +3543,27 @@ impl Driver for EthDriver {
                     let test_val = sr.read32(0);
 
                     if test_val == 0xCAFEBABE {
-                        udebug!("ethd", "sram_ok"; base = userlib::ulog::hex64(SRAM_BASE),
-                               size = userlib::ulog::hex64(SRAM_SIZE));
+                        udebug!("ethd", "sram_ok"; base = libsys::ulog::hex64(SRAM_BASE),
+                               size = libsys::ulog::hex64(SRAM_SIZE));
                         self.sram_vaddr = sr.virt_base();
                         self.sram_paddr = SRAM_BASE;
                         // Keep the mapping alive
                         core::mem::forget(sr);
                     } else {
-                        uerror!("ethd", "sram_write_failed"; expected = userlib::ulog::hex32(0xCAFEBABE),
-                                got = userlib::ulog::hex32(test_val));
+                        uerror!("ethd", "sram_write_failed"; expected = libsys::ulog::hex32(0xCAFEBABE),
+                                got = libsys::ulog::hex32(test_val));
                         // Fall back to DMA memory
                     }
                 }
                 None => {
-                    uerror!("ethd", "sram_mmio_failed"; base = userlib::ulog::hex64(SRAM_BASE));
+                    uerror!("ethd", "sram_mmio_failed"; base = libsys::ulog::hex64(SRAM_BASE));
                 }
             }
         }
 
         udebug!("ethd", "sram_config";
                use_sram = if USE_SRAM_FOR_RINGS && self.sram_vaddr != 0 { 1u32 } else { 0u32 },
-               paddr = userlib::ulog::hex64(if self.sram_vaddr != 0 { self.sram_paddr } else { 0 }));
+               paddr = libsys::ulog::hex64(if self.sram_vaddr != 0 { self.sram_paddr } else { 0 }));
 
         // Allocate DMA pool for data buffers (8MB: 4MB TX + 4MB RX)
         // Descriptor rings go to SRAM, only buffers go to DMA pool
@@ -3582,7 +3582,7 @@ impl Driver for EthDriver {
 
         let paddr = dma.paddr();
         udebug!("ethd", "dma_pool";
-               paddr = userlib::ulog::hex64(paddr),
+               paddr = libsys::ulog::hex64(paddr),
                size_mb = (DMA_POOL_SIZE / (1024 * 1024)) as u32);
         self.dma = Some(dma);
 
@@ -3765,14 +3765,14 @@ impl Driver for EthDriver {
                     let dtx = self.qdma_read(QDMA_DTX_PTR);
                     let glo = self.qdma_read(QDMA_GLO_CFG);
                     let fq_cnt = self.qdma_read(QDMA_FQ_COUNT);
-                    udebug!("ethd", "qdma_status"; ctx = userlib::ulog::hex32(ctx), dtx = userlib::ulog::hex32(dtx),
-                           glo = userlib::ulog::hex32(glo), fq_cnt = userlib::ulog::hex32(fq_cnt), poll = self.poll_count);
+                    udebug!("ethd", "qdma_status"; ctx = libsys::ulog::hex32(ctx), dtx = libsys::ulog::hex32(dtx),
+                           glo = libsys::ulog::hex32(glo), fq_cnt = libsys::ulog::hex32(fq_cnt), poll = self.poll_count);
 
                     // Also show PDMA RX status (we use PDMA for RX)
                     let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
                     let rx_drx = self.pdma_read(rx_drx_idx_reg(0));
                     let rx_crx = self.pdma_read(rx_crx_idx_reg(0));
-                    udebug!("ethd", "pdma_rx_status"; glo = userlib::ulog::hex32(pdma_glo),
+                    udebug!("ethd", "pdma_rx_status"; glo = libsys::ulog::hex32(pdma_glo),
                            rx_drx = rx_drx, rx_crx = rx_crx);
                 } else if self.sram_vaddr != 0 {
                     let tx_ring_vaddr = self.sram_vaddr + SRAM_TX_RING_OFF as u64;
@@ -3790,13 +3790,13 @@ impl Driver for EthDriver {
                             ddone_bits |= 1 << i;
                         }
                     }
-                    udebug!("ethd", "tx_status"; dtx = dtx, ctx = ctx_idx, ddone_mask = userlib::ulog::hex32(ddone_bits), poll = self.poll_count);
+                    udebug!("ethd", "tx_status"; dtx = dtx, ctx = ctx_idx, ddone_mask = libsys::ulog::hex32(ddone_bits), poll = self.poll_count);
                 } else {
                     // Regular DMA mode (no SRAM, no QDMA)
                     let pdma_glo = self.pdma_read(PDMA_GLO_CFG_REG);
                     let dtx = self.pdma_read(tx_dtx_idx_reg(0));
                     let ctx_idx = self.pdma_read(tx_ctx_idx_reg(0));
-                    udebug!("ethd", "pdma_status"; glo = userlib::ulog::hex32(pdma_glo),
+                    udebug!("ethd", "pdma_status"; glo = libsys::ulog::hex32(pdma_glo),
                            dtx = dtx, ctx = ctx_idx, poll = self.poll_count);
                 }
 
@@ -3848,7 +3848,7 @@ impl Driver for EthDriver {
                 // Dump all 3 GMAC MCR registers
                 for gmac in 0..3u32 {
                     let mcr = self.fe_read(GMAC_BASE + gmac_port_mcr(gmac));
-                    udebug!("ethd", "gmac_mcr"; port = gmac, mcr = userlib::ulog::hex32(mcr));
+                    udebug!("ethd", "gmac_mcr"; port = gmac, mcr = libsys::ulog::hex32(mcr));
                 }
 
                 // PDMA status
@@ -3856,11 +3856,11 @@ impl Driver for EthDriver {
                 let pdma_tx_ptr = self.pdma_read(tx_base_ptr_reg(0));
                 let pdma_tx_ctx = self.pdma_read(tx_ctx_idx_reg(0));
                 let pdma_tx_dtx = self.pdma_read(tx_dtx_idx_reg(0));
-                udebug!("ethd", "pdma_state"; glo = userlib::ulog::hex32(pdma_glo),
-                       tx_ptr = userlib::ulog::hex32(pdma_tx_ptr), ctx = pdma_tx_ctx, dtx = pdma_tx_dtx);
+                udebug!("ethd", "pdma_state"; glo = libsys::ulog::hex32(pdma_glo),
+                       tx_ptr = libsys::ulog::hex32(pdma_tx_ptr), ctx = pdma_tx_ctx, dtx = pdma_tx_dtx);
 
-                udebug!("ethd", "fe_status"; pse_fq = userlib::ulog::hex32(pse_fq), pse_drop = userlib::ulog::hex32(pse_drop),
-                       pse_oq = userlib::ulog::hex32(pse_oqc));
+                udebug!("ethd", "fe_status"; pse_fq = libsys::ulog::hex32(pse_fq), pse_drop = libsys::ulog::hex32(pse_drop),
+                       pse_oq = libsys::ulog::hex32(pse_oqc));
             }
 
             // Re-arm the timer
@@ -3874,8 +3874,8 @@ impl Driver for EthDriver {
     // Config API (devc ethd get/set switch.* and fe.*)
     // =========================================================================
 
-    fn config_keys(&self) -> &[userlib::bus::ConfigKey] {
-        use userlib::bus::ConfigKey;
+    fn config_keys(&self) -> &[libsys::bus::ConfigKey] {
+        use libsys::bus::ConfigKey;
         static KEYS: [ConfigKey; 12] = [
             // Top-level
             ConfigKey::read_only(b"stats"),         // Combined FE + switch stats
@@ -4111,34 +4111,8 @@ static mut DRIVER: EthDriver = EthDriver {
     dp_stats: EthDataPathStats::new(),
 };
 
-struct EthDriverWrapper(&'static mut EthDriver);
-
-impl Driver for EthDriverWrapper {
-    fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        self.0.reset(ctx)
-    }
-    fn command(&mut self, msg: &BusMsg, ctx: &mut dyn BusCtx) -> Disposition {
-        self.0.command(msg, ctx)
-    }
-    fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
-        self.0.data_ready(port, ctx)
-    }
-    fn handle_event(&mut self, tag: u32, handle: Handle, ctx: &mut dyn BusCtx) {
-        self.0.handle_event(tag, handle, ctx)
-    }
-    fn config_keys(&self) -> &[userlib::bus::ConfigKey] {
-        self.0.config_keys()
-    }
-    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
-        self.0.config_get(key, buf)
-    }
-    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
-        self.0.config_set(key, value, buf, ctx)
-    }
-}
-
 #[unsafe(no_mangle)]
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
-    driver_main(b"ethd", EthDriverWrapper(driver));
+    driver_main(b"ethd", driver);
 }
