@@ -321,7 +321,12 @@ impl Driver for PcieDriver {
 
     fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
         match key {
-            b"devices" => {
+            b"hw.device_count" => {
+                let mut tmp = [0u8; 16];
+                let len = fmt_u32(&mut tmp, self.count as u32);
+                copy_to(buf, &tmp[..len])
+            }
+            b"hw.devices" => {
                 let mut pos = 0;
                 let mut counters = [0u8; 8];
                 for dev in &self.devices[..self.count] {
@@ -354,8 +359,28 @@ impl Driver for PcieDriver {
     }
 }
 
+fn copy_to(buf: &mut [u8], src: &[u8]) -> usize {
+    let len = src.len().min(buf.len());
+    buf[..len].copy_from_slice(&src[..len]);
+    len
+}
+
+fn fmt_u32(buf: &mut [u8], val: u32) -> usize {
+    if val == 0 { buf[0] = b'0'; return 1; }
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 { len += 1; n /= 10; }
+    n = val;
+    for i in (0..len).rev() {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    len
+}
+
 const PCIE_CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey::read_only(b"devices"),
+    ConfigKey::read_only(b"hw.device_count"),
+    ConfigKey::read_only(b"hw.devices"),
 ];
 
 fn fmt_hex16(val: u16, buf: &mut [u8]) -> usize {

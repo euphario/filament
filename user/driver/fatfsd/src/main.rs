@@ -1177,19 +1177,30 @@ impl Driver for FatfsDriver {
 
     fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
         match key {
-            b"type" => copy_to_buf(buf, 0, if self.is_fat32 { b"FAT32" as &[u8] } else { b"FAT16" }),
-            b"mount" => copy_to_buf(buf, 0, &self.port_name[..self.port_name_len]),
-            b"cluster_size" => {
+            b"fs.type" => copy_to_buf(buf, 0, if self.is_fat32 { b"FAT32" as &[u8] } else { b"FAT16" }),
+            b"fs.cluster_size" => {
                 let mut tmp = [0u8; 16];
                 let len = format_u32(&mut tmp, self.cluster_size());
                 copy_to_buf(buf, 0, &tmp[..len])
             }
-            b"total_sectors" => {
+            b"fs.total_sectors" => {
                 let mut tmp = [0u8; 16];
                 let len = format_u32(&mut tmp, self.total_sectors);
                 copy_to_buf(buf, 0, &tmp[..len])
             }
-            b"open_files" => {
+            b"fs.sectors_per_cluster" => {
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, self.sectors_per_cluster as u32);
+                copy_to_buf(buf, 0, &tmp[..len])
+            }
+            b"fs.fat_copies" => {
+                let mut tmp = [0u8; 16];
+                let len = format_u32(&mut tmp, self.num_fats as u32);
+                copy_to_buf(buf, 0, &tmp[..len])
+            }
+            b"fs.readonly" => copy_to_buf(buf, 0, b"true"),
+            b"mount.path" => copy_to_buf(buf, 0, &self.port_name[..self.port_name_len]),
+            b"stats.open_files" => {
                 let count = self.open_files.iter().filter(|f| f.in_use).count() as u32;
                 let mut tmp = [0u8; 16];
                 let len = format_u32(&mut tmp, count);
@@ -1201,11 +1212,14 @@ impl Driver for FatfsDriver {
 }
 
 const FAT_CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey::read_only(b"type"),
-    ConfigKey::read_only(b"mount"),
-    ConfigKey::read_only(b"cluster_size"),
-    ConfigKey::read_only(b"total_sectors"),
-    ConfigKey::read_only(b"open_files"),
+    ConfigKey::read_only(b"fs.type"),
+    ConfigKey::read_only(b"fs.cluster_size"),
+    ConfigKey::read_only(b"fs.total_sectors"),
+    ConfigKey::read_only(b"fs.sectors_per_cluster"),
+    ConfigKey::read_only(b"fs.fat_copies"),
+    ConfigKey::read_only(b"fs.readonly"),
+    ConfigKey::read_only(b"mount.path"),
+    ConfigKey::read_only(b"stats.open_files"),
 ];
 
 fn copy_to_buf(buf: &mut [u8], pos: usize, src: &[u8]) -> usize {

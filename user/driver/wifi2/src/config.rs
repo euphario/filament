@@ -10,9 +10,9 @@ use crate::DriverState;
 
 /// Config keys exposed to `devc get wifi2 <key>`.
 pub static CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey { name: b"status", writable: false },
-    ConfigKey { name: b"radio", writable: false },
-    ConfigKey { name: b"channel", writable: false },
+    ConfigKey::read_only(b"state"),
+    ConfigKey::read_only(b"radio.on"),
+    ConfigKey::read_only(b"radio.channel"),
 ];
 
 /// Handle `devc get wifi2 <key>`.
@@ -20,15 +20,14 @@ pub fn config_get(state: &DriverState, channel: u8, key: &[u8], buf: &mut [u8]) 
     let mut w = BufWriter::new(buf);
 
     match key {
-        b"status" => {
-            w.kv("state", state.name());
-            w.kv("channel", channel);
+        b"state" => {
+            let _ = write!(w, "{}", state.name());
         }
-        b"radio" => {
+        b"radio.on" => {
             let on = matches!(state, DriverState::RadioOn | DriverState::ApActive);
             w.on_off(on);
         }
-        b"channel" => {
+        b"radio.channel" => {
             let _ = write!(w, "{}", channel);
         }
         _ => return 0,

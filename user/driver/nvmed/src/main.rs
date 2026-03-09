@@ -17,7 +17,7 @@
 use libsys::syscall;
 use libos::mmio::{MmioRegion, DmaPool};
 use libos::bus::{
-    BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
+    BusMsg, BusError, BusCtx, Driver, Disposition, PortId, ConfigKey,
     BlockTransport, BlockPortConfig, BlockGeometry, bus_msg,
     PortInfo, PortClass, port_subclass,
 };
@@ -792,11 +792,63 @@ impl Driver for NvmeDriver {
         }
     }
 
+    fn config_keys(&self) -> &[ConfigKey] {
+        NVME_CONFIG_KEYS
+    }
+
+    fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
+        let ctrl = match &self.ctrl {
+            Some(c) => c,
+            None => return 0,
+        };
+        match key {
+            b"disk.block_size" => fmt_u32_to(buf, ctrl.block_size),
+            b"disk.blocks" => fmt_u64_to(buf, ctrl.ns_size),
+            b"disk.capacity_mb" => {
+                let mb = (ctrl.ns_size * ctrl.block_size as u64) / (1024 * 1024);
+                fmt_u64_to(buf, mb)
+            }
+            _ => 0,
+        }
+    }
+
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
         if self.port_id == Some(port) {
             self.process_ring_requests(ctx);
         }
     }
+}
+
+const NVME_CONFIG_KEYS: &[ConfigKey] = &[
+    ConfigKey::read_only(b"disk.block_size"),
+    ConfigKey::read_only(b"disk.blocks"),
+    ConfigKey::read_only(b"disk.capacity_mb"),
+];
+
+fn fmt_u32_to(buf: &mut [u8], val: u32) -> usize {
+    let mut tmp = [0u8; 16];
+    if val == 0 { buf[0] = b'0'; return 1; }
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 { len += 1; n /= 10; }
+    n = val;
+    for i in (0..len).rev() { tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
+    let out = len.min(buf.len());
+    buf[..out].copy_from_slice(&tmp[..out]);
+    out
+}
+
+fn fmt_u64_to(buf: &mut [u8], val: u64) -> usize {
+    let mut tmp = [0u8; 20];
+    if val == 0 { buf[0] = b'0'; return 1; }
+    let mut n = val;
+    let mut len = 0;
+    while n > 0 { len += 1; n /= 10; }
+    n = val;
+    for i in (0..len).rev() { tmp[i] = b'0' + (n % 10) as u8; n /= 10; }
+    let out = len.min(buf.len());
+    buf[..out].copy_from_slice(&tmp[..out]);
+    out
 }
 
 // =============================================================================

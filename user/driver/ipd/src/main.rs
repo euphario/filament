@@ -968,11 +968,11 @@ impl IpdDriver {
     fn ipd_config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
         match key {
             b"" => self.format_summary(buf),
-            b"ip" => format_ip(buf, self.assigned_ip),
-            b"prefix" => format_u64(self.assigned_prefix as u64, buf),
-            b"gateway" => format_ip(buf, self.assigned_gateway),
-            b"mac" => self.format_mac(buf),
-            b"dhcp" => {
+            b"net.ip" => format_ip(buf, self.assigned_ip),
+            b"net.prefix" => format_u64(self.assigned_prefix as u64, buf),
+            b"net.gateway" => format_ip(buf, self.assigned_gateway),
+            b"hw.mac" => self.format_mac(buf),
+            b"net.dhcp" => {
                 let s = match self.ip_state {
                     IpState::DhcpConfigured | IpState::Unconfigured => b"on" as &[u8],
                     IpState::StaticFallback | IpState::StaticConfigured => b"off",
@@ -1112,7 +1112,7 @@ impl IpdDriver {
 
     fn ipd_config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
         match key {
-            b"ip" => {
+            b"net.ip" => {
                 if let Some(ip) = parse_ipv4(value) {
                     let gw = ipv4_from_bytes(&self.assigned_gateway);
                     let prefix = if self.assigned_prefix == 0 { STATIC_PREFIX_LEN } else { self.assigned_prefix };
@@ -1123,7 +1123,7 @@ impl IpdDriver {
                     copy_str(buf, "ERR invalid ip\n")
                 }
             }
-            b"prefix" => {
+            b"net.prefix" => {
                 if let Some(prefix) = parse_u8(value) {
                     if prefix <= 32 {
                         let ip = ipv4_from_bytes(&self.assigned_ip);
@@ -1138,7 +1138,7 @@ impl IpdDriver {
                     copy_str(buf, "ERR invalid prefix\n")
                 }
             }
-            b"gateway" => {
+            b"net.gateway" => {
                 if let Some(gw) = parse_ipv4(value) {
                     let ip = ipv4_from_bytes(&self.assigned_ip);
                     let prefix = if self.assigned_prefix == 0 { STATIC_PREFIX_LEN } else { self.assigned_prefix };
@@ -1149,7 +1149,7 @@ impl IpdDriver {
                     copy_str(buf, "ERR invalid gateway\n")
                 }
             }
-            b"dhcp" => {
+            b"net.dhcp" => {
                 match value {
                     b"on" => {
                         if let Some(stack) = unsafe { &mut *(&raw mut SMOL_STACK) } {
@@ -1656,12 +1656,12 @@ impl Driver for IpdDriver {
 }
 
 const IPD_CONFIG_KEYS: &[ConfigKey] = &[
-    ConfigKey::read_write(b"ip"),
-    ConfigKey::read_write(b"prefix"),
-    ConfigKey::read_write(b"gateway"),
-    ConfigKey::read_write(b"dhcp"),
-    ConfigKey::read_only(b"mac"),
     ConfigKey::read_only(b"state"),
+    ConfigKey::read_write(b"net.ip"),
+    ConfigKey::read_write(b"net.prefix"),
+    ConfigKey::read_write(b"net.gateway"),
+    ConfigKey::read_write(b"net.dhcp"),
+    ConfigKey::read_only(b"hw.mac"),
     ConfigKey::read_only(b"stats"),
     ConfigKey::read_only(b"diag.rx"),
 ];

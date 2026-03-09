@@ -537,8 +537,21 @@ pub mod config_key {
 /// Drivers return a static slice of these from `config_keys()`. The framework
 /// uses them to auto-generate the summary (empty-key GET) and the `keys=` line
 /// listing writable keys.
+///
+/// ## Key naming convention
+///
+/// Use dot-separated categories for grouping related keys:
+///
+/// - Top-level identity: `state`, `name` (no prefix)
+/// - Hardware info: `hw.vendor`, `hw.device`, `hw.mac`
+/// - Statistics: `stats.rx_bytes`, `stats.tx_bytes`, `stats.errors`
+/// - Diagnostics: `diag.rx`, `diag.queue_depth`
+/// - Device-specific: `radio.channel`, `net.ip`, `fs.type`, `disk.size`
+///
+/// The framework's prefix matching allows drill-down: querying `"stats."`
+/// returns all stats.* keys. Querying `""` (empty) returns everything.
 pub struct ConfigKey {
-    /// Key name (e.g. b"ip").
+    /// Key name (e.g. b"hw.vendor", b"stats.rx_bytes").
     pub name: &'static [u8],
     /// Whether SET is supported for this key.
     pub writable: bool,

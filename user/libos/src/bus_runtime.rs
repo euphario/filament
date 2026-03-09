@@ -1592,16 +1592,13 @@ impl<D: Driver> DriverRuntime<D> {
                 // our response with [trigger_port/driver_name] via append_with_source.
 
                 if key.is_empty() {
-                    // Summary: send local config immediately, relay children's
-                    // responses individually. Relay mode avoids accumulating a
-                    // response that might exceed the 576-byte IPC message limit.
-                    let len = if skip_local { 0 } else {
-                        build_config_summary(&self.driver, &mut buf)
-                    };
-
-                    // Send own local config immediately (before children)
-                    if len > 0 {
-                        let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
+                    // Summary: stream local config in chunks, relay children's
+                    // responses individually. Streaming avoids overflow when
+                    // drivers register many keys (100+).
+                    if !skip_local {
+                        send_config_summary(
+                            &self.driver, bus_msg.seq_id, &mut self.ctx, &mut buf,
+                        );
                     }
 
                     if forward_to_children {
@@ -1633,12 +1630,13 @@ impl<D: Driver> DriverRuntime<D> {
                             let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..len]);
                             let _ = self.ctx.respond_info_eol(bus_msg.seq_id);
                         } else {
-                            // No exact match — try prefix, then forward to children
-                            let plen = build_prefix_matches(&self.driver, key, &mut buf);
-                            // Send local prefix matches immediately
-                            if plen > 0 {
-                                let _ = self.ctx.respond_info(bus_msg.seq_id, &buf[..plen]);
-                            }
+                            // No exact match — try prefix, then forward to children.
+                            // Streaming: flushes buffer when it fills, so large
+                            // categories (100+ keys) don't overflow.
+                            send_prefix_matches(
+                                &self.driver, key, bus_msg.seq_id,
+                                &mut self.ctx, &mut buf,
+                            );
                             if forward_to_children {
                                 let origin = ConfigQueryOrigin::Devd { seq_id: bus_msg.seq_id };
                                 // Relay mode: forward each child's response individually
@@ -3054,67 +3052,75 @@ fn append_with_source(buf: &mut [u8], pos: usize, prefix: &[u8], data: &[u8]) ->
 // Config Summary Builder
 // ============================================================================
 
-/// Auto-build a summary response from the driver's registered config keys.
+/// Stream a summary response from the driver's registered config keys.
 ///
 /// For each key, calls `config_get()` and emits `key=value\n`.
+/// Flushes the buffer via `respond_info()` when it approaches full,
+/// so drivers with 100+ keys don't overflow.
 /// Appends a `keys=` line listing all writable keys.
-fn build_config_summary<D: Driver>(driver: &D, buf: &mut [u8]) -> usize {
+fn send_config_summary<D: Driver>(
+    driver: &D, seq_id: u32, ctx: &mut RuntimeCtx, buf: &mut [u8],
+) {
     let keys = driver.config_keys();
     let mut pos = 0;
 
-    // Emit key=value lines
     for key in keys {
-        // key name
-        let klen = key.name.len().min(buf.len() - pos);
-        buf[pos..pos + klen].copy_from_slice(&key.name[..klen]);
-        pos += klen;
+        // Flush if next entry might overflow (generous estimate: name + '=' + 128 value + '\n')
+        let est = key.name.len() + 130;
+        if pos > 0 && pos + est > buf.len() {
+            let _ = ctx.respond_info(seq_id, &buf[..pos]);
+            pos = 0;
+        }
 
-        // '='
-        if pos < buf.len() { buf[pos] = b'='; pos += 1; }
-
-        // value from driver
-        let n = driver.config_get(key.name, &mut buf[pos..]);
-        pos += n;
-
-        // newline
-        if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
+        pos += append_kv(driver, key.name, &mut buf[pos..]);
     }
 
     // Append keys= line (writable keys only)
-    let writable: [&[u8]; 16] = {
-        let mut arr: [&[u8]; 16] = [b""; 16];
-        let mut count = 0;
-        for key in keys {
-            if key.writable && count < 16 {
-                arr[count] = key.name;
-                count += 1;
-            }
-        }
-        arr
-    };
-
     let writable_count = keys.iter().filter(|k| k.writable).count().min(16);
     if writable_count > 0 {
+        // Flush if keys= line might not fit
+        if pos + 6 + writable_count * 32 > buf.len() {
+            let _ = ctx.respond_info(seq_id, &buf[..pos]);
+            pos = 0;
+        }
         pos += copy_static(&mut buf[pos..], b"keys=");
-        for i in 0..writable_count {
-            if i > 0 {
+        let mut first = true;
+        for key in keys {
+            if !key.writable { continue; }
+            if !first {
                 if pos < buf.len() { buf[pos] = b','; pos += 1; }
             }
-            let name = writable[i];
-            let nlen = name.len().min(buf.len() - pos);
-            buf[pos..pos + nlen].copy_from_slice(&name[..nlen]);
+            first = false;
+            let nlen = key.name.len().min(buf.len() - pos);
+            buf[pos..pos + nlen].copy_from_slice(&key.name[..nlen]);
             pos += nlen;
         }
         if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
     }
 
-    pos
+    if pos > 0 {
+        let _ = ctx.respond_info(seq_id, &buf[..pos]);
+    }
 }
 
 fn copy_static(dst: &mut [u8], src: &[u8]) -> usize {
     let len = src.len().min(dst.len());
     dst[..len].copy_from_slice(&src[..len]);
     len
+}
+
+/// Append `key=value\n` to buf by calling `driver.config_get()`.
+/// Returns bytes written.
+fn append_kv<D: Driver>(driver: &D, key: &[u8], buf: &mut [u8]) -> usize {
+    let mut pos = 0;
+    let klen = key.len().min(buf.len());
+    buf[..klen].copy_from_slice(&key[..klen]);
+    pos += klen;
+    if pos < buf.len() { buf[pos] = b'='; pos += 1; }
+    let n = driver.config_get(key, &mut buf[pos..]);
+    pos += n;
+    if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
+    pos
 }
 
 /// Format key=value\n into buf (uses a temp buffer to avoid overlap with value).
@@ -3135,28 +3141,29 @@ fn format_kv(key: &[u8], value: &[u8], buf: &mut [u8]) -> usize {
     out_len
 }
 
-/// Return all keys whose name starts with `prefix`, formatted as key=value\n lines.
-fn build_prefix_matches<D: Driver>(driver: &D, prefix: &[u8], buf: &mut [u8]) -> usize {
+/// Stream all keys whose name starts with `prefix`, formatted as key=value\n lines.
+/// Flushes the buffer via `respond_info()` when it fills, so large categories work.
+fn send_prefix_matches<D: Driver>(
+    driver: &D, prefix: &[u8], seq_id: u32,
+    ctx: &mut RuntimeCtx, buf: &mut [u8],
+) {
     let keys = driver.config_keys();
     let mut pos = 0;
 
     for key in keys {
         if key.name.len() >= prefix.len() && &key.name[..prefix.len()] == prefix {
-            // key name
-            let klen = key.name.len().min(buf.len() - pos);
-            buf[pos..pos + klen].copy_from_slice(&key.name[..klen]);
-            pos += klen;
-            // '='
-            if pos < buf.len() { buf[pos] = b'='; pos += 1; }
-            // value
-            let n = driver.config_get(key.name, &mut buf[pos..]);
-            pos += n;
-            // newline
-            if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
+            let est = key.name.len() + 130;
+            if pos > 0 && pos + est > buf.len() {
+                let _ = ctx.respond_info(seq_id, &buf[..pos]);
+                pos = 0;
+            }
+            pos += append_kv(driver, key.name, &mut buf[pos..]);
         }
     }
 
-    pos
+    if pos > 0 {
+        let _ = ctx.respond_info(seq_id, &buf[..pos]);
+    }
 }
 
 // ============================================================================
