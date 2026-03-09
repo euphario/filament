@@ -17,6 +17,7 @@ pub mod ipc;
 pub mod io;
 pub mod half_ring;
 pub mod query;
+pub mod wire;
 pub mod mmio;
 pub mod dma;
 pub mod ring;

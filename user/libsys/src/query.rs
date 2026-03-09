@@ -267,30 +267,25 @@ impl PortRegisterInfo {
 
     /// Serialize to buffer with PortInfo, returns total length written
     pub fn write_to(&self, buf: &mut [u8], info: &abi::PortInfo) -> Option<usize> {
-        if buf.len() < Self::SIZE {
-            return None;
-        }
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8..12].copy_from_slice(&self.shmem_id.to_le_bytes());
-        buf[12..16].copy_from_slice(&self._pad.to_le_bytes());
-        // Copy PortInfo bytes
+        use crate::wire::WireWriter;
         let info_bytes: &[u8; 112] = unsafe { &*(info as *const abi::PortInfo as *const [u8; 112]) };
-        buf[16..128].copy_from_slice(info_bytes);
-        Some(Self::SIZE)
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_u32(self.shmem_id)?;
+        w.put_u32(0)?; // pad
+        w.put_bytes(info_bytes)?;
+        Some(w.finish())
     }
 
     /// Deserialize header from bytes (PortInfo follows at offset 16)
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::SIZE {
-            return None;
-        }
-        let header = QueryHeader::from_bytes(&buf[0..8])?;
-        let shmem_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let info_bytes = &buf[16..128];
-        Some((
-            Self { header, shmem_id, _pad: 0 },
-            info_bytes,
-        ))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let shmem_id = r.u32()?;
+        r.skip(4)?; // pad
+        let info_bytes = r.bytes(112)?;
+        Some((Self { header, shmem_id, _pad: 0 }, info_bytes))
     }
 }
 
@@ -435,76 +430,46 @@ impl SpawnContextResponse {
         metadata: &[u8],
         context_kvs: &[(&[u8], &[u8])],
     ) -> Option<usize> {
+        use crate::wire::WireWriter;
         if port_name.len() > 255 || metadata.len() > 255 {
             return None;
         }
-        // Calculate total size: header + port_name + metadata + kv_count + kv entries
-        let mut kv_size = 1; // kv_count byte
-        for (k, v) in context_kvs {
-            kv_size += 1 + k.len() + 1 + v.len(); // key_len + key + value_len + value
-        }
-        let total = Self::HEADER_SIZE + port_name.len() + metadata.len() + kv_size;
-        if buf.len() < total {
-            return None;
-        }
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
-        buf[12] = self.port_type;
-        buf[13] = port_name.len() as u8;
-        buf[14] = metadata.len() as u8;
-        buf[15] = self.port_id;
-        buf[16..16 + port_name.len()].copy_from_slice(port_name);
-        let meta_start = 16 + port_name.len();
-        buf[meta_start..meta_start + metadata.len()].copy_from_slice(metadata);
-
-        // Append context KV pairs
-        let mut pos = meta_start + metadata.len();
-        buf[pos] = context_kvs.len() as u8;
-        pos += 1;
-        for (k, v) in context_kvs {
-            buf[pos] = k.len() as u8;
-            pos += 1;
-            buf[pos..pos + k.len()].copy_from_slice(k);
-            pos += k.len();
-            buf[pos] = v.len() as u8;
-            pos += 1;
-            buf[pos..pos + v.len()].copy_from_slice(v);
-            pos += v.len();
-        }
-
-        Some(total)
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_i32(self.result)?;
+        w.put_u8(self.port_type)?;
+        w.put_u8(port_name.len() as u8)?;
+        w.put_u8(metadata.len() as u8)?;
+        w.put_u8(self.port_id)?;
+        w.put_bytes(port_name)?;
+        w.put_bytes(metadata)?;
+        w.put_kv_list(context_kvs)?;
+        Some(w.finish())
     }
 
     /// Parse header, port_name, and metadata from bytes.
     ///
     /// Context KV pairs (if present) can be parsed separately via `parse_context_kvs()`.
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8], &[u8])> {
-        if buf.len() < Self::HEADER_SIZE {
-            return None;
-        }
-        let header = QueryHeader::from_bytes(buf)?;
-        let result = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let port_type = buf[12];
-        let port_name_len = buf[13] as usize;
-        let metadata_len = buf[14] as usize;
-        let port_id = buf[15];
-
-        let total = Self::HEADER_SIZE + port_name_len + metadata_len;
-        if buf.len() < total {
-            return None;
-        }
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let result = r.i32()?;
+        let port_type = r.u8()?;
+        let port_name_len = r.u8()?;
+        let metadata_len = r.u8()?;
+        let port_id = r.u8()?;
+        let port_name = r.bytes(port_name_len as usize)?;
+        let metadata = r.bytes(metadata_len as usize)?;
 
         let resp = Self {
             header,
             result,
             port_type,
-            port_name_len: port_name_len as u8,
-            metadata_len: metadata_len as u8,
+            port_name_len,
+            metadata_len,
             port_id,
         };
-        let port_name = &buf[Self::HEADER_SIZE..Self::HEADER_SIZE + port_name_len];
-        let meta_start = Self::HEADER_SIZE + port_name_len;
-        let metadata = &buf[meta_start..meta_start + metadata_len];
         Some((resp, port_name, metadata))
     }
 
@@ -515,33 +480,30 @@ impl SpawnContextResponse {
     pub fn parse_context_kvs(buf: &[u8], port_name_len: usize, metadata_len: usize)
         -> ([([u8; 32], u8, [u8; 64], u8); 4], usize)
     {
+        use crate::wire::WireReader;
         let mut result = [([0u8; 32], 0u8, [0u8; 64], 0u8); 4];
         let kv_start = Self::HEADER_SIZE + port_name_len + metadata_len;
         if buf.len() <= kv_start {
             return (result, 0);
         }
-        let kv_count = buf[kv_start] as usize;
-        let count = kv_count.min(4);
-        let mut pos = kv_start + 1;
-        for i in 0..count {
-            if pos >= buf.len() { return (result, i); }
-            let key_len = buf[pos] as usize;
-            pos += 1;
-            if pos + key_len > buf.len() { return (result, i); }
-            let kl = key_len.min(32);
-            result[i].0[..kl].copy_from_slice(&buf[pos..pos + kl]);
-            result[i].1 = kl as u8;
-            pos += key_len;
-            if pos >= buf.len() { return (result, i); }
-            let value_len = buf[pos] as usize;
-            pos += 1;
-            if pos + value_len > buf.len() { return (result, i); }
-            let vl = value_len.min(64);
-            result[i].2[..vl].copy_from_slice(&buf[pos..pos + vl]);
-            result[i].3 = vl as u8;
-            pos += value_len;
-        }
-        (result, count)
+        let mut r = WireReader::new(&buf[kv_start..]);
+        let mut count = 0;
+        let parsed = r.kv_list(|key, value| {
+            if count < 4 {
+                let kl = key.len().min(32);
+                result[count].0[..kl].copy_from_slice(&key[..kl]);
+                result[count].1 = kl as u8;
+                let vl = value.len().min(64);
+                result[count].2[..vl].copy_from_slice(&value[..vl]);
+                result[count].3 = vl as u8;
+            }
+            count += 1;
+        });
+        let n = match parsed {
+            Some(_) => count.min(4),
+            None => count.min(4),
+        };
+        (result, n)
     }
 
     /// Parse trailing shmem_id appended after the KV section by parent relay.
@@ -550,29 +512,18 @@ impl SpawnContextResponse {
     /// SpawnContextResponse + KV data. Root-mode devd responses omit this,
     /// so returns 0 if there aren't enough trailing bytes.
     pub fn parse_trailing_shmem_id(buf: &[u8], port_name_len: usize, metadata_len: usize) -> u32 {
+        use crate::wire::WireReader;
         let kv_start = Self::HEADER_SIZE + port_name_len + metadata_len;
         if buf.len() <= kv_start {
             return 0;
         }
-        let kv_count = buf[kv_start] as usize;
-        let count = kv_count.min(4);
-        let mut pos = kv_start + 1;
-        for _ in 0..count {
-            if pos >= buf.len() { return 0; }
-            let key_len = buf[pos] as usize;
-            pos += 1;
-            pos += key_len;
-            if pos >= buf.len() { return 0; }
-            let value_len = buf[pos] as usize;
-            pos += 1;
-            pos += value_len;
+        let mut r = WireReader::new(&buf[kv_start..]);
+        // Skip past the KV list
+        if r.kv_list(|_, _| {}).is_none() {
+            return 0;
         }
-        // pos now points past KV section — check for 4-byte shmem_id
-        if pos + 4 <= buf.len() {
-            u32::from_le_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
-        } else {
-            0
-        }
+        // Read trailing shmem_id
+        r.u32().unwrap_or(0)
     }
 }
 
@@ -623,46 +574,27 @@ impl QueryPort {
 
     /// Serialize to buffer, returns total length written
     pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
-        let total_len = Self::FIXED_SIZE + name.len();
-        if buf.len() < total_len || name.len() > 255 {
-            return None;
-        }
-
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8] = name.len() as u8;
-        buf[9] = self.port_id;
-        buf[10..12].copy_from_slice(&[0, 0]);
-        buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
-
-        Some(total_len)
+        use crate::wire::WireWriter;
+        if name.len() > 255 { return None; }
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_u8(name.len() as u8)?;
+        w.put_u8(self.port_id)?;
+        w.put_zeros(2)?;
+        w.put_bytes(name)?;
+        Some(w.finish())
     }
 
     /// Parse from buffer
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-
-        let header = QueryHeader::from_bytes(buf)?;
-        let name_len = buf[8] as usize;
-        let port_id = buf[9];
-
-        let total_len = Self::FIXED_SIZE + name_len;
-        if buf.len() < total_len {
-            return None;
-        }
-
-        let name = &buf[Self::FIXED_SIZE..total_len];
-
-        Some((
-            Self {
-                header,
-                name_len: name_len as u8,
-                port_id,
-                _pad: [0; 2],
-            },
-            name,
-        ))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let name_len = r.u8()?;
+        let port_id = r.u8()?;
+        r.skip(2)?;
+        let name = r.bytes(name_len as usize)?;
+        Some((Self { header, name_len, port_id, _pad: [0; 2] }, name))
     }
 }
 
@@ -696,46 +628,27 @@ impl UpdatePortShmemId {
 
     /// Serialize to buffer, returns total length written
     pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
-        let total_len = Self::FIXED_SIZE + name.len();
-        if buf.len() < total_len || name.len() > 255 {
-            return None;
-        }
-
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8..12].copy_from_slice(&self.shmem_id.to_le_bytes());
-        buf[12] = name.len() as u8;
-        buf[13..16].copy_from_slice(&[0, 0, 0]);
-        buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
-
-        Some(total_len)
+        use crate::wire::WireWriter;
+        if name.len() > 255 { return None; }
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_u32(self.shmem_id)?;
+        w.put_u8(name.len() as u8)?;
+        w.put_zeros(3)?;
+        w.put_bytes(name)?;
+        Some(w.finish())
     }
 
     /// Parse from buffer
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-
-        let header = QueryHeader::from_bytes(buf)?;
-        let shmem_id = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let name_len = buf[12] as usize;
-
-        let total_len = Self::FIXED_SIZE + name_len;
-        if buf.len() < total_len {
-            return None;
-        }
-
-        let name = &buf[Self::FIXED_SIZE..total_len];
-
-        Some((
-            Self {
-                header,
-                shmem_id,
-                name_len: name_len as u8,
-                _pad: [0; 3],
-            },
-            name,
-        ))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let shmem_id = r.u32()?;
+        let name_len = r.u8()?;
+        r.skip(3)?;
+        let name = r.bytes(name_len as usize)?;
+        Some((Self { header, shmem_id, name_len, _pad: [0; 3] }, name))
     }
 }
 
@@ -769,46 +682,27 @@ impl SetPortState {
 
     /// Serialize to buffer, returns total length written
     pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
-        let total_len = Self::FIXED_SIZE + name.len();
-        if buf.len() < total_len || name.len() > 255 {
-            return None;
-        }
-
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8] = self.state;
-        buf[9] = name.len() as u8;
-        buf[10..12].copy_from_slice(&[0, 0]);
-        buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
-
-        Some(total_len)
+        use crate::wire::WireWriter;
+        if name.len() > 255 { return None; }
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_u8(self.state)?;
+        w.put_u8(name.len() as u8)?;
+        w.put_zeros(2)?;
+        w.put_bytes(name)?;
+        Some(w.finish())
     }
 
     /// Parse from buffer
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-
-        let header = QueryHeader::from_bytes(buf)?;
-        let state = buf[8];
-        let name_len = buf[9] as usize;
-
-        let total_len = Self::FIXED_SIZE + name_len;
-        if buf.len() < total_len {
-            return None;
-        }
-
-        let name = &buf[Self::FIXED_SIZE..total_len];
-
-        Some((
-            Self {
-                header,
-                state,
-                name_len: name_len as u8,
-                _pad: [0; 2],
-            },
-            name,
-        ))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let state = r.u8()?;
+        let name_len = r.u8()?;
+        r.skip(2)?;
+        let name = r.bytes(name_len as usize)?;
+        Some((Self { header, state, name_len, _pad: [0; 2] }, name))
     }
 }
 
@@ -999,37 +893,28 @@ impl PortFilter {
 
     /// Write filter to buffer, returns bytes written
     pub fn write_to(&self, buf: &mut [u8], pattern: &[u8]) -> Option<usize> {
-        let total = Self::FIXED_SIZE + pattern.len();
-        if buf.len() < total {
-            return None;
-        }
-        buf[0] = self.mode;
-        buf[1] = self.port_type;
-        buf[2..4].copy_from_slice(&self.class_filter.to_le_bytes());
-        buf[4] = pattern.len() as u8;
-        buf[5..8].copy_from_slice(&[0, 0, 0]);
-        buf[Self::FIXED_SIZE..total].copy_from_slice(pattern);
-        Some(total)
+        use crate::wire::WireWriter;
+        let mut w = WireWriter::new(buf);
+        w.put_u8(self.mode)?;
+        w.put_u8(self.port_type)?;
+        w.put_u16(self.class_filter)?;
+        w.put_u8(pattern.len() as u8)?;
+        w.put_zeros(3)?;
+        w.put_bytes(pattern)?;
+        Some(w.finish())
     }
 
     /// Parse filter from buffer
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-        let pattern_len = buf[4] as usize;
-        let total = Self::FIXED_SIZE + pattern_len;
-        if buf.len() < total {
-            return None;
-        }
-        let pattern = &buf[Self::FIXED_SIZE..total];
-        Some((Self {
-            mode: buf[0],
-            port_type: buf[1],
-            class_filter: u16::from_le_bytes([buf[2], buf[3]]),
-            pattern_len: pattern_len as u8,
-            _pad: [0; 3],
-        }, pattern))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let mode = r.u8()?;
+        let port_type = r.u8()?;
+        let class_filter = r.u16()?;
+        let pattern_len = r.u8()?;
+        r.skip(3)?;
+        let pattern = r.bytes(pattern_len as usize)?;
+        Some((Self { mode, port_type, class_filter, pattern_len, _pad: [0; 3] }, pattern))
     }
 }
 
@@ -1184,26 +1069,25 @@ impl SpawnChild {
         filter: &PortFilter,
         pattern: &[u8],
     ) -> Option<usize> {
+        use crate::wire::WireWriter;
         let filter_total = PortFilter::FIXED_SIZE + pattern.len();
-        let total_len = Self::FIXED_SIZE + binary.len() + filter_total;
-        if buf.len() < total_len || binary.len() > 255 || filter_total > 255 {
+        if binary.len() > 255 || filter_total > 255 {
             return None;
         }
-
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8] = binary.len() as u8;
-        buf[9] = filter_total as u8;
-        buf[10] = self.context_len;
-        buf[11] = self.priority;
-        buf[12..20].copy_from_slice(&self.caps.to_le_bytes());
-
-        let binary_start = Self::FIXED_SIZE;
-        buf[binary_start..binary_start + binary.len()].copy_from_slice(binary);
-
-        let filter_start = binary_start + binary.len();
-        filter.write_to(&mut buf[filter_start..], pattern)?;
-
-        Some(total_len)
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_u8(binary.len() as u8)?;
+        w.put_u8(filter_total as u8)?;
+        w.put_u8(self.context_len)?;
+        w.put_u8(self.priority)?;
+        w.put_u64(self.caps)?;
+        w.put_bytes(binary)?;
+        // Reserve space for PortFilter — written below via its own write_to
+        w.put_zeros(filter_total)?;
+        let header_end = w.finish();
+        // PortFilter writes into the reserved region
+        filter.write_to(&mut buf[header_end - filter_total..], pattern)?;
+        Some(header_end)
     }
 
     /// Serialize to buffer with filter and context section.
@@ -1222,7 +1106,8 @@ impl SpawnChild {
         pattern: &[u8],
         ctx: &SpawnChildContext,
     ) -> Option<usize> {
-        // Calculate context section size
+        use crate::wire::WireWriter;
+        // Calculate context section size for the header's context_len field
         let mut ctx_size: usize = 8; // port_type + port_id + metadata_len + kv_count + shmem_id
         ctx_size += ctx.metadata_len as usize;
         for i in 0..ctx.kv_count as usize {
@@ -1231,49 +1116,43 @@ impl SpawnChild {
         if ctx_size > 255 { return None; }
 
         let filter_total = PortFilter::FIXED_SIZE + pattern.len();
-        let total_len = Self::FIXED_SIZE + binary.len() + filter_total + ctx_size;
-        if buf.len() < total_len || binary.len() > 255 || filter_total > 255 {
+        if binary.len() > 255 || filter_total > 255 {
             return None;
         }
 
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8] = binary.len() as u8;
-        buf[9] = filter_total as u8;
-        buf[10] = ctx_size as u8;
-        buf[11] = self.priority;
-        buf[12..20].copy_from_slice(&self.caps.to_le_bytes());
-
-        let binary_start = Self::FIXED_SIZE;
-        buf[binary_start..binary_start + binary.len()].copy_from_slice(binary);
-
-        let filter_start = binary_start + binary.len();
-        filter.write_to(&mut buf[filter_start..], pattern)?;
+        // Write header + binary
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_u8(binary.len() as u8)?;
+        w.put_u8(filter_total as u8)?;
+        w.put_u8(ctx_size as u8)?;
+        w.put_u8(self.priority)?;
+        w.put_u64(self.caps)?;
+        w.put_bytes(binary)?;
+        // Reserve space for filter (written via its own write_to below)
+        w.put_zeros(filter_total)?;
+        let filter_end = w.position();
 
         // Write context section
-        let ctx_start = filter_start + filter_total;
-        buf[ctx_start] = ctx.port_type;
-        buf[ctx_start + 1] = ctx.port_id;
-        buf[ctx_start + 2] = ctx.metadata_len;
-        buf[ctx_start + 3] = ctx.kv_count;
-        buf[ctx_start + 4..ctx_start + 8].copy_from_slice(&ctx.shmem_id.to_le_bytes());
-        let mut pos = ctx_start + 8;
+        w.put_u8(ctx.port_type)?;
+        w.put_u8(ctx.port_id)?;
+        w.put_u8(ctx.metadata_len)?;
+        w.put_u8(ctx.kv_count)?;
+        w.put_u32(ctx.shmem_id)?;
         let mlen = ctx.metadata_len as usize;
-        buf[pos..pos + mlen].copy_from_slice(&ctx.metadata[..mlen]);
-        pos += mlen;
+        w.put_bytes(&ctx.metadata[..mlen])?;
         for i in 0..ctx.kv_count as usize {
             let klen = ctx.kv_keys_len[i] as usize;
-            buf[pos] = klen as u8;
-            pos += 1;
-            buf[pos..pos + klen].copy_from_slice(&ctx.kv_keys[i][..klen]);
-            pos += klen;
+            w.put_len_u8_bytes(&ctx.kv_keys[i][..klen])?;
             let vlen = ctx.kv_values_len[i] as usize;
-            buf[pos] = vlen as u8;
-            pos += 1;
-            buf[pos..pos + vlen].copy_from_slice(&ctx.kv_values[i][..vlen]);
-            pos += vlen;
+            w.put_len_u8_bytes(&ctx.kv_values[i][..vlen])?;
         }
+        let total = w.finish();
 
-        Some(total_len)
+        // Write PortFilter into the reserved region
+        filter.write_to(&mut buf[filter_end - filter_total..], pattern)?;
+
+        Some(total)
     }
 
     /// Legacy: Serialize with port name (backwards compat, uses exact filter)
@@ -1286,42 +1165,25 @@ impl SpawnChild {
     /// Returns (header, binary_name, filter_bytes). Use `parse_context()` to
     /// extract the optional context section.
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8], &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-
-        let header = QueryHeader::from_bytes(buf)?;
-        let binary_len = buf[8] as usize;
-        let filter_len = buf[9] as usize;
-        let context_len = buf[10] as usize;
-
-        let total_len = Self::FIXED_SIZE + binary_len + filter_len + context_len;
-        if buf.len() < total_len {
-            return None;
-        }
-
-        let binary_start = Self::FIXED_SIZE;
-        let binary = &buf[binary_start..binary_start + binary_len];
-        let filter_start = binary_start + binary_len;
-        let filter_bytes = &buf[filter_start..filter_start + filter_len];
-
-        let caps = if buf.len() >= 20 {
-            u64::from_le_bytes([
-                buf[12], buf[13], buf[14], buf[15],
-                buf[16], buf[17], buf[18], buf[19],
-            ])
-        } else {
-            0
-        };
-
-        let priority = buf[11];
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let binary_len = r.u8()?;
+        let filter_len = r.u8()?;
+        let context_len = r.u8()?;
+        let priority = r.u8()?;
+        let caps = r.u64()?;
+        let binary = r.bytes(binary_len as usize)?;
+        let filter_bytes = r.bytes(filter_len as usize)?;
+        // Validate that context section is also present
+        r.skip(context_len as usize)?;
 
         Some((
             Self {
                 header,
-                binary_len: binary_len as u8,
-                filter_len: filter_len as u8,
-                context_len: context_len as u8,
+                binary_len,
+                filter_len,
+                context_len,
                 priority,
                 caps,
             },
@@ -1334,6 +1196,7 @@ impl SpawnChild {
     ///
     /// Call after `from_bytes()`. Returns None if context_len == 0.
     pub fn parse_context(buf: &[u8]) -> Option<SpawnChildContext> {
+        use crate::wire::WireReader;
         if buf.len() < Self::FIXED_SIZE {
             return None;
         }
@@ -1344,15 +1207,16 @@ impl SpawnChild {
             return None;
         }
         let ctx_start = Self::FIXED_SIZE + binary_len + filter_len;
-        if buf.len() < ctx_start + context_len || context_len < 8 {
+        if buf.len() < ctx_start + context_len {
             return None;
         }
-        let ctx = &buf[ctx_start..ctx_start + context_len];
-        let port_type = ctx[0];
-        let port_id = ctx[1];
-        let metadata_len = ctx[2];
-        let kv_count = ctx[3];
-        let shmem_id = u32::from_le_bytes([ctx[4], ctx[5], ctx[6], ctx[7]]);
+
+        let mut r = WireReader::new(&buf[ctx_start..ctx_start + context_len]);
+        let port_type = r.u8()?;
+        let port_id = r.u8()?;
+        let metadata_len = r.u8()?;
+        let kv_count = r.u8()?;
+        let shmem_id = r.u32()?;
 
         let mut result = SpawnChildContext {
             port_type, port_id, metadata_len, kv_count, shmem_id,
@@ -1363,28 +1227,20 @@ impl SpawnChild {
             kv_values_len: [0u8; 4],
         };
 
-        let mut pos = 8;
         let mlen = (metadata_len as usize).min(64);
-        if pos + mlen > context_len { return None; }
-        result.metadata[..mlen].copy_from_slice(&ctx[pos..pos + mlen]);
-        pos += mlen;
+        let meta = r.bytes(mlen)?;
+        result.metadata[..mlen].copy_from_slice(meta);
 
         let kv_n = (kv_count as usize).min(4);
         for i in 0..kv_n {
-            if pos >= context_len { break; }
-            let klen = (ctx[pos] as usize).min(32);
-            pos += 1;
-            if pos + klen > context_len { break; }
-            result.kv_keys[i][..klen].copy_from_slice(&ctx[pos..pos + klen]);
+            let key = r.len_u8_bytes()?;
+            let klen = key.len().min(32);
+            result.kv_keys[i][..klen].copy_from_slice(&key[..klen]);
             result.kv_keys_len[i] = klen as u8;
-            pos += klen;
-            if pos >= context_len { break; }
-            let vlen = (ctx[pos] as usize).min(64);
-            pos += 1;
-            if pos + vlen > context_len { break; }
-            result.kv_values[i][..vlen].copy_from_slice(&ctx[pos..pos + vlen]);
+            let value = r.len_u8_bytes()?;
+            let vlen = value.len().min(64);
+            result.kv_values[i][..vlen].copy_from_slice(&value[..vlen]);
             result.kv_values_len[i] = vlen as u8;
-            pos += vlen;
         }
 
         Some(result)
@@ -1444,61 +1300,52 @@ impl SpawnAck {
 
     /// Write to buffer with child PIDs
     pub fn write_to(&self, buf: &mut [u8], child_pids: &[u32]) -> Option<usize> {
-        let total = Self::FIXED_SIZE + child_pids.len() * 4;
-        if buf.len() < total || child_pids.len() > Self::MAX_CHILDREN {
-            return None;
+        use crate::wire::WireWriter;
+        if child_pids.len() > Self::MAX_CHILDREN { return None; }
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_i32(self.result)?;
+        w.put_u8(child_pids.len() as u8)?;
+        w.put_u8(self.match_count)?;
+        w.put_zeros(2)?;
+        for &pid in child_pids {
+            w.put_u32(pid)?;
         }
-
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
-        buf[12] = child_pids.len() as u8;
-        buf[13] = self.match_count;
-        buf[14..16].copy_from_slice(&[0, 0]);
-
-        for (i, &pid) in child_pids.iter().enumerate() {
-            let offset = Self::FIXED_SIZE + i * 4;
-            buf[offset..offset + 4].copy_from_slice(&pid.to_le_bytes());
-        }
-
-        Some(total)
+        Some(w.finish())
     }
 
     /// Legacy: to_bytes for single spawn (backwards compat)
     pub fn to_bytes(&self) -> [u8; 20] {
+        use crate::wire::WireWriter;
         let mut buf = [0u8; 20];
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
-        buf[12] = self.spawn_count;
-        buf[13] = self.match_count;
-        buf[14..16].copy_from_slice(&[0, 0]);
-        // No PIDs in legacy format
+        let mut w = WireWriter::new(&mut buf);
+        w.put_query_header(&self.header).unwrap();
+        w.put_i32(self.result).unwrap();
+        w.put_u8(self.spawn_count).unwrap();
+        w.put_u8(self.match_count).unwrap();
+        w.put_zeros(2).unwrap();
         buf
     }
 
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-        Some(Self {
-            header: QueryHeader::from_bytes(buf)?,
-            result: i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            spawn_count: buf[12],
-            match_count: buf[13],
-            _pad: [0; 2],
-        })
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let result = r.i32()?;
+        let spawn_count = r.u8()?;
+        let match_count = r.u8()?;
+        r.skip(2)?;
+        Some(Self { header, result, spawn_count, match_count, _pad: [0; 2] })
     }
 
     /// Parse child PIDs from buffer (after from_bytes)
     pub fn parse_pids(buf: &[u8], count: usize) -> Option<[u32; Self::MAX_CHILDREN]> {
-        if buf.len() < Self::FIXED_SIZE + count * 4 {
-            return None;
-        }
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        r.skip(Self::FIXED_SIZE)?; // skip header
         let mut pids = [0u32; Self::MAX_CHILDREN];
         for i in 0..count.min(Self::MAX_CHILDREN) {
-            let offset = Self::FIXED_SIZE + i * 4;
-            pids[i] = u32::from_le_bytes([
-                buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]
-            ]);
+            pids[i] = r.u32()?;
         }
         Some(pids)
     }
@@ -1935,43 +1782,25 @@ impl QueryServiceInfo {
 
     /// Serialize to buffer, returns total length written
     pub fn write_to(&self, buf: &mut [u8], name: &[u8]) -> Option<usize> {
-        let total_len = Self::FIXED_SIZE + name.len();
-        if buf.len() < total_len || name.len() > 255 {
-            return None;
-        }
-
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8] = name.len() as u8;
-        buf[9..12].copy_from_slice(&[0, 0, 0]);
-        buf[Self::FIXED_SIZE..total_len].copy_from_slice(name);
-
-        Some(total_len)
+        use crate::wire::WireWriter;
+        if name.len() > 255 { return None; }
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_u8(name.len() as u8)?;
+        w.put_zeros(3)?;
+        w.put_bytes(name)?;
+        Some(w.finish())
     }
 
     /// Parse from buffer
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-
-        let header = QueryHeader::from_bytes(buf)?;
-        let name_len = buf[8] as usize;
-
-        let total_len = Self::FIXED_SIZE + name_len;
-        if buf.len() < total_len {
-            return None;
-        }
-
-        let name = &buf[Self::FIXED_SIZE..total_len];
-
-        Some((
-            Self {
-                header,
-                name_len: name_len as u8,
-                _pad: [0; 3],
-            },
-            name,
-        ))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let name_len = r.u8()?;
+        r.skip(3)?;
+        let name = r.bytes(name_len as usize)?;
+        Some((Self { header, name_len, _pad: [0; 3] }, name))
     }
 }
 
@@ -2023,46 +1852,26 @@ impl ServiceInfoResult {
 
     /// Serialize to buffer with info text, returns total length written
     pub fn write_to(&self, buf: &mut [u8], info: &[u8]) -> Option<usize> {
-        let total_len = Self::FIXED_SIZE + info.len();
-        if buf.len() < total_len {
-            return None;
-        }
-
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
-        buf[12..14].copy_from_slice(&(info.len() as u16).to_le_bytes());
-        buf[14..16].copy_from_slice(&[0, 0]);
-        buf[Self::FIXED_SIZE..total_len].copy_from_slice(info);
-
-        Some(total_len)
+        use crate::wire::WireWriter;
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_i32(self.result)?;
+        w.put_u16(info.len() as u16)?;
+        w.put_u16(0)?;
+        w.put_bytes(info)?;
+        Some(w.finish())
     }
 
     /// Parse from buffer
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-
-        let header = QueryHeader::from_bytes(buf)?;
-        let result = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let info_len = u16::from_le_bytes([buf[12], buf[13]]) as usize;
-
-        let total_len = Self::FIXED_SIZE + info_len;
-        if buf.len() < total_len {
-            return None;
-        }
-
-        let info = &buf[Self::FIXED_SIZE..total_len];
-
-        Some((
-            Self {
-                header,
-                result,
-                info_len: info_len as u16,
-                _pad: 0,
-            },
-            info,
-        ))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let result = r.i32()?;
+        let info_len = r.u16()?;
+        r.skip(2)?;
+        let info = r.bytes(info_len as usize)?;
+        Some((Self { header, result, info_len, _pad: 0 }, info))
     }
 }
 
@@ -2107,32 +1916,26 @@ impl LogMessage {
     }
 
     pub fn write_to(&self, buf: &mut [u8], message: &[u8]) -> Option<usize> {
+        use crate::wire::WireWriter;
         let len = message.len().min(Self::MAX_MSG_LEN);
-        let total = Self::FIXED_SIZE + len;
-        if buf.len() < total {
-            return None;
-        }
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8] = self.level;
-        buf[9] = len as u8;
-        buf[10..12].copy_from_slice(&[0, 0]);
-        buf[Self::FIXED_SIZE..Self::FIXED_SIZE + len].copy_from_slice(&message[..len]);
-        Some(total)
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_u8(self.level)?;
+        w.put_u8(len as u8)?;
+        w.put_zeros(2)?;
+        w.put_bytes(&message[..len])?;
+        Some(w.finish())
     }
 
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-        let header = QueryHeader::from_bytes(buf)?;
-        let level = buf[8];
-        let msg_len = buf[9] as usize;
-        let total = Self::FIXED_SIZE + msg_len;
-        if buf.len() < total {
-            return None;
-        }
-        let message = &buf[Self::FIXED_SIZE..total];
-        Some((Self { header, level, msg_len: msg_len as u8, _pad: [0; 2] }, message))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let level = r.u8()?;
+        let msg_len = r.u8()?;
+        r.skip(2)?;
+        let message = r.bytes(msg_len as usize)?;
+        Some((Self { header, level, msg_len, _pad: [0; 2] }, message))
     }
 }
 
@@ -2260,34 +2063,27 @@ impl LogHistory {
     }
 
     pub fn write_to(&self, buf: &mut [u8], text: &[u8]) -> Option<usize> {
-        let total = Self::FIXED_SIZE + text.len();
-        if buf.len() < total {
-            return None;
-        }
-        buf[0..8].copy_from_slice(&self.header.to_bytes());
-        buf[8..12].copy_from_slice(&self.result.to_le_bytes());
-        buf[12] = self.count;
-        buf[13] = self.live_enabled;
-        buf[14..16].copy_from_slice(&(text.len() as u16).to_le_bytes());
-        buf[Self::FIXED_SIZE..total].copy_from_slice(text);
-        Some(total)
+        use crate::wire::WireWriter;
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&self.header)?;
+        w.put_i32(self.result)?;
+        w.put_u8(self.count)?;
+        w.put_u8(self.live_enabled)?;
+        w.put_u16(text.len() as u16)?;
+        w.put_bytes(text)?;
+        Some(w.finish())
     }
 
     pub fn from_bytes(buf: &[u8]) -> Option<(Self, &[u8])> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-        let header = QueryHeader::from_bytes(buf)?;
-        let result = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let count = buf[12];
-        let live_enabled = buf[13];
-        let text_len = u16::from_le_bytes([buf[14], buf[15]]) as usize;
-        let total = Self::FIXED_SIZE + text_len;
-        if buf.len() < total {
-            return None;
-        }
-        let text = &buf[Self::FIXED_SIZE..total];
-        Some((Self { header, result, count, live_enabled, text_len: text_len as u16 }, text))
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let header = r.query_header()?;
+        let result = r.i32()?;
+        let count = r.u8()?;
+        let live_enabled = r.u8()?;
+        let text_len = r.u16()?;
+        let text = r.bytes(text_len as usize)?;
+        Some((Self { header, result, count, live_enabled, text_len }, text))
     }
 }
 
@@ -2322,60 +2118,56 @@ impl RegisterMount {
 
     /// Serialize a DataPort mount registration.
     pub fn write_dataport(buf: &mut [u8], seq_id: u32, prefix: &[u8], shmem_id: u32) -> Option<usize> {
-        if prefix.len() > 64 || buf.len() < Self::MAX_SIZE {
-            return None;
-        }
+        use crate::wire::WireWriter;
+        if prefix.len() > 64 || buf.len() < Self::MAX_SIZE { return None; }
         let header = QueryHeader::new(msg::REGISTER_MOUNT, seq_id);
-        buf[0..8].copy_from_slice(&header.to_bytes());
-        buf[8] = mount_transport::DATAPORT;
-        buf[9] = prefix.len() as u8;
-        buf[10] = 0; // no port name
-        buf[11] = 0;
-        buf[12..16].copy_from_slice(&shmem_id.to_le_bytes());
-        buf[16..16 + prefix.len()].copy_from_slice(prefix);
-        // Zero rest
-        for b in &mut buf[16 + prefix.len()..Self::MAX_SIZE] { *b = 0; }
-        Some(Self::MAX_SIZE)
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&header)?;
+        w.put_u8(mount_transport::DATAPORT)?;
+        w.put_u8(prefix.len() as u8)?;
+        w.put_u8(0)?; // no port name
+        w.put_u8(0)?;
+        w.put_u32(shmem_id)?;
+        w.put_padded(prefix, 64)?;
+        w.put_zeros(32)?; // port_name field
+        Some(w.finish())
     }
 
     /// Serialize a Port-based mount registration.
     pub fn write_port(buf: &mut [u8], seq_id: u32, prefix: &[u8], port_name: &[u8]) -> Option<usize> {
-        if prefix.len() > 64 || port_name.len() > 32 || buf.len() < Self::MAX_SIZE {
-            return None;
-        }
+        use crate::wire::WireWriter;
+        if prefix.len() > 64 || port_name.len() > 32 || buf.len() < Self::MAX_SIZE { return None; }
         let header = QueryHeader::new(msg::REGISTER_MOUNT, seq_id);
-        buf[0..8].copy_from_slice(&header.to_bytes());
-        buf[8] = mount_transport::PORT;
-        buf[9] = prefix.len() as u8;
-        buf[10] = port_name.len() as u8;
-        buf[11] = 0;
-        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-        buf[16..16 + prefix.len()].copy_from_slice(prefix);
-        for b in &mut buf[16 + prefix.len()..80] { *b = 0; }
-        buf[80..80 + port_name.len()].copy_from_slice(port_name);
-        for b in &mut buf[80 + port_name.len()..Self::MAX_SIZE] { *b = 0; }
-        Some(Self::MAX_SIZE)
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&header)?;
+        w.put_u8(mount_transport::PORT)?;
+        w.put_u8(prefix.len() as u8)?;
+        w.put_u8(port_name.len() as u8)?;
+        w.put_u8(0)?;
+        w.put_u32(0)?; // no shmem_id
+        w.put_padded(prefix, 64)?;
+        w.put_padded(port_name, 32)?;
+        Some(w.finish())
     }
 
     /// Parse from buffer. Returns (transport_type, prefix, port_name, shmem_id).
     pub fn from_bytes(buf: &[u8]) -> Option<(u8, &[u8], &[u8], u32)> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-        let transport_type = buf[8];
-        let prefix_len = buf[9] as usize;
-        let port_name_len = buf[10] as usize;
-        let shmem_id = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-
-        if prefix_len > 64 || port_name_len > 32 {
-            return None;
-        }
-        if buf.len() < 16 + prefix_len {
-            return None;
-        }
-        let prefix = &buf[16..16 + prefix_len];
-        let port_name = if port_name_len > 0 && buf.len() >= 80 + port_name_len {
-            &buf[80..80 + port_name_len]
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        r.skip(QueryHeader::SIZE)?; // skip header (caller already parsed it)
+        let transport_type = r.u8()?;
+        let prefix_len = r.u8()? as usize;
+        let port_name_len = r.u8()? as usize;
+        r.skip(1)?; // pad
+        let shmem_id = r.u32()?;
+        if prefix_len > 64 || port_name_len > 32 { return None; }
+        // prefix lives at fixed offset 16, port_name at fixed offset 80
+        // Read the full prefix field (64 bytes), then slice to actual length
+        let prefix_field = r.bytes(64)?;
+        let prefix = &prefix_field[..prefix_len];
+        let port_name_field = r.bytes(32)?;
+        let port_name = if port_name_len > 0 {
+            &port_name_field[..port_name_len]
         } else {
             &[]
         };
@@ -2398,27 +2190,23 @@ impl ResolvePath {
     pub const MAX_SIZE: usize = QueryHeader::SIZE + 1 + 64; // 73 bytes
 
     pub fn write_to(buf: &mut [u8], seq_id: u32, path: &[u8]) -> Option<usize> {
+        use crate::wire::WireWriter;
         let path_len = path.len().min(64);
-        let total = Self::FIXED_SIZE + path_len;
-        if buf.len() < total {
-            return None;
-        }
         let header = QueryHeader::new(msg::RESOLVE_PATH, seq_id);
-        buf[0..8].copy_from_slice(&header.to_bytes());
-        buf[8] = path_len as u8;
-        buf[Self::FIXED_SIZE..total].copy_from_slice(&path[..path_len]);
-        Some(total)
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&header)?;
+        w.put_u8(path_len as u8)?;
+        w.put_bytes(&path[..path_len])?;
+        Some(w.finish())
     }
 
     pub fn from_bytes(buf: &[u8]) -> Option<&[u8]> {
-        if buf.len() < Self::FIXED_SIZE {
-            return None;
-        }
-        let path_len = buf[8] as usize;
-        if path_len > 64 || buf.len() < Self::FIXED_SIZE + path_len {
-            return None;
-        }
-        Some(&buf[Self::FIXED_SIZE..Self::FIXED_SIZE + path_len])
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        r.skip(QueryHeader::SIZE)?; // skip header
+        let path_len = r.u8()? as usize;
+        if path_len > 64 { return None; }
+        r.bytes(path_len)
     }
 }
 
@@ -2441,63 +2229,69 @@ impl ResolvePathResponse {
     pub const SIZE: usize = 112;
 
     pub fn write_not_found(buf: &mut [u8], seq_id: u32) -> usize {
+        use crate::wire::WireWriter;
         let header = QueryHeader::new(msg::RESOLVE_RESULT, seq_id);
-        buf[0..8].copy_from_slice(&header.to_bytes());
-        buf[8] = error::NOT_FOUND as u8;
-        for b in &mut buf[9..Self::SIZE] { *b = 0; }
-        Self::SIZE
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&header).unwrap();
+        w.put_u8(error::NOT_FOUND as u8).unwrap();
+        w.put_zeros(Self::SIZE - 9).unwrap();
+        w.finish()
     }
 
     pub fn write_dataport(buf: &mut [u8], seq_id: u32, shmem_id: u32, remaining: &[u8]) -> usize {
+        use crate::wire::WireWriter;
         let header = QueryHeader::new(msg::RESOLVE_RESULT, seq_id);
-        buf[0..8].copy_from_slice(&header.to_bytes());
-        buf[8] = 0; // result OK
-        buf[9] = mount_transport::DATAPORT;
-        buf[10] = 0; // no port name
         let rem_len = remaining.len().min(64);
-        buf[11] = rem_len as u8;
-        buf[12..16].copy_from_slice(&shmem_id.to_le_bytes());
-        for b in &mut buf[16..48] { *b = 0; }
-        buf[48..48 + rem_len].copy_from_slice(&remaining[..rem_len]);
-        for b in &mut buf[48 + rem_len..Self::SIZE] { *b = 0; }
-        Self::SIZE
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&header).unwrap();
+        w.put_u8(0).unwrap(); // result OK
+        w.put_u8(mount_transport::DATAPORT).unwrap();
+        w.put_u8(0).unwrap(); // no port name
+        w.put_u8(rem_len as u8).unwrap();
+        w.put_u32(shmem_id).unwrap();
+        w.put_zeros(32).unwrap(); // port_name field (empty)
+        w.put_padded(&remaining[..rem_len], 64).unwrap();
+        w.finish()
     }
 
     pub fn write_port(buf: &mut [u8], seq_id: u32, port_name: &[u8], remaining: &[u8]) -> usize {
+        use crate::wire::WireWriter;
         let header = QueryHeader::new(msg::RESOLVE_RESULT, seq_id);
-        buf[0..8].copy_from_slice(&header.to_bytes());
-        buf[8] = 0; // result OK
-        buf[9] = mount_transport::PORT;
         let pn_len = port_name.len().min(32);
-        buf[10] = pn_len as u8;
         let rem_len = remaining.len().min(64);
-        buf[11] = rem_len as u8;
-        buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-        buf[16..16 + pn_len].copy_from_slice(&port_name[..pn_len]);
-        for b in &mut buf[16 + pn_len..48] { *b = 0; }
-        buf[48..48 + rem_len].copy_from_slice(&remaining[..rem_len]);
-        for b in &mut buf[48 + rem_len..Self::SIZE] { *b = 0; }
-        Self::SIZE
+        let mut w = WireWriter::new(buf);
+        w.put_query_header(&header).unwrap();
+        w.put_u8(0).unwrap(); // result OK
+        w.put_u8(mount_transport::PORT).unwrap();
+        w.put_u8(pn_len as u8).unwrap();
+        w.put_u8(rem_len as u8).unwrap();
+        w.put_u32(0).unwrap(); // no shmem_id
+        w.put_padded(&port_name[..pn_len], 32).unwrap();
+        w.put_padded(&remaining[..rem_len], 64).unwrap();
+        w.finish()
     }
 
     /// Parse response. Returns (result, transport_type, port_name, remaining_path, shmem_id).
     pub fn from_bytes(buf: &[u8]) -> Option<(i8, u8, &[u8], &[u8], u32)> {
-        if buf.len() < Self::SIZE {
-            return None;
-        }
-        let result = buf[8] as i8;
-        let transport_type = buf[9];
-        let port_name_len = buf[10] as usize;
-        let remaining_len = buf[11] as usize;
-        let shmem_id = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        r.skip(QueryHeader::SIZE)?; // skip header
+        let result = r.u8()? as i8;
+        let transport_type = r.u8()?;
+        let port_name_len = r.u8()? as usize;
+        let remaining_len = r.u8()? as usize;
+        let shmem_id = r.u32()?;
+        // port_name is in a 32-byte fixed field
+        let pn_field = r.bytes(32)?;
         let port_name = if port_name_len > 0 && port_name_len <= 32 {
-            &buf[16..16 + port_name_len]
+            &pn_field[..port_name_len]
         } else {
             &[]
         };
+        // remaining_path is in a 64-byte fixed field
+        let rem_field = r.bytes(64)?;
         let remaining = if remaining_len > 0 && remaining_len <= 64 {
-            &buf[48..48 + remaining_len]
+            &rem_field[..remaining_len]
         } else {
             &[]
         };
@@ -2525,34 +2319,33 @@ impl MountListEntry {
     pub const MAX_PER_MSG: usize = 5;
 
     pub fn write_to(buf: &mut [u8], transport_type: u8, prefix: &[u8], port_name: &[u8], shmem_id: u32) -> bool {
-        if buf.len() < Self::SIZE {
-            return false;
-        }
-        buf[0] = transport_type;
-        buf[1] = prefix.len().min(64) as u8;
-        buf[2] = port_name.len().min(32) as u8;
-        buf[3] = 0;
-        buf[4..8].copy_from_slice(&shmem_id.to_le_bytes());
+        use crate::wire::WireWriter;
+        let mut w = WireWriter::new(buf);
         let pl = prefix.len().min(64);
-        buf[8..8 + pl].copy_from_slice(&prefix[..pl]);
-        for b in &mut buf[8 + pl..72] { *b = 0; }
         let pnl = port_name.len().min(32);
-        buf[72..72 + pnl].copy_from_slice(&port_name[..pnl]);
-        for b in &mut buf[72 + pnl..Self::SIZE] { *b = 0; }
+        if w.put_u8(transport_type).is_none() { return false; }
+        if w.put_u8(pl as u8).is_none() { return false; }
+        if w.put_u8(pnl as u8).is_none() { return false; }
+        if w.put_u8(0).is_none() { return false; }
+        if w.put_u32(shmem_id).is_none() { return false; }
+        if w.put_padded(&prefix[..pl], 64).is_none() { return false; }
+        if w.put_padded(&port_name[..pnl], 32).is_none() { return false; }
         true
     }
 
     /// Parse entry from buffer. Returns (transport_type, prefix, port_name, shmem_id).
     pub fn from_bytes(buf: &[u8]) -> Option<(u8, &[u8], &[u8], u32)> {
-        if buf.len() < Self::SIZE {
-            return None;
-        }
-        let transport_type = buf[0];
-        let prefix_len = buf[1] as usize;
-        let port_name_len = buf[2] as usize;
-        let shmem_id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let prefix = &buf[8..8 + prefix_len.min(64)];
-        let port_name = &buf[72..72 + port_name_len.min(32)];
+        use crate::wire::WireReader;
+        let mut r = WireReader::new(buf);
+        let transport_type = r.u8()?;
+        let prefix_len = r.u8()? as usize;
+        let port_name_len = r.u8()? as usize;
+        r.skip(1)?; // pad
+        let shmem_id = r.u32()?;
+        let prefix_field = r.bytes(64)?;
+        let port_name_field = r.bytes(32)?;
+        let prefix = &prefix_field[..prefix_len.min(64)];
+        let port_name = &port_name_field[..port_name_len.min(32)];
         Some((transport_type, prefix, port_name, shmem_id))
     }
 }
