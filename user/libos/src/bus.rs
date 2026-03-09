@@ -605,7 +605,7 @@ pub trait Driver {
     ///
     /// Called when a handle registered via `ctx.watch_handle()` fires.
     /// The `tag` is the value passed when the handle was registered.
-    fn handle_event(&mut self, _tag: u32, _handle: crate::syscall::Handle, _ctx: &mut dyn BusCtx) {}
+    fn handle_event(&mut self, _tag: u32, _handle: libsys::syscall::Handle, _ctx: &mut dyn BusCtx) {}
 
     /// A signal was delivered to this task.
     ///
@@ -679,10 +679,10 @@ pub trait BusCtx {
     ///
     /// When the handle becomes readable, `Driver::handle_event()` is called
     /// with the given tag. Use this for kernel bus channels, device ports, etc.
-    fn watch_handle(&mut self, handle: crate::syscall::Handle, tag: u32) -> Result<(), BusError>;
+    fn watch_handle(&mut self, handle: libsys::syscall::Handle, tag: u32) -> Result<(), BusError>;
 
     /// Remove a handle from the runtime's Mux.
-    fn unwatch_handle(&mut self, handle: crate::syscall::Handle) -> Result<(), BusError>;
+    fn unwatch_handle(&mut self, handle: libsys::syscall::Handle) -> Result<(), BusError>;
 
     // === Managed IRQ/Timer helpers ===
 
@@ -892,35 +892,11 @@ impl PciMetadata {
 // Data Transport Traits
 // ============================================================================
 
-/// Block port configuration.
-#[derive(Clone, Copy)]
-pub struct BlockPortConfig {
-    /// Number of SQ/CQ entries (power of 2).
-    pub ring_size: u16,
-    /// Number of sidechannel entries (power of 2, 0 to disable).
-    pub side_size: u16,
-    /// Size of data buffer pool in bytes.
-    pub pool_size: u32,
-}
+/// Block port configuration (defined in libsys::data_port).
+pub type BlockPortConfig = libsys::data_port::DataPortConfig;
 
-impl Default for BlockPortConfig {
-    fn default() -> Self {
-        Self {
-            ring_size: 64,
-            side_size: 8,
-            pool_size: 256 * 1024,
-        }
-    }
-}
-
-/// Block device geometry.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct BlockGeometry {
-    pub block_size: u32,
-    pub block_count: u64,
-    pub max_transfer: u32,
-}
+/// Block device geometry (defined in libsys::data_port).
+pub type BlockGeometry = libsys::data_port::GeometryInfo;
 
 /// Block operation completion.
 #[derive(Clone, Copy)]
@@ -1056,7 +1032,7 @@ pub trait BlockTransport {
     fn wait(&self, timeout_ms: u32) -> bool;
 
     /// Get the underlying shmem handle for Mux registration.
-    fn mux_handle(&self) -> Option<crate::syscall::Handle>;
+    fn mux_handle(&self) -> Option<libsys::syscall::Handle>;
 
     // === Pool reclaim + deferred ack ===
 
@@ -1170,7 +1146,7 @@ impl<D: Driver + ?Sized> Driver for &'static mut D {
     fn port_event(&mut self, port: PortId, state: PortState, ctx: &mut dyn BusCtx) { (**self).port_event(port, state, ctx) }
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) { (**self).data_ready(port, ctx) }
     fn deadline(&mut self, seq_id: u32, ctx: &mut dyn BusCtx) { (**self).deadline(seq_id, ctx) }
-    fn handle_event(&mut self, tag: u32, handle: crate::syscall::Handle, ctx: &mut dyn BusCtx) { (**self).handle_event(tag, handle, ctx) }
+    fn handle_event(&mut self, tag: u32, handle: libsys::syscall::Handle, ctx: &mut dyn BusCtx) { (**self).handle_event(tag, handle, ctx) }
     fn signal(&mut self, signal_event: u16, signal_value: u64, ctx: &mut dyn BusCtx) { (**self).signal(signal_event, signal_value, ctx) }
     fn bus_event(&mut self, id: KernelBusId, msg_type: u8, data: &[u8], ctx: &mut dyn BusCtx) { (**self).bus_event(id, msg_type, data, ctx) }
     fn config_keys(&self) -> &[ConfigKey] { (**self).config_keys() }
@@ -1182,7 +1158,7 @@ impl<D: Driver + ?Sized> Driver for &'static mut D {
 pub trait StreamTransport {
     fn write_data(&mut self, data: &[u8]) -> Result<usize, PortError>;
     fn read_data(&mut self, buf: &mut [u8]) -> Result<usize, PortError>;
-    fn mux_handle(&self) -> Option<crate::syscall::Handle>;
+    fn mux_handle(&self) -> Option<libsys::syscall::Handle>;
 }
 
 /// Packet data transport (TX/RX descriptor rings).
@@ -1194,14 +1170,14 @@ pub trait PacketTransport {
     fn pool_slice(&self, offset: u32, len: u32) -> Option<&[u8]>;
     fn pool_slice_mut(&self, offset: u32, len: u32) -> Option<&mut [u8]>;
     fn pool_phys(&self) -> u64;
-    fn mux_handle(&self) -> Option<crate::syscall::Handle>;
+    fn mux_handle(&self) -> Option<libsys::syscall::Handle>;
     fn notify(&self);
 }
 
 /// Event data transport (small typed events).
 pub trait EventTransport {
     fn poll_event(&mut self) -> Option<DeviceEvent>;
-    fn mux_handle(&self) -> Option<crate::syscall::Handle>;
+    fn mux_handle(&self) -> Option<libsys::syscall::Handle>;
 }
 
 // ============================================================================
@@ -1221,7 +1197,7 @@ pub trait ControlTransport {
     fn try_recv(&mut self) -> Option<BusMsg>;
 
     /// Get a handle for Mux registration (event-driven wakeup).
-    fn mux_handle(&self) -> crate::syscall::Handle;
+    fn mux_handle(&self) -> libsys::syscall::Handle;
 
     /// Check if the link is alive.
     fn is_alive(&self) -> bool;

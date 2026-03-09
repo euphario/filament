@@ -26,14 +26,14 @@ mod icmp;
 mod nic;
 
 use libf::time::Duration;
-use libsys::bus::{
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId, bus_msg,
 };
-use libsys::bus_runtime::driver_main;
+use libos::bus_runtime::driver_main;
 use libsys::ipc::Timer;
-use libsys::ring::{IoSqe, SideEntry, io_op, side_msg, side_status};
+use libos::ring::{IoSqe, SideEntry, io_op, side_msg, side_status};
 use libsys::syscall::Handle;
-use libsys::{uinfo, udebug, uerror};
+use libos::{uinfo, udebug, uerror};
 
 use types::{EthAddr, Ipv4Addr, ethertype, ip_proto};
 use nic::{NicTable, NicState};

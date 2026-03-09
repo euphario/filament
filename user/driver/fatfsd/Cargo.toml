@@ -6,6 +6,7 @@ description = "FAT16 filesystem driver"
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }
 
 [profile.release]
 opt-level = "z"

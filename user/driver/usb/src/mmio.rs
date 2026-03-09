@@ -5,7 +5,7 @@
 use libsys::syscall;
 
 // Re-export from libsys (now uses unified object interface)
-pub use libsys::mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interval};
+pub use libos::mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interval};
 
 /// Format MMIO URL: "mmio:ADDR/SIZE" in hex
 /// (kept for compatibility with existing code)

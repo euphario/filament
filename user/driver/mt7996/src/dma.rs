@@ -1669,7 +1669,7 @@ impl<'a> Wfdma<'a> {
         libsys::println!("[DMA]   HIF2 RST after clear: 0x{:08x}", rst_after_clear);
 
         // Short delay between clear and set
-        libsys::delay_us(100);
+        libos::delay_us(100);
 
         // Now assert reset using RMW (matches Linux mt76_set)
         let rst_val = self.dev.hif2_via_hif1_read32(rst_offset);
@@ -1679,7 +1679,7 @@ impl<'a> Wfdma<'a> {
         libsys::println!("[DMA]   HIF2 RST after set(0x30): 0x{:08x}", rst_after_set);
 
         // Actual time delay for HIF2 reset to complete
-        libsys::delay_ms(10);
+        libos::delay_ms(10);
 
         // Read back RST
         let rst_after = self.dev.hif2_via_hif1_read32(rst_offset);
@@ -1955,7 +1955,7 @@ impl<'a> Wfdma<'a> {
         libsys::println!("[DMA]   WF_SUBSYS_RST during reset: 0x{:08x}", val_during);
 
         // Wait 50ms (reset must be held long enough)
-        libsys::delay_ms(50);
+        libos::delay_ms(50);
 
         // Clear reset bit
         libsys::println!("[DMA] Releasing reset (writing 0x{:08x})...", val & !0x1);
@@ -1963,7 +1963,7 @@ impl<'a> Wfdma<'a> {
 
         // Wait 100ms for ROM to boot and reach download state
         // The MT7996 ROM needs time to initialize after reset
-        libsys::delay_ms(100);
+        libos::delay_ms(100);
 
         let val_after = self.read_remap_cbtop(remap::WF_SUBSYS_RST);
         libsys::println!("[DMA]   WF_SUBSYS_RST after: 0x{:08x}", val_after);
@@ -2001,7 +2001,7 @@ impl<'a> Wfdma<'a> {
             core::arch::asm!("mrs {}, cntpct_el0", out(reg) start);
         }
         libsys::println!("[TIMING] cntfrq_el0 = {} Hz ({} MHz)", freq, freq / 1_000_000);
-        libsys::delay_ms(100);
+        libos::delay_ms(100);
         let end: u64;
         unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) end); }
         let elapsed_ticks = end - start;
@@ -2127,11 +2127,11 @@ impl<'a> Wfdma<'a> {
         let rst_val = self.read(wfdma::RST);
         self.write(wfdma::RST, rst_val & !rst_mask);  // mt76_clear
         unsafe { core::arch::asm!("dsb sy"); }
-        libsys::delay_us(100);
+        libos::delay_us(100);
         let rst_val = self.read(wfdma::RST);
         self.write(wfdma::RST, rst_val | rst_mask);   // mt76_set
         unsafe { core::arch::asm!("dsb sy"); }
-        libsys::delay_ms(10);
+        libos::delay_ms(10);
 
         let rst_after = self.read(wfdma::RST);
         libsys::println!("[DMA] RST after pulse: 0x{:08x}", rst_after);
@@ -2808,7 +2808,7 @@ impl<'a> Wfdma<'a> {
         let hif_misc_addr = wfdma::EXT_CSR_HIF_MISC;
         let mut busy_timeout = false;
         for i in 0..1000 {
-            libsys::delay_ms(1);  // Delay FIRST before checking
+            libos::delay_ms(1);  // Delay FIRST before checking
             let hif_misc = self.read_bar(hif_misc_addr);
             if (hif_misc & wfdma::EXT_CSR_HIF_MISC_BUSY) == 0 {
                 libsys::println!("[DMA] HIF_MISC idle after {}ms: 0x{:08x}", i + 1, hif_misc);
@@ -2825,7 +2825,7 @@ impl<'a> Wfdma<'a> {
             libsys::println!("[DMA] Waiting for HIF2 HIF_MISC_BUSY to clear...");
             let hif2_hif_misc_offset = wfdma::EXT_CSR_HIF_MISC;
             for i in 0..1000 {
-                libsys::delay_ms(1);  // Delay FIRST before checking
+                libos::delay_ms(1);  // Delay FIRST before checking
                 let hif2_misc = self.dev.hif2_via_hif1_read32(hif2_hif_misc_offset);
                 if (hif2_misc & wfdma::EXT_CSR_HIF_MISC_BUSY) == 0 {
                     libsys::println!("[DMA] HIF2 HIF_MISC idle after {}ms: 0x{:08x}", i + 1, hif2_misc);
@@ -2924,7 +2924,7 @@ impl<'a> Wfdma<'a> {
         // (USB driver had similar issues with tight loops preventing HW completion)
         // Using 500ms to rule out timing issues - if this works, timing is the culprit
         libsys::println!("[DMA] Waiting 500ms after GLO_CFG enable for hardware to settle...");
-        libsys::delay_ms(500);
+        libos::delay_ms(500);
 
         // Check ring state after GLO_CFG enable (hardware should have auto-released RST)
         let ring2_after_glo = self.read(ring_base + wfdma::RING_BASE);
@@ -2996,7 +2996,7 @@ impl<'a> Wfdma<'a> {
 
         // FINAL RST CHECK: After all configuration including interrupts
         // (User requested: "could we check the RST status AFTER the interrupt config?")
-        libsys::delay_ms(5);  // Give hardware time to settle
+        libos::delay_ms(5);  // Give hardware time to settle
         let rst_final = self.read(wfdma::RST);
         libsys::println!("[DMA] **FINAL** RST after INT_MASK enable: 0x{:08x} (expected 0x00)", rst_final);
         if self.dev.has_hif2() {
@@ -3274,7 +3274,7 @@ impl<'a> Wfdma<'a> {
 
         for i in 0..(timeout_ms * 10) {
             // Delay FIRST before checking (avoids tight loops starving hardware)
-            libsys::delay_us(100);
+            libos::delay_us(100);
 
             // Check TX DMA progress
             let tx_dma_idx = self.read(tx_ring_base + wfdma::RING_DMA_IDX);
@@ -3350,7 +3350,7 @@ impl<'a> Wfdma<'a> {
 
         for i in 0..(timeout_ms * 10) {
             // Delay FIRST before checking (avoids tight loops starving hardware)
-            libsys::delay_us(100);
+            libos::delay_us(100);
 
             let tx_dma_idx = self.read(tx_ring_base + wfdma::RING_DMA_IDX);
             let rx_dma_idx = self.read(rx_ring_base + wfdma::RING_DMA_IDX);

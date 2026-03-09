@@ -7,7 +7,7 @@
 use smoltcp::wire::{
     DhcpMessageType, DhcpPacket, DhcpRepr, EthernetAddress, IpAddress, IpEndpoint, Ipv4Address,
 };
-use libsys::{uinfo, udebug};
+use libos::{uinfo, udebug};
 
 const LEASE_SECS: u32 = 3600;
 const POOL_START: u8 = 100;

@@ -6,6 +6,7 @@ description = "MT7531 Gigabit Switch driver"
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }
 abi = { path = "../../abi" }
 
 [profile.release]

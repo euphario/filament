@@ -142,7 +142,7 @@ pub fn refresh() {
     if ssh {
         let pipe_after = console::console().pipe_writable();
         let bytes_out = pipe_before.saturating_sub(pipe_after);
-        libsys::udebug!("shell", "heartbeat"; bytes = bytes_out as u32, pipe_free = pipe_after as u32);
+        libos::udebug!("shell", "heartbeat"; bytes = bytes_out as u32, pipe_free = pipe_after as u32);
     }
 }
 

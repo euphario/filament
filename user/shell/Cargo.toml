@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 libsys = { path = "../libsys" }
+libos = { path = "../libos" }
 libf = { path = "../libf" }
 
 [profile.release]

@@ -35,19 +35,19 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 use libf::time::Duration;
-use libsys::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, PortId, ConfigKey, bus_msg};
-use libsys::bus_runtime::driver_main;
+use libos::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, PortId, ConfigKey, bus_msg};
+use libos::bus_runtime::driver_main;
 use libsys::ipc::Timer;
-use libsys::ring::{SideEntry, side_msg, side_status};
+use libos::ring::{SideEntry, side_msg, side_status};
 use libsys::syscall::Handle;
-use libsys::{uinfo, udebug, uerror};
+use libos::{uinfo, udebug, uerror};
 
 use device::{RxOffsetQueue, SmolDevice, TxTracker, DataPathStats};
 use rsh::RemoteShell;
 use dhcp_server::DhcpServer;
 use socket_svc::SocketService;
 use tftp::TftpServer;
-use libsys::vfs_client::VfsClient;
+use libos::vfs_client::VfsClient;
 
 // =============================================================================
 // Constants
@@ -672,7 +672,7 @@ impl IpdDriver {
     /// TX completions free the consumer pool slot. RX CQEs are buffered.
     /// Returns the number of RX CQEs peeked (for later ack).
     fn drain_rx(&mut self, ctx: &mut dyn BusCtx) -> u32 {
-        use libsys::ring::io_status::CQE_FLAG_TX_DONE;
+        use libos::ring::io_status::CQE_FLAG_TX_DONE;
 
         let port_id = self.nic_port;
         let mut rx_count = 0u32;

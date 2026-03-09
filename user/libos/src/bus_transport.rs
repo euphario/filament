@@ -16,7 +16,7 @@
 //! allows this swap without changing any driver code.
 
 use crate::bus::{BusMsg, BusError, ControlTransport};
-use crate::ipc::Channel;
+use libsys::ipc::Channel;
 
 // ============================================================================
 // Channel-backed ControlTransport
@@ -66,11 +66,11 @@ impl ControlTransport for ChannelTransport {
         }
     }
 
-    fn mux_handle(&self) -> crate::syscall::Handle {
+    fn mux_handle(&self) -> libsys::syscall::Handle {
         self.channel.handle()
     }
 
     fn is_alive(&self) -> bool {
-        self.channel.state() == crate::ipc::ChannelState::Open
+        self.channel.state() == libsys::ipc::ChannelState::Open
     }
 }

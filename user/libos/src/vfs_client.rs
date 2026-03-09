@@ -12,15 +12,15 @@
 //! ```
 
 use crate::data_port::DataPort;
-use crate::ipc::{Channel, Timer, Mux, MuxFilter};
+use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
 use crate::ring::{IoSqe, IoCqe, io_status};
 use crate::vfs_proto::{fs_op, file_type, VfsDirEntry, VfsStat};
 use crate::query::{
     QueryHeader, ResolvePath, ResolvePathResponse, MountsListResponse, MountListEntry,
     mount_transport, msg, error,
 };
-use crate::syscall;
-use crate::syscall::RamfsListEntry;
+use libsys::syscall;
+use libsys::syscall::RamfsListEntry;
 
 // =============================================================================
 // Constants

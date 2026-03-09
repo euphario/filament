@@ -3,9 +3,9 @@
 //! Capability discovery, virtqueue management, and device initialization
 //! for virtio PCI devices. Reusable across future virtio device types.
 
-use libsys::mmio::{MmioRegion, DmaPool};
+use libos::mmio::{MmioRegion, DmaPool};
 use libsys::ipc::PciDevice;
-use libsys::{uinfo, uerror};
+use libos::{uinfo, uerror};
 
 // =============================================================================
 // Virtio PCI Capability Types (virtio 1.0 spec §4.1.4)
@@ -141,7 +141,7 @@ pub fn discover_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
 
     // Read PCI identity
     if let Ok(v) = pci.config_read(0x00, 4) {
-        uinfo!("virtio", "pci_id"; vendor = libsys::ulog::hex32(v & 0xFFFF), device = libsys::ulog::hex32((v >> 16) & 0xFFFF));
+        uinfo!("virtio", "pci_id"; vendor = libos::ulog::hex32(v & 0xFFFF), device = libos::ulog::hex32((v >> 16) & 0xFFFF));
     }
 
     // Read status register to check capabilities list present
@@ -198,7 +198,7 @@ pub fn discover_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
             };
 
             uinfo!("virtio", "cap"; cfg_type = cfg_type as u32, bar = bar as u32,
-                off = libsys::ulog::hex32(offset), len = libsys::ulog::hex32(length));
+                off = libos::ulog::hex32(offset), len = libos::ulog::hex32(length));
 
             // Lock to the BAR of the first meaningful virtio cap (types 1-4)
             if cap_bar.is_none() && cfg_type >= 1 && cfg_type <= 4 {

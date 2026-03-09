@@ -18,16 +18,16 @@ mod virtio;
 
 use libf::time::Duration;
 use libsys::syscall::{self, Handle};
-use libsys::mmio::{MmioRegion, DmaPool};
+use libos::mmio::{MmioRegion, DmaPool};
 use libsys::ipc::{PciDevice, Timer};
-use libsys::bus::{
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg,
     PortInfo, PortClass, port_subclass, NetworkMetadata,
 };
-use libsys::bus_runtime::driver_main;
-use libsys::ring::{IoSqe, IoCqe, io_op, io_status, side_msg, side_status, SideEntry};
-use libsys::{uinfo, uerror, uwarn};
+use libos::bus_runtime::driver_main;
+use libos::ring::{IoSqe, IoCqe, io_op, io_status, side_msg, side_status, SideEntry};
+use libos::{uinfo, uerror, uwarn};
 
 use virtio::{VirtioPciCaps, Virtqueue};
 
@@ -495,9 +495,9 @@ impl Driver for NetDriver {
         })?;
 
         uinfo!("netd", "pci_device";
-            bar0 = libsys::ulog::hex64(bar0_addr),
-            size = libsys::ulog::hex32(bar0_size as u32),
-            bdf = libsys::ulog::hex32(bdf));
+            bar0 = libos::ulog::hex64(bar0_addr),
+            size = libos::ulog::hex32(bar0_size as u32),
+            bdf = libos::ulog::hex32(bdf));
 
         // 2. Open PCI device for config space access
         let pci = PciDevice::open(bdf).map_err(|e| {
@@ -513,9 +513,9 @@ impl Driver for NetDriver {
 
         uinfo!("netd", "virtio_caps";
             bar = caps.bar as u32,
-            common = libsys::ulog::hex32(caps.common_off),
-            notify = libsys::ulog::hex32(caps.notify_off),
-            device = libsys::ulog::hex32(caps.device_off));
+            common = libos::ulog::hex32(caps.common_off),
+            notify = libos::ulog::hex32(caps.notify_off),
+            device = libos::ulog::hex32(caps.device_off));
 
         // 4. Map the BAR that contains the virtio capabilities
         let (bar_addr, bar_size) = if caps.bar == 0 {
@@ -545,15 +545,15 @@ impl Driver for NetDriver {
 
             uinfo!("netd", "bar_resolved";
                 bar = caps.bar as u32,
-                phys = libsys::ulog::hex64(bar_phys),
-                size = libsys::ulog::hex64(bar_sz));
+                phys = libos::ulog::hex64(bar_phys),
+                size = libos::ulog::hex64(bar_sz));
             (bar_phys, bar_sz)
         };
 
         let bar = MmioRegion::open(bar_addr, bar_size).ok_or_else(|| {
             uerror!("netd", "bar_map_failed";
                 bar = caps.bar as u32,
-                addr = libsys::ulog::hex64(bar_addr));
+                addr = libos::ulog::hex64(bar_addr));
             BusError::Internal
         })?;
 
@@ -564,7 +564,7 @@ impl Driver for NetDriver {
             BusError::Internal
         })?;
 
-        uinfo!("netd", "features_ok"; features = libsys::ulog::hex64(negotiated));
+        uinfo!("netd", "features_ok"; features = libos::ulog::hex64(negotiated));
 
         // 6. Allocate DMA pool
         let mut dma = DmaPool::alloc(DMA_POOL_SIZE).ok_or_else(|| {

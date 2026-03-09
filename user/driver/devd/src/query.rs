@@ -1,15 +1,15 @@
 //! Query Handling Module
 //!
 //! Handles queries from clients and port registration from managed services.
-//! Implements the query protocol defined in `libsys::query`.
+//! Implements the query protocol defined in `libos::query`.
 //!
 //! Managed services (spawned by devd) communicate via SuperQ (kernel supervision queue).
 //! Dynamic clients (connected via devd-query: port) use IPC channels.
 
 use libsys::ipc::Channel;
 use libsys::error::SysError;
-use libsys::supervision::SupervisionHandle;
-use libsys::query::{
+use libos::supervision::SupervisionHandle;
+use libos::query::{
     QueryHeader, ErrorResponse,
     PortRegisterResponse, PortRegisterInfo as PortRegisterInfoMsg, SpawnChild, SpawnAck,
     SpawnChildContext, query_flags,
@@ -355,7 +355,7 @@ impl QueryHandler {
         let mut buf = [0u8; 512];
 
         let len = if let Some(context) = ctx {
-            let (filter, pattern) = libsys::query::PortFilter::exact(trigger_port);
+            let (filter, pattern) = libos::query::PortFilter::exact(trigger_port);
             cmd.write_to_with_context(&mut buf, binary, &filter, pattern, context)?
         } else {
             cmd.write_to(&mut buf, binary, trigger_port)?
@@ -409,7 +409,7 @@ impl QueryHandler {
         let mut base = [0u8; 512];
 
         let base_len = if let Some(context) = ctx {
-            let (filter, pattern) = libsys::query::PortFilter::exact(trigger_port);
+            let (filter, pattern) = libos::query::PortFilter::exact(trigger_port);
             cmd.write_to_with_context(&mut base, binary, &filter, pattern, context)?
         } else {
             cmd.write_to(&mut base, binary, trigger_port)?

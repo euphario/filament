@@ -8,16 +8,16 @@
 #![no_main]
 
 use libf::time::Duration;
-use libsys::{uinfo, unotice, uwarn, uerror, udebug, ulog};
-use libsys::mmio::{MmioRegion, DmaPool};
+use libos::{uinfo, unotice, uwarn, uerror, udebug, ulog};
+use libos::mmio::{MmioRegion, DmaPool};
 use libsys::ipc::{Msi, Irq};
-use libsys::bus::{
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, ConfigKey,
     PortInfo, PortClass, NetworkMetadata, port_subclass,
     BlockPortConfig, PortId,
 };
-use libsys::bus_runtime::driver_main;
-use libsys::ring::{IoSqe, IoCqe, SideEntry, io_op, io_status, side_msg, side_status};
+use libos::bus_runtime::driver_main;
+use libos::ring::{IoSqe, IoCqe, SideEntry, io_op, io_status, side_msg, side_status};
 
 #[allow(dead_code)]
 mod regs;

@@ -396,7 +396,7 @@ pub fn drain_one() -> bool {
 
     let text_len = format_event(&event_buf[..len], &mut text_buf);
     if text_len > 0 {
-        let _ = crate::syscall::write(crate::syscall::Handle::STDOUT, &text_buf[..text_len]);
+        let _ = libsys::syscall::write(libsys::syscall::Handle::STDOUT, &text_buf[..text_len]);
     }
 
     true

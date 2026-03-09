@@ -17,3 +17,4 @@ usbd = ["mt7988a", "block-client"]
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }

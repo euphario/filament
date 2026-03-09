@@ -3,7 +3,7 @@
 //! Provides a safe-ish wrapper around memory-mapped I/O regions.
 //! Uses the unified object interface for mapping physical addresses.
 
-use crate::syscall::{self, Handle, ObjectType};
+use libsys::syscall::{self, Handle, ObjectType};
 
 /// MMIO region handle
 ///
@@ -427,7 +427,7 @@ where
         }
 
         if syscall::gettime() >= deadline {
-            crate::println!("poll_until '{}' timeout after {}ms", label, timeout_ms);
+            libsys::println!("poll_until '{}' timeout after {}ms", label, timeout_ms);
             return false;
         }
 
@@ -448,7 +448,7 @@ where
         }
         delay_ms(interval_ms);
     }
-    crate::println!("poll_interval '{}' timeout after {}ms", label, timeout_ms);
+    libsys::println!("poll_interval '{}' timeout after {}ms", label, timeout_ms);
     false
 }
 

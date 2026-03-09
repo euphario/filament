@@ -6,7 +6,7 @@
 use crate::println;
 use libf::time::Duration;
 use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
-use libsys::query::{QueryHeader, MountsListResponse, MountListEntry, mount_transport, msg};
+use libos::query::{QueryHeader, MountsListResponse, MountListEntry, mount_transport, msg};
 use crate::output::CommandResult;
 
 pub fn run(_args: &[u8]) -> CommandResult {

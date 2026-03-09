@@ -15,12 +15,12 @@
 #![no_std]
 #![no_main]
 
-use libsys::{uinfo, unotice, udebug, uerror};
-use libsys::bus::{
+use libos::{uinfo, unotice, udebug, uerror};
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, KernelBusId, ConfigKey,
     bus_msg, PortInfo, PortClass, PortMetadata, port_subclass,
 };
-use libsys::bus_runtime::driver_main;
+use libos::bus_runtime::driver_main;
 
 // ============================================================================
 // PCI Class Constants
@@ -119,7 +119,7 @@ fn format_port_name(cname: &str, index: u8, buf: &mut [u8; 32]) -> usize {
 // ============================================================================
 
 struct PcieDriver {
-    devices: [libsys::BusDevice; MAX_PCI_DEVICES],
+    devices: [libos::BusDevice; MAX_PCI_DEVICES],
     count: usize,
     kernel_bus: Option<KernelBusId>,
     /// Per-class port index counters for class:index naming
@@ -151,7 +151,7 @@ fn class_counter_for(base_class: u8, subclass: u8, prog_if: u8) -> ClassCounter 
 impl PcieDriver {
     const fn new() -> Self {
         Self {
-            devices: [libsys::BusDevice::empty(); MAX_PCI_DEVICES],
+            devices: [libos::BusDevice::empty(); MAX_PCI_DEVICES],
             count: 0,
             kernel_bus: None,
             class_counters: [0; 8],
@@ -219,7 +219,7 @@ impl Driver for PcieDriver {
         // Claim the kernel bus — receives StateSnapshot + DeviceList
         match ctx.claim_kernel_bus(bus_path) {
             Ok((bus_id, info)) => {
-                unotice!("pcied", "bus_claimed"; bus_type = info.bus_type as u32, caps = libsys::ulog::hex32(info.capabilities as u32));
+                unotice!("pcied", "bus_claimed"; bus_type = info.bus_type as u32, caps = libos::ulog::hex32(info.capabilities as u32));
                 self.kernel_bus = Some(bus_id);
             }
             Err(_) => {

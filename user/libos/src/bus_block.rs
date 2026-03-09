@@ -198,7 +198,7 @@ impl BlockTransport for ShmemBlockPort {
         self.port.wait(timeout_ms)
     }
 
-    fn mux_handle(&self) -> Option<crate::syscall::Handle> {
+    fn mux_handle(&self) -> Option<libsys::syscall::Handle> {
         Some(self.port.mux_handle())
     }
 

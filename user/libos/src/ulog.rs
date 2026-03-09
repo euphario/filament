@@ -720,7 +720,7 @@ pub fn drain_one() -> bool {
     };
 
     // Inject binary record into kernel log ring — structure preserved
-    crate::syscall::klog_write(&record_buf[..len]);
+    libsys::syscall::klog_write(&record_buf[..len]);
 
     true
 }

@@ -605,8 +605,7 @@ impl io::Write for TcpStream {
         };
         if !self.data_port.submit(&sqe) {
             // SQ ring full — data lost! Log this.
-            libsys::uerror!("net", "sq_full"; data_len = len);
-            libsys::ulog::flush();
+            libsys::klog(libsys::LogLevel::Error, b"net: sq_full");
             self.data_port.free(offset);
             return Err(io::Error::new(io::ErrorKind::WouldBlock));
         }

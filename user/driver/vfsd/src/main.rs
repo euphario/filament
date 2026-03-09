@@ -24,15 +24,15 @@
 #![no_std]
 #![no_main]
 
-use libsys::bus::{
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, bus_msg,
     PortInfo, PortClass, port_subclass,
 };
-use libsys::bus_runtime::driver_main;
-use libsys::ring::side_msg;
-use libsys::vfs_proto::{MountTable, MountEntry};
-use libsys::{uinfo, uerror};
+use libos::bus_runtime::driver_main;
+use libos::ring::side_msg;
+use libos::vfs_proto::{MountTable, MountEntry};
+use libos::{uinfo, uerror};
 
 const MAX_MOUNTS: usize = MountTable::MAX_MOUNTS;
 

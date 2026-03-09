@@ -19,7 +19,7 @@
 //! 4. Load DSP firmware (optional)
 
 use libsys::syscall;
-use libsys::firmware::FirmwareClient;
+use libos::firmware::FirmwareClient;
 
 /// Firmware loading error
 #[derive(Debug, Clone, Copy)]
@@ -230,11 +230,11 @@ impl UsbFirmware {
                 Ok(Self { vaddr, paddr, size, shmem_id })
             }
             Err(code) => {
-                if code == libsys::firmware::error::NOT_FOUND {
+                if code == libos::firmware::error::NOT_FOUND {
                     Err(FirmwareError::FileNotFound)
-                } else if code == libsys::firmware::error::TOO_LARGE {
+                } else if code == libos::firmware::error::TOO_LARGE {
                     Err(FirmwareError::TooLarge)
-                } else if code == libsys::firmware::error::NO_MEMORY {
+                } else if code == libos::firmware::error::NO_MEMORY {
                     Err(FirmwareError::DmaAllocFailed)
                 } else {
                     Err(FirmwareError::ReadFailed)

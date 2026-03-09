@@ -32,15 +32,15 @@
 #![no_main]
 
 use libsys::syscall;
-use libsys::bus::{
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, bus_msg, ConfigKey,
     PortInfo, PortClass, port_subclass,
 };
-use libsys::bus_runtime::driver_main;
-use libsys::ring::{IoSqe, io_status};
-use libsys::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
-use libsys::{uinfo, unotice, udebug, uerror};
+use libos::bus_runtime::driver_main;
+use libos::ring::{IoSqe, io_status};
+use libos::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
+use libos::{uinfo, unotice, udebug, uerror};
 
 const FAT_CACHE_ENTRIES: usize = 8192;
 const MAX_OPEN_FILES: usize = 16;
@@ -931,12 +931,12 @@ impl FatfsDriver {
         // Process sidechannel queries
         if let Some(port) = ctx.block_port(vfs_id) {
             while let Some(entry) = port.poll_side_request() {
-                use libsys::ring::side_msg;
+                use libos::ring::side_msg;
                 match entry.msg_type {
                     side_msg::QUERY_GEOMETRY => {
                         // Not a block device - return error
                         let mut eol = entry;
-                        eol.status = libsys::ring::side_status::EOL;
+                        eol.status = libos::ring::side_status::EOL;
                         port.notify();
                     }
                     _ => {

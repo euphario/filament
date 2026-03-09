@@ -31,15 +31,15 @@
 #![no_main]
 
 use libsys::syscall;
-use libsys::uerror;
-use libsys::uinfo;
-use libsys::bus::{
+use libos::uerror;
+use libos::uinfo;
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockPortConfig, BlockMetadata, PortInfo, PortClass, port_subclass, bus_msg,
     ConfigKey,
 };
-use libsys::bus_runtime::driver_main;
-use libsys::ring::io_status;
+use libos::bus_runtime::driver_main;
+use libos::ring::io_status;
 
 // =============================================================================
 // Constants
@@ -293,7 +293,7 @@ impl PartitionDriver {
         };
 
         // Collect pending SQ requests
-        let mut requests: [Option<libsys::ring::IoSqe>; 8] = [None; 8];
+        let mut requests: [Option<libos::ring::IoSqe>; 8] = [None; 8];
         let mut req_count = 0;
 
         if let Some(port) = ctx.block_port(provider_id) {
@@ -311,15 +311,15 @@ impl PartitionDriver {
         for i in 0..req_count {
             if let Some(sqe) = requests[i].take() {
                 match sqe.opcode {
-                    libsys::ring::io_op::READ => {
+                    libos::ring::io_op::READ => {
                         self.handle_ring_read(disk_idx, &sqe, ctx);
                     }
-                    libsys::ring::io_op::WRITE => {
+                    libos::ring::io_op::WRITE => {
                         self.handle_ring_write(disk_idx, &sqe, ctx);
                     }
                     _ => {
                         if let Some(port) = ctx.block_port(provider_id) {
-                            port.complete_error(sqe.tag, libsys::ring::io_status::INVALID);
+                            port.complete_error(sqe.tag, libos::ring::io_status::INVALID);
                             port.notify();
                         }
                     }
@@ -328,7 +328,7 @@ impl PartitionDriver {
         }
 
         // Process sidechannel queries
-        let mut queries: [Option<libsys::ring::SideEntry>; 4] = [None; 4];
+        let mut queries: [Option<libos::ring::SideEntry>; 4] = [None; 4];
         let mut query_count = 0;
 
         if let Some(port) = ctx.block_port(provider_id) {
@@ -344,14 +344,14 @@ impl PartitionDriver {
 
         for i in 0..query_count {
             if let Some(entry) = queries[i].take() {
-                use libsys::ring::side_msg;
+                use libos::ring::side_msg;
                 match entry.msg_type {
                     side_msg::QUERY_GEOMETRY => {
                         let disk = match &self.disks[disk_idx] {
                             Some(d) => d,
                             None => continue,
                         };
-                        let info = libsys::bus::BlockGeometry {
+                        let info = libos::bus::BlockGeometry {
                             block_size: disk.block_size,
                             block_count: if disk.partition_count > 0 {
                                 disk.partitions[0].sector_count
@@ -380,7 +380,7 @@ impl PartitionDriver {
     /// Translates LBA, submits to consumer port, stores inflight entry.
     /// Completion arrives later via `process_completions()` when the consumer
     /// port fires a data_ready callback.
-    fn handle_ring_read(&mut self, disk_idx: usize, sqe: &libsys::ring::IoSqe, ctx: &mut dyn BusCtx) {
+    fn handle_ring_read(&mut self, disk_idx: usize, sqe: &libos::ring::IoSqe, ctx: &mut dyn BusCtx) {
         let (provider_id, consumer_id, block_size, partition_count) = match &self.disks[disk_idx] {
             Some(d) => (
                 match d.provider_port { Some(id) => id, None => return },
@@ -482,7 +482,7 @@ impl PartitionDriver {
     }
 
     /// Handle a ring WRITE request — copy data to consumer pool, submit write.
-    fn handle_ring_write(&mut self, disk_idx: usize, sqe: &libsys::ring::IoSqe, ctx: &mut dyn BusCtx) {
+    fn handle_ring_write(&mut self, disk_idx: usize, sqe: &libos::ring::IoSqe, ctx: &mut dyn BusCtx) {
         let (provider_id, consumer_id, block_size, partition_count) = match &self.disks[disk_idx] {
             Some(d) => (
                 match d.provider_port { Some(id) => id, None => return },

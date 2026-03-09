@@ -6,6 +6,7 @@ description = "MT7988 native Ethernet driver (GMAC1 + internal switch)"
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }
 libf = { path = "../../libf" }
 
 [profile.release]

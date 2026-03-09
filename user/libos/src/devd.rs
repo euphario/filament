@@ -45,7 +45,7 @@
 //! }
 //! ```
 
-use crate::error::SysError;
+use libsys::error::SysError;
 
 // =============================================================================
 // Capability Presets (mirrors kernel caps.rs bits)
@@ -65,7 +65,7 @@ pub mod caps {
     /// IPC | MEM | SPAWN | GRANT | KILL — interactive admin shell
     pub const USER_ADMIN: u64 = 0x0C07;
 }
-use crate::ipc::{Channel, ObjHandle};
+use libsys::ipc::{Channel, ObjHandle};
 use crate::query::{
     QueryHeader, PortRegisterResponse,
     StateChange, SpawnChild, SpawnChildContext, SpawnAck,
@@ -313,7 +313,7 @@ impl DevdClient {
     }
 
     /// Get the SuperQ ObjHandle for Mux registration (tree mode only).
-    pub fn superq_obj_handle(&self) -> Option<crate::ipc::ObjHandle> {
+    pub fn superq_obj_handle(&self) -> Option<libsys::ipc::ObjHandle> {
         match &self.transport {
             DevdTransport::Supervision(sq) => Some(sq.handle()),
             _ => None,
@@ -323,7 +323,7 @@ impl DevdClient {
     /// Read a FORWARD note from the SuperQ (parent→child direction).
     ///
     /// Returns Ok(Some(len)) if data was available, Ok(None) if empty.
-    pub fn recv_superq(&self, buf: &mut [u8]) -> Result<Option<usize>, crate::error::SysError> {
+    pub fn recv_superq(&self, buf: &mut [u8]) -> Result<Option<usize>, libsys::error::SysError> {
         match &self.transport {
             DevdTransport::Supervision(sq) => sq.recv_forward(buf),
             _ => Ok(None),
@@ -380,7 +380,7 @@ impl DevdClient {
                 loop {
                     match sq.recv_forward(buf) {
                         Ok(Some(n)) => return Ok(n),
-                        Ok(None) => crate::ipc::wait_one(sq.handle())?,
+                        Ok(None) => libsys::ipc::wait_one(sq.handle())?,
                         Err(e) => return Err(e),
                     }
                 }

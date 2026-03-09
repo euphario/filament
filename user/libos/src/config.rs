@@ -16,7 +16,7 @@
 //! let n = config::list(b"ipd", &mut buf);
 //! ```
 
-use crate::ipc::Channel;
+use libsys::ipc::Channel;
 
 /// Response timeout in nanoseconds (2 seconds).
 const TIMEOUT_NS: u64 = 2_000_000_000;

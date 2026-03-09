@@ -21,10 +21,10 @@ use crate::bus::{
 };
 use crate::bus_block::ShmemBlockPort;
 use crate::devd::{DevdClient, DevdCommand};
-use crate::ipc::{Channel, Irq, Mux, MuxFilter};
-use crate::mailbox::Mailbox;
+use libsys::ipc::{Channel, Irq, Mux, MuxFilter};
+use libsys::mailbox::Mailbox;
 use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, query_flags, port_type as qport_type, error as query_error};
-use crate::syscall::{self, Handle, LogLevel};
+use libsys::syscall::{self, Handle, LogLevel};
 use crate::hash_map::HashMap;
 
 // ============================================================================
@@ -2828,6 +2828,9 @@ impl<D: Driver> DriverRuntime<D> {
 /// * `name` - Driver name (for logging and identification)
 /// * `driver` - The Driver implementation
 pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
+    // Register ulog flush for panic handler
+    libsys::set_panic_flush(crate::ulog::flush);
+
     // Check for mailbox (Handle::MAILBOX = slot 5).
     // If present, this child was spawned via exec_with_mailbox and its
     // spawn context is in the mailbox header — no GET_SPAWN_CONTEXT needed.

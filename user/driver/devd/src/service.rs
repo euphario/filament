@@ -4,7 +4,7 @@
 //! All services are dynamically spawned via PORT_RULES or boot services.
 //! Uses trait-based design for testability.
 
-use libsys::uwarn;
+use libos::uwarn;
 
 
 // =============================================================================

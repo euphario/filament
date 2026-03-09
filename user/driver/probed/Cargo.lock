@@ -7,6 +7,14 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
+name = "libos"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "libsys",
+]
+
+[[package]]
 name = "libsys"
 version = "0.1.0"
 dependencies = [
@@ -18,5 +26,6 @@ name = "probed"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "libos",
  "libsys",
 ]

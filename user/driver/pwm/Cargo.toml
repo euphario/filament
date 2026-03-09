@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }
 
 [profile.release]
 opt-level = "z"

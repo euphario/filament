@@ -55,8 +55,25 @@ use crate::error::SysError;
 // Configuration
 // =============================================================================
 
-/// Configuration for creating a DataPort (alias for BlockPortConfig)
-pub type DataPortConfig = crate::bus::BlockPortConfig;
+/// Configuration for creating a DataPort.
+pub struct DataPortConfig {
+    /// Number of SQ/CQ entries (power of 2).
+    pub ring_size: u16,
+    /// Number of sidechannel entries (power of 2, 0 to disable).
+    pub side_size: u16,
+    /// Size of data buffer pool in bytes.
+    pub pool_size: u32,
+}
+
+impl Default for DataPortConfig {
+    fn default() -> Self {
+        Self {
+            ring_size: 64,
+            side_size: 8,
+            pool_size: 256 * 1024,
+        }
+    }
+}
 
 // =============================================================================
 // Port Role
@@ -608,8 +625,14 @@ impl DataPort {
 // Query Helpers
 // =============================================================================
 
-/// Block device geometry (alias for BlockGeometry)
-pub type GeometryInfo = crate::bus::BlockGeometry;
+/// Block device geometry.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GeometryInfo {
+    pub block_size: u32,
+    pub block_count: u64,
+    pub max_transfer: u32,
+}
 
 impl DataPort {
     /// Query block geometry from provider

@@ -11,7 +11,7 @@
 //! 4. fatfs reads file into shared memory
 //! 5. fatfs sends FirmwareReply with size or error
 
-use crate::syscall;
+use libsys::syscall;
 
 /// Maximum filename length
 pub const MAX_FILENAME: usize = 128;
@@ -142,7 +142,7 @@ impl FirmwareClient {
     pub fn connect() -> Option<Self> {
         let result = syscall::port_connect(FATFS_PORT);
         if result < 0 {
-            crate::println!("[FwClient] port_connect failed: {}", result);
+            libsys::println!("[FwClient] port_connect failed: {}", result);
             return None;
         }
         let channel = result as u32;
@@ -155,7 +155,7 @@ impl FirmwareClient {
         // Send empty request to trigger handshake
         let ping = [0u8; 4]; // PID query
         if syscall::send(channel, &ping) < 0 {
-            crate::println!("[FwClient] send ping failed");
+            libsys::println!("[FwClient] send ping failed");
             syscall::channel_close(channel);
             return None;
         }
@@ -163,13 +163,13 @@ impl FirmwareClient {
         // Receive server PID with timeout
         let n = syscall::receive_timeout(channel, &mut pid_buf, IPC_TIMEOUT_MS);
         if n < 0 {
-            crate::println!("[FwClient] receive PID failed: {} (timeout={}ms)", n, IPC_TIMEOUT_MS);
+            libsys::println!("[FwClient] receive PID failed: {} (timeout={}ms)", n, IPC_TIMEOUT_MS);
             syscall::channel_close(channel);
             return None;
         }
 
         let server_pid = u32::from_le_bytes(pid_buf);
-        crate::println!("[FwClient] connected, server PID={}", server_pid);
+        libsys::println!("[FwClient] connected, server PID={}", server_pid);
 
         Some(Self { channel, server_pid })
     }

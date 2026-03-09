@@ -7,7 +7,7 @@
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
 use libsys::syscall::RamfsListEntry;
-use libsys::vfs_client::VfsClient;
+use libos::vfs_client::VfsClient;
 
 /// TFTP opcodes (RFC 1350).
 const OP_RRQ: u16 = 1;

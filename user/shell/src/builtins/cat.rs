@@ -2,7 +2,7 @@
 
 use crate::println;
 use crate::output::CommandResult;
-use libsys::vfs_proto::open_flags;
+use libos::vfs_proto::open_flags;
 
 pub fn cmd_cat(args: &[u8]) -> CommandResult {
     let path = crate::trim(args);

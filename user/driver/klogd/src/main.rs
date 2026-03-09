@@ -3,8 +3,8 @@
 
 extern crate libsys;
 
-use libsys::bus::{BusCtx, BusError, ConfigKey, Disposition, Driver, BusMsg};
-use libsys::bus_runtime::driver_main;
+use libos::bus::{BusCtx, BusError, ConfigKey, Disposition, Driver, BusMsg};
+use libos::bus_runtime::driver_main;
 use libsys::syscall::{self, Handle, ObjectType};
 
 const TAG_KLOG: u32 = 0x4B4C; // "KL"

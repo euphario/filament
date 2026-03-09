@@ -22,13 +22,13 @@ use libsys::syscall::{self, Handle, ObjectType};
 use libsys::ipc::{Timer, ObjHandle};
 use libf::sync::SharedPipe;
 use libf::time::Duration;
-use libsys::supervision::SupervisionHandle;
-use libsys::bus::{
+use libos::supervision::SupervisionHandle;
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition,
     PortInfo, PortClass, PortState, port_subclass,
 };
-use libsys::bus_runtime::driver_main;
-use libsys::{uinfo, unotice, uerror};
+use libos::bus_runtime::driver_main;
+use libos::{uinfo, unotice, uerror};
 
 // =============================================================================
 // Handle Tags
@@ -181,7 +181,7 @@ impl ConsoledDriver {
         mailbox[68..70].copy_from_slice(&self.cols.to_le_bytes());
         mailbox[70..72].copy_from_slice(&self.rows.to_le_bytes());
 
-        let caps = libsys::devd::caps::USER_ADMIN;
+        let caps = libos::devd::caps::USER_ADMIN;
         match syscall::exec_with_mailbox("shell", caps, &mailbox) {
             Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
                 // Grant child access to the ring shmem

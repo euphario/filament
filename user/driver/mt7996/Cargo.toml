@@ -8,4 +8,5 @@ path = "src/lib.rs"
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }
 pcie = { path = "../pcie" }

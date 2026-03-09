@@ -9,6 +9,7 @@ platform-mt7988a = []
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }
 abi = { path = "../../abi" }
 
 [profile.release]

@@ -2,7 +2,7 @@
 
 use crate::println;
 use crate::output::{CommandResult, Table, Row, Value, Align};
-use libsys::vfs_proto::{open_flags, file_type, VfsDirEntry};
+use libos::vfs_proto::{open_flags, file_type, VfsDirEntry};
 
 pub fn cmd_ls(args: &[u8]) -> CommandResult {
     let path = crate::trim(args);
@@ -93,8 +93,8 @@ fn write_dec(buf: &mut [u8], val: u32) -> usize {
     libf::fmt::format_u32_into(buf, val)
 }
 
-pub fn print_vfs_error(cmd: &[u8], path: &[u8], e: libsys::vfs_client::VfsError) {
-    use libsys::vfs_client::VfsError;
+pub fn print_vfs_error(cmd: &[u8], path: &[u8], e: libos::vfs_client::VfsError) {
+    use libos::vfs_client::VfsError;
     crate::console::write(cmd);
     crate::console::write(b": ");
     crate::console::write(path);

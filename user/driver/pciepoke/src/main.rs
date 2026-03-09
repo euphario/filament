@@ -15,7 +15,8 @@
 #![no_std]
 #![no_main]
 
-use libsys::{println, print, syscall, Stdin, uinfo, uerror};
+use libsys::{println, print, syscall, Stdin};
+use libos::{uinfo, uerror};
 use libsys::ipc::protocols::PcieClient;
 
 /// Default device to access (MT7996 HIF1)

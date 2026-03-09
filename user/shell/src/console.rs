@@ -168,16 +168,16 @@ impl Console {
 
         let writable_before = pipe.writable();
         if data.len() > writable_before {
-            libsys::udebug!("shell", "pipe_write_backpressure"; len = data.len(), writable = writable_before, capacity = pipe.outgoing().capacity());
-            libsys::ulog::flush();
+            libos::udebug!("shell", "pipe_write_backpressure"; len = data.len(), writable = writable_before, capacity = pipe.outgoing().capacity());
+            libos::ulog::flush();
         }
 
         // SharedPipe::push_all handles the write loop with backpressure.
         pipe.push_all(data);
 
         if data.len() > writable_before {
-            libsys::udebug!("shell", "pipe_write_resumed"; len = data.len());
-            libsys::ulog::flush();
+            libos::udebug!("shell", "pipe_write_resumed"; len = data.len());
+            libos::ulog::flush();
         }
     }
 

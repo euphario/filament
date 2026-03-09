@@ -10,6 +10,15 @@ version = "0.1.0"
 name = "klogd"
 version = "0.1.0"
 dependencies = [
+ "libos",
+ "libsys",
+]
+
+[[package]]
+name = "libos"
+version = "0.1.0"
+dependencies = [
+ "abi",
  "libsys",
 ]
 

@@ -642,7 +642,7 @@ impl<'a> Mcu<'a> {
     /// Load firmware from USB via fatfs
     fn load_firmware_usb(&mut self) -> Result<(), FirmwareError> {
         use crate::firmware::{usb_names, UsbFirmware};
-        use libsys::firmware::FirmwareClient;
+        use libos::firmware::FirmwareClient;
         use libsys::println;
 
         println!("[MT7996] === Loading Firmware from USB ===");

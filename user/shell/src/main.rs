@@ -40,7 +40,7 @@ macro_rules! println {
 use libf::time::{Duration, Instant};
 use libsys::syscall;
 use libsys::ipc::{Process, Mux, MuxFilter};
-use libsys::vfs_client::VfsClient;
+use libos::vfs_client::VfsClient;
 
 // Re-export libf utilities so builtins can use crate::trim, crate::cmd_eq, etc.
 pub use libf::str::trim;
@@ -85,19 +85,20 @@ static mut VFS_CLIENT: Option<VfsClient> = None;
 
 #[unsafe(no_mangle)]
 fn main() {
-    libsys::uinfo!("shell", "starting";);
-    libsys::ulog::flush();
+    libsys::set_panic_flush(libos::ulog::flush);
+    libos::uinfo!("shell", "starting";);
+    libos::ulog::flush();
 
     // Connect to console via mailbox (shmem_id from parent)
     if !console::init() {
         // No mailbox — exit (shell must be spawned by a transport)
-        libsys::uerror!("shell", "init_failed";);
-        libsys::ulog::flush();
+        libos::uerror!("shell", "init_failed";);
+        libos::ulog::flush();
         syscall::exit(1);
     }
 
-    libsys::uinfo!("shell", "connected";);
-    libsys::ulog::flush();
+    libos::uinfo!("shell", "connected";);
+    libos::ulog::flush();
 
     // Set up decoration: clear screen, scroll region, separator, status bar
     {
@@ -105,8 +106,8 @@ fn main() {
         decoration::setup(con.cols, con.rows);
     }
 
-    libsys::uinfo!("shell", "decoration_done";);
-    libsys::ulog::flush();
+    libos::uinfo!("shell", "decoration_done";);
+    libos::ulog::flush();
 
     // Welcome banner (prints inside scroll region after setup)
     color::set(color::BOLD);
@@ -176,11 +177,11 @@ fn main() {
             let pipe_after = console::console().pipe_writable();
             let elapsed = t0.elapsed();
             let bytes_out = pipe_before.saturating_sub(pipe_after);
-            libsys::udebug!("shell", "cmd_done";
+            libos::udebug!("shell", "cmd_done";
                 elapsed_ms = elapsed.as_millis() as u32,
                 bytes_out = bytes_out as u32,
                 pipe_free = pipe_after as u32);
-            libsys::ulog::flush();
+            libos::ulog::flush();
         }
     }
 }
@@ -198,7 +199,7 @@ fn execute_command(cmd: &[u8]) {
     if console::console().ssh_mode {
         let cmd_str = core::str::from_utf8(cmd).unwrap_or("?");
         let log_name = if cmd_str.len() > 24 { &cmd_str[..24] } else { cmd_str };
-        libsys::udebug!("shell", "cmd_exec"; cmd = log_name, len = cmd.len() as u32);
+        libos::udebug!("shell", "cmd_exec"; cmd = log_name, len = cmd.len() as u32);
     }
 
     // Built-in commands
@@ -1216,7 +1217,7 @@ fn cmd_pwd() {
 
 /// Change directory
 fn cmd_cd(path_arg: &[u8]) {
-    use libsys::vfs_proto::open_flags;
+    use libos::vfs_proto::open_flags;
 
     let path = trim(path_arg);
 

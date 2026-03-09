@@ -13,10 +13,10 @@
 
 extern crate libsys;
 
-use libsys::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
-use libsys::bus_runtime::driver_main;
-use libsys::MmioRegion;
-use libsys::unotice;
+use libos::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
+use libos::bus_runtime::driver_main;
+use libos::MmioRegion;
+use libos::unotice;
 
 // =============================================================================
 // MT7988 PWM Hardware Constants

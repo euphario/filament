@@ -32,8 +32,8 @@ use libsys::syscall;
 use libsys::syscall::Handle;
 use libsys::ipc::{Mux, MuxFilter};
 use libf::sync::SharedPipe;
-use libsys::supervision::SupervisionHandle;
-use libsys::{uinfo, udebug, uerror};
+use libos::supervision::SupervisionHandle;
+use libos::{uinfo, udebug, uerror};
 
 // =============================================================================
 // Constants
@@ -188,7 +188,7 @@ impl SshSession {
         version_line[vlen + 1] = b'\n';
         if self.stream.write_all(&version_line[..vlen + 2]).is_err() {
             uerror!("sshd", "version_write_failed";);
-            libsys::ulog::flush();
+            libos::ulog::flush();
             return;
         }
 
@@ -217,14 +217,14 @@ impl SshSession {
                 SshState::ShellRunning => self.do_shell_running(),
                 SshState::Closing => {
                     uinfo!("sshd", "closing";);
-                    libsys::ulog::flush();
+                    libos::ulog::flush();
                     return;
                 }
             };
 
             if !ok {
                 uerror!("sshd", "state_failed"; state = state_id);
-                libsys::ulog::flush();
+                libos::ulog::flush();
                 return;
             }
         }
@@ -297,7 +297,7 @@ impl SshSession {
                 // WouldBlock = timeout, no data arrived. Not an error.
                 if e.kind() != io::ErrorKind::WouldBlock {
                     uerror!("sshd", "recv_read_len_failed"; seq = rx_seq as u32);
-                    libsys::ulog::flush();
+                    libos::ulog::flush();
                 }
                 return None;
             }
@@ -306,7 +306,7 @@ impl SshSession {
         let packet_length = rx.decrypt_length(&enc_len) as usize;
         if packet_length < 1 || packet_length > 35000 {
             uerror!("sshd", "recv_bad_pkt_len"; len = packet_length as u32, seq = rx_seq as u32);
-            libsys::ulog::flush();
+            libos::ulog::flush();
             return None;
         }
 
@@ -317,14 +317,14 @@ impl SshSession {
         let mut data = alloc::vec![0u8; packet_length + 16];
         if let Err(_) = self.stream.read_exact(&mut data) {
             uerror!("sshd", "recv_read_data_failed"; pkt_len = packet_length as u32);
-            libsys::ulog::flush();
+            libos::ulog::flush();
             return None;
         }
 
         let result = rx.decrypt_packet(&enc_len, &data);
         if result.is_none() {
             uerror!("sshd", "recv_decrypt_failed"; pkt_len = packet_length as u32);
-            libsys::ulog::flush();
+            libos::ulog::flush();
         }
         result
     }
@@ -394,7 +394,7 @@ impl SshSession {
 
         if packet_length < 1 || packet_length > 35000 {
             uerror!("sshd", "recv_bad_pkt_len"; len = packet_length as u32);
-            libsys::ulog::flush();
+            libos::ulog::flush();
             // Skip these 4 bytes to avoid getting stuck
             self.ssh_rx_pos += 4;
             return None;
@@ -414,7 +414,7 @@ impl SshSession {
 
         if result.is_none() {
             uerror!("sshd", "recv_decrypt_failed"; pkt_len = packet_length as u32);
-            libsys::ulog::flush();
+            libos::ulog::flush();
         }
         result
     }
@@ -458,7 +458,7 @@ impl SshSession {
                 let n = tx.encrypt_packet(payload, &mut out);
                 if n == 0 {
                     uerror!("sshd", "encrypt_failed"; payload_len = payload.len() as u32);
-                    libsys::ulog::flush();
+                    libos::ulog::flush();
                     return false;
                 }
 
@@ -478,7 +478,7 @@ impl SshSession {
                     Ok(()) => true,
                     Err(e) => {
                         uerror!("sshd", "write_all_failed"; enc_len = n as u32, kind = e.kind() as u8 as u32);
-                        libsys::ulog::flush();
+                        libos::ulog::flush();
                         false
                     }
                 }
@@ -735,7 +735,7 @@ impl SshSession {
 
         if password == DEV_PASSWORD {
             uinfo!("sshd", "auth_ok"; user_len = username.len() as u32);
-            libsys::ulog::flush();
+            libos::ulog::flush();
             if !self.send_packet(&[ssh::msg::USERAUTH_SUCCESS]) {
                 return false;
             }
@@ -759,7 +759,7 @@ impl SshSession {
             Some(p) => p,
             None => {
                 uinfo!("sshd", "channel_open_recv_failed";);
-                libsys::ulog::flush();
+                libos::ulog::flush();
                 return false;
             }
         };
@@ -877,7 +877,7 @@ impl SshSession {
 
                 self.state = SshState::ShellRunning;
                 uinfo!("sshd", "shell_started";);
-                libsys::ulog::flush();
+                libos::ulog::flush();
                 true
             }
             b"window-change" => {
@@ -949,12 +949,12 @@ impl SshSession {
         mailbox[70..72].copy_from_slice(&self.pty_rows.to_le_bytes());
         mailbox[72] = 0x01; // flags: bit 0 = SSH transport (enable diagnostics)
 
-        let caps = libsys::devd::caps::USER_ADMIN;
+        let caps = libos::devd::caps::USER_ADMIN;
         match syscall::exec_with_mailbox("shell", caps, &mailbox) {
             Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
                 ring.allow(child_pid);
                 uinfo!("sshd", "shell_spawned"; pid = child_pid);
-                libsys::ulog::flush();
+                libos::ulog::flush();
                 self.superq = Some(SupervisionHandle::from_handle(parent_superq_handle));
                 self.shell_pid = Some(child_pid);
                 self.shell_ring = Some(ring);
@@ -962,7 +962,7 @@ impl SshSession {
             }
             Err(e) => {
                 uerror!("sshd", "shell_spawn_failed"; err = e as i32);
-                libsys::ulog::flush();
+                libos::ulog::flush();
                 false
             }
         }
@@ -976,12 +976,12 @@ impl SshSession {
     /// packets are parsed only when complete.
     fn do_shell_running(&mut self) -> bool {
         uinfo!("sshd", "shell_loop_enter";);
-        libsys::ulog::flush();
+        libos::ulog::flush();
 
         // Diagnostic: send a known test string to verify the data path.
         let test_sent = self.send_channel_data(b"[sshd: data path test]\r\n");
         udebug!("sshd", "test_probe"; sent = test_sent, window = self.remote_window, pool = self.stream.pool_remaining());
-        libsys::ulog::flush();
+        libos::ulog::flush();
 
         // Create a Mux to watch pipe shmem, TCP DataPort, and SuperQ.
         let mux = match Mux::new() {
@@ -1005,7 +1005,7 @@ impl SshSession {
         }
 
         udebug!("sshd", "mux_handles"; tcp = tcp_handle.0, pipe = pipe_handle.0, superq = superq_handle.0);
-        libsys::ulog::flush();
+        libos::ulog::flush();
 
         let _ = mux.set_timeout(100);
         let mut loop_count = 0u32;
@@ -1024,7 +1024,7 @@ impl SshSession {
                     pipe_rd = pipe_readable, pipe_wr = pipe_writable,
                     window = self.remote_window, ssh_buf = self.ssh_rx_len - self.ssh_rx_pos,
                     pipe_w = pipe_wake_count, tcp_w = tcp_wake_count, tmo = timeout_count);
-                libsys::ulog::flush();
+                libos::ulog::flush();
                 pipe_wake_count = 0;
                 tcp_wake_count = 0;
                 timeout_count = 0;
@@ -1033,7 +1033,7 @@ impl SshSession {
             // 1. Drain pipe → SSH (non-blocking)
             if !self.drain_ring_tx() {
                 uerror!("sshd", "drain_tx_failed";);
-                libsys::ulog::flush();
+                libos::ulog::flush();
                 return false;
             }
 
@@ -1058,7 +1058,7 @@ impl SshSession {
             // 4. Check for EOF after buffering
             if self.stream.is_eof() && self.ssh_rx_pos >= self.ssh_rx_len {
                 uinfo!("sshd", "shell_tcp_eof";);
-                libsys::ulog::flush();
+                libos::ulog::flush();
                 return false;
             }
 
@@ -1072,7 +1072,7 @@ impl SshSession {
                 if let Ok(Some(_note)) = superq.try_recv() {
                     let _ = self.drain_ring_tx();
                     uinfo!("sshd", "shell_exited_superq";);
-                    libsys::ulog::flush();
+                    libos::ulog::flush();
                     self.send_channel_data(b"\r\n[Shell exited]\r\n");
                     let mut resp = [0u8; 8];
                     resp[0] = ssh::msg::CHANNEL_CLOSE;
@@ -1106,7 +1106,7 @@ impl SshSession {
     fn handle_shell_packet(&mut self, payload: &[u8]) -> bool {
         if payload.is_empty() {
             uerror!("sshd", "shell_empty_payload";);
-            libsys::ulog::flush();
+            libos::ulog::flush();
             return false;
         }
 
@@ -1353,7 +1353,7 @@ fn fmt_u16(buf: &mut [u8], n: u16) -> usize {
 #[unsafe(no_mangle)]
 fn main() {
     uinfo!("sshd", "starting";);
-    libsys::ulog::flush();
+    libos::ulog::flush();
 
     // Retry binding until ipd is ready
     let mut listener = loop {
@@ -1367,13 +1367,13 @@ fn main() {
     };
 
     uinfo!("sshd", "listening"; port = SSH_PORT as u32);
-    libsys::ulog::flush();
+    libos::ulog::flush();
 
     loop {
         match listener.accept() {
             Ok((stream, remote)) => {
                 uinfo!("sshd", "connection"; remote_port = remote.port as u32);
-                libsys::ulog::flush();
+                libos::ulog::flush();
 
                 let mut session = SshSession::new(stream, DEV_HOST_KEY_SEED);
                 session.run();
@@ -1384,11 +1384,11 @@ fn main() {
                 }
 
                 uinfo!("sshd", "session_ended";);
-                libsys::ulog::flush();
+                libos::ulog::flush();
             }
             Err(_) => {
                 uerror!("sshd", "accept_failed";);
-                libsys::ulog::flush();
+                libos::ulog::flush();
             }
         }
 

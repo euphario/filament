@@ -6,6 +6,7 @@ description = "USB host controller driver (xHCI, bus framework)"
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }
 usb = { path = "../usb", features = ["mt7988a"] }
 
 [profile.release]

@@ -7,7 +7,7 @@
 //!   dlog off       - Disable live logging
 //!   dlog status    - Show logging status
 
-use libsys::devd::DevdClient;
+use libos::devd::DevdClient;
 use crate::output::CommandResult;
 use crate::{print, println};
 

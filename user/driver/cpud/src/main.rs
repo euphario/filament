@@ -3,8 +3,8 @@
 
 extern crate libsys;
 
-use libsys::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
-use libsys::bus_runtime::driver_main;
+use libos::bus::{BusCtx, BusError, BusMsg, ConfigKey, Disposition, Driver, KernelBusId};
+use libos::bus_runtime::driver_main;
 
 const MAX_CPUS: usize = 4;
 const MAX_OPPS: usize = 8;

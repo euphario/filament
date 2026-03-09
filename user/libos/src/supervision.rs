@@ -9,8 +9,8 @@
 //! Child end (SupervisionChild): reads from `down` ring (parent→child),
 //! writes to `up` ring (child→parent).
 
-use crate::error::SysError;
-use crate::ipc::ObjHandle;
+use libsys::error::SysError;
+use libsys::ipc::ObjHandle;
 use abi::{Handle, SupervisionNote};
 
 /// Wrapper around a kernel SupervisionQueue handle.
@@ -39,7 +39,7 @@ impl SupervisionHandle {
                 core::mem::size_of::<SupervisionNote>(),
             )
         };
-        crate::syscall::write(self.handle, bytes)?;
+        libsys::syscall::write(self.handle, bytes)?;
         Ok(())
     }
 
@@ -55,7 +55,7 @@ impl SupervisionHandle {
             match self.try_recv()? {
                 Some(note) => return Ok(note),
                 None => {
-                    crate::ipc::wait_one(self.handle())?;
+                    libsys::ipc::wait_one(self.handle())?;
                 }
             }
         }
@@ -72,7 +72,7 @@ impl SupervisionHandle {
                 core::mem::size_of::<SupervisionNote>(),
             )
         };
-        match crate::syscall::try_read(self.handle, bytes) {
+        match libsys::syscall::try_read(self.handle, bytes) {
             Ok(Some(_)) => Ok(Some(note)),
             Ok(None) => Ok(None),
             Err(e) => Err(e),
@@ -152,6 +152,6 @@ impl SupervisionHandle {
 
 impl Drop for SupervisionHandle {
     fn drop(&mut self) {
-        let _ = crate::syscall::close(self.handle);
+        let _ = libsys::syscall::close(self.handle);
     }
 }

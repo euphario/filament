@@ -1,6 +1,7 @@
-//! User-space runtime library for BPI-R4 kernel
+//! Kernel interface library for BPI-R4 kernel
 //!
-//! Minimal library for unified 5-syscall interface.
+//! Thin boundary layer: syscalls, IPC primitives, error types, allocator.
+//! Driver SDK lives in `libos`.
 
 #![no_std]
 
@@ -16,54 +17,26 @@ pub mod syscall;
 pub mod ipc;
 pub mod io;
 pub mod half_ring;
-pub mod query;
-pub mod wire;
-pub mod hash_map;
-pub mod mmio;
-pub mod dma;
 pub mod ring;
 pub mod data_port;
-pub mod devd;
-pub mod blk;
-pub mod sync;
-pub mod config;
-
-pub mod bus;
-pub mod bus_transport;
-pub mod bus_runtime;
-pub mod bus_block;
-pub mod vfs_proto;
-pub mod vfs_client;
-pub mod serialize;
 pub mod mailbox;
-pub mod supervision;
-#[macro_use]
-pub mod ulog;
+pub mod sync;
 
 pub use error::{SysError, SysResult};
 pub use syscall::{LogLevel, Handle, ObjHandle, ObjectType};
 pub use syscall::{exit, exec, klog};
 pub use syscall::{open, read, write, map, close, channel_pair};
 pub use ipc::{Channel, Port, Timer, Mux, MuxFilter, MuxEvent, Process, Message, ObjHandle as IpcHandle, EventLoop, Shmem, PciDevice, Msi, MsiInfo, PipeRing};
-pub use mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interval};
-pub use dma::{DmaBuf, DmaDirection, CoherentBuf, StreamingBuf};
 pub use ring::{Ring, LayeredRing, IoSqe, IoCqe, SideEntry, PoolAlloc, io_op, io_status, side_msg, side_status, Doorbell, ChannelDoorbell};
 pub use data_port::{DataPort, DataPortConfig, PortRole, Layer, ConnectedLayer, GeometryInfo};
-pub use devd::{
-    DevdClient, ClientState,
-    DevdCommand, SpawnFilter,
-};
-pub use bus::{
-    BusMsg, BusMsgFlags, BusError, BusCtx, Driver, Disposition, ConfigKey,
-    PortId, BlockTransport, BlockPortConfig, BlockGeometry,
-    BlockCompletion, PortError, bus_msg as bus_msg_types,
-};
-pub use abi::{BusDevice, bus_device_flags};
-pub use bus_block::ShmemBlockPort;
-pub use vfs_proto::{VfsDirEntry, VfsStat, fs_op, open_flags, file_type, vfs_error};
-pub use vfs_client::{VfsClient, VfsError};
-pub use bus_runtime::driver_main;
-pub use supervision::SupervisionHandle;
+
+// Panic flush callback — libos registers ulog::flush here at startup
+static mut PANIC_FLUSH: Option<fn()> = None;
+
+/// Register a function to call before panic output (e.g., ulog::flush).
+pub fn set_panic_flush(f: fn()) {
+    unsafe { PANIC_FLUSH = Some(f); }
+}
 
 // Entry point - called by _start
 unsafe extern "Rust" {
@@ -87,8 +60,10 @@ pub extern "C" fn _start() -> ! {
 /// Panic handler
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Flush any buffered ulog records before they're lost
-    ulog::flush();
+    // Flush any buffered log records before they're lost
+    if let Some(flush) = unsafe { PANIC_FLUSH } {
+        flush();
+    }
 
     // Log location: "PANIC: src/mcu.rs:123"
     let mut buf = [0u8; 80];

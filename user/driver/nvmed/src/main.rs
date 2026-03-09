@@ -15,15 +15,15 @@
 #![no_main]
 
 use libsys::syscall;
-use libsys::mmio::{MmioRegion, DmaPool};
-use libsys::bus::{
+use libos::mmio::{MmioRegion, DmaPool};
+use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId,
     BlockTransport, BlockPortConfig, BlockGeometry, bus_msg,
     PortInfo, PortClass, port_subclass,
 };
-use libsys::bus_runtime::driver_main;
-use libsys::ring::{io_op, io_status, side_msg};
-use libsys::{uinfo, unotice, udebug, uerror};
+use libos::bus_runtime::driver_main;
+use libos::ring::{io_op, io_status, side_msg};
+use libos::{uinfo, unotice, udebug, uerror};
 
 // =============================================================================
 // NVMe Register Definitions (NVMe 1.4 spec)
@@ -581,7 +581,7 @@ impl NvmeDriver {
         };
 
         // Collect pending SQ requests
-        let mut requests: [Option<libsys::ring::IoSqe>; 8] = [None; 8];
+        let mut requests: [Option<libos::ring::IoSqe>; 8] = [None; 8];
         let mut req_count = 0;
 
         if let Some(port) = ctx.block_port(port_id) {
@@ -674,7 +674,7 @@ impl NvmeDriver {
         }
 
         // Process sidechannel queries (geometry, etc.)
-        let mut queries: [Option<libsys::ring::SideEntry>; 4] = [None; 4];
+        let mut queries: [Option<libos::ring::SideEntry>; 4] = [None; 4];
         let mut query_count = 0;
 
         if let Some(port) = ctx.block_port(port_id) {

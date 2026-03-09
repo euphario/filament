@@ -49,7 +49,7 @@ pub use client::{PcieClient, PcieDeviceInfo, DeviceList};
 pub use msi::{MsiController, MsiAssignment, MsiEvent};
 
 // Re-export MmioRegion from libsys for use by submodules
-pub use libsys::MmioRegion;
+pub use libos::MmioRegion;
 
 // Re-export delay_ms from libsys (timer-based, more accurate)
-pub use libsys::delay_ms;
+pub use libos::delay_ms;

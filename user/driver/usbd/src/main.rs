@@ -46,14 +46,14 @@ impl BlockInfo {
 }
 
 use libsys::syscall;
-use libsys::{uinfo, unotice, udebug, uerror};
-use libsys::bus::{
+use libos::{uinfo, unotice, udebug, uerror};
+use libos::bus::{
     Driver, BusCtx, Disposition, BusError, BusMsg, bus_msg,
     BlockPortConfig, BlockGeometry, PortId,
     PortInfo, PortClass, port_subclass,
 };
-use libsys::driver_main;
-use libsys::ring::{io_op, io_status, side_msg, side_status};
+use libos::driver_main;
+use libos::ring::{io_op, io_status, side_msg, side_status};
 use usb::{MmioRegion, DmaPool, XhciController, XhciCaps};
 use usb::soc::{GenericSoc, SocUsb, SocError};
 use usb::soc::mt7988a::{Mt7988aSoc, addrs as mt_addrs};

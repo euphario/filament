@@ -11,7 +11,7 @@
 
 use abi::{bus_type, bus_create_flags, BusCreateInfo, ObjectType};
 use libsys::syscall;
-use libsys::unotice;
+use libos::unotice;
 
 #[unsafe(no_mangle)]
 fn main() {
@@ -20,7 +20,7 @@ fn main() {
     #[cfg(feature = "platform-mt7988a")]
     let platform = "mt7988a";
 
-    libsys::uinfo!("probed", "platform"; name = platform);
+    libos::uinfo!("probed", "platform"; name = platform);
 
     #[cfg(feature = "platform-qemu-virt")]
     register_qemu_buses();
@@ -29,7 +29,7 @@ fn main() {
     register_mt7988_buses();
 
     unotice!("probed", "bus_discovery_done");
-    libsys::ulog::flush();
+    libos::ulog::flush();
     // exit(0) is called automatically by _start after main returns
 }
 
@@ -45,7 +45,7 @@ fn bus_create(info: &BusCreateInfo) -> Option<libsys::Handle> {
     match syscall::open(ObjectType::Bus, params) {
         Ok(handle) => Some(handle),
         Err(_) => {
-            libsys::uerror!("probed", "bus_create_failed");
+            libos::uerror!("probed", "bus_create_failed");
             None
         }
     }
