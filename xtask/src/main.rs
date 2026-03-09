@@ -710,7 +710,7 @@ fn cmd_qemu(root: &Path, build: bool, gdb: bool, test: bool, stress: bool) -> Re
         "-drive", &nvme_drive_str,
         // Network (virtio - simpler than emulating real NIC)
         "-device", "virtio-net-pci,netdev=net0",
-        "-netdev", "user,id=net0,hostfwd=tcp::8080-:80,hostfwd=udp::6969-:69,hostfwd=tcp::2323-:23",
+        "-netdev", "user,id=net0,hostfwd=tcp::8080-:80,hostfwd=udp::6969-:69,hostfwd=tcp::2323-:23,hostfwd=tcp::2222-:22",
     ];
 
     if gdb {
@@ -1025,39 +1025,96 @@ fn create_nvme_disk(path: &str, size_mb: u32) -> Result<()> {
     file.seek(SeekFrom::Start(fat2_offset))?;
     file.write_all(&fat)?;
 
-    // Write a hello.txt file in the root directory
+    // Write files into the root directory
     let root_dir_offset = fat2_offset + (fat_sectors as u64 * 512);
+    let data_start = root_dir_offset + (root_dir_sectors as u64 * 512);
+    let cluster_bytes = sectors_per_cluster as u64 * 512; // bytes per cluster
 
-    // Root directory entry for HELLO.TXT
     let mut root_dir = [0u8; 512];
-    // 8.3 filename: "HELLO   TXT"
-    root_dir[0..8].copy_from_slice(b"HELLO   ");
-    root_dir[8..11].copy_from_slice(b"TXT");
-    root_dir[11] = 0x20; // Archive attribute
-    let file_content = b"Hello from BPI-R4 NVMe!\n";
-    let file_size = file_content.len() as u32;
-    let file_cluster: u16 = 2; // First data cluster
-    root_dir[26..28].copy_from_slice(&file_cluster.to_le_bytes());
-    root_dir[28..32].copy_from_slice(&file_size.to_le_bytes());
+    let mut next_cluster: u16 = 2; // First data cluster
+    let mut dir_entry_idx = 0usize;
+    let mut file_count = 0u32;
 
+    // Helper: write a FAT16 directory entry
+    fn write_dir_entry(dir: &mut [u8], idx: usize, name: &[u8; 11], attr: u8, cluster: u16, size: u32) {
+        let off = idx * 32;
+        dir[off..off + 8].copy_from_slice(&name[..8]);
+        dir[off + 8..off + 11].copy_from_slice(&name[8..11]);
+        dir[off + 11] = attr;
+        dir[off + 26..off + 28].copy_from_slice(&cluster.to_le_bytes());
+        dir[off + 28..off + 32].copy_from_slice(&size.to_le_bytes());
+    }
+
+    // File 1: HELLO.TXT
+    let hello_content = b"Hello from BPI-R4 NVMe!\n";
+    let hello_cluster = next_cluster;
+    let hello_clusters = 1u16; // fits in 1 cluster
+    write_dir_entry(&mut root_dir, dir_entry_idx, b"HELLO   TXT", 0x20, hello_cluster, hello_content.len() as u32);
+    dir_entry_idx += 1;
+
+    // Mark hello cluster as EOF in FAT
+    let c = hello_cluster as usize;
+    fat[c * 2] = 0xFF; fat[c * 2 + 1] = 0xFF;
+    next_cluster += hello_clusters;
+    file_count += 1;
+
+    // Write hello.txt data
+    let hello_data_offset = data_start + (hello_cluster as u64 - 2) * cluster_bytes;
+    file.seek(SeekFrom::Start(hello_data_offset))?;
+    file.write_all(hello_content)?;
+
+    // File 2: KERNEL.BIN (if built)
+    let kernel_candidates = [
+        PathBuf::from("kernel.bin"),
+        PathBuf::from("build/kernel.bin"),
+    ];
+    let kernel_data = kernel_candidates.iter()
+        .find_map(|p| fs::read(p).ok());
+
+    if let Some(kdata) = kernel_data {
+        let kernel_size = kdata.len() as u32;
+        let kernel_cluster = next_cluster;
+        let clusters_needed = ((kdata.len() as u64 + cluster_bytes - 1) / cluster_bytes) as u16;
+
+        write_dir_entry(&mut root_dir, dir_entry_idx, b"KERNEL  BIN", 0x20, kernel_cluster, kernel_size);
+        dir_entry_idx += 1;
+        let _ = dir_entry_idx; // suppress unused warning
+
+        // Mark cluster chain in FAT
+        for i in 0..clusters_needed {
+            let c = (kernel_cluster + i) as usize;
+            if i + 1 < clusters_needed {
+                let next = kernel_cluster + i + 1;
+                fat[c * 2] = next as u8;
+                fat[c * 2 + 1] = (next >> 8) as u8;
+            } else {
+                fat[c * 2] = 0xFF;
+                fat[c * 2 + 1] = 0xFF;
+            }
+        }
+
+        // Write kernel data
+        let kernel_data_offset = data_start + (kernel_cluster as u64 - 2) * cluster_bytes;
+        file.seek(SeekFrom::Start(kernel_data_offset))?;
+        file.write_all(&kdata)?;
+
+        file_count += 1;
+        println!("  Embedded kernel.bin ({} bytes, {} clusters)", kernel_size, clusters_needed);
+    }
+
+    // Write root directory
     file.seek(SeekFrom::Start(root_dir_offset))?;
     file.write_all(&root_dir)?;
 
-    // Mark cluster 2 as end-of-chain in FAT
-    fat[4] = 0xFF; fat[5] = 0xFF; // cluster 2 = EOF
+    // Write both FATs
     file.seek(SeekFrom::Start(fat1_offset))?;
     file.write_all(&fat)?;
     file.seek(SeekFrom::Start(fat2_offset))?;
     file.write_all(&fat)?;
 
-    // Write file content at cluster 2 (first data cluster)
-    let data_start = root_dir_offset + (root_dir_sectors as u64 * 512);
-    file.seek(SeekFrom::Start(data_start))?;
-    file.write_all(file_content)?;
-
     file.sync_all()?;
 
-    println!("  Created: {} ({} MB, FAT16, 1 file)", path, size_mb);
+    println!("  Created: {} ({} MB, FAT16, {} files)", path, size_mb, file_count);
     Ok(())
 }
 

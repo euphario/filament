@@ -1,0 +1,36 @@
+/dts-v1/;
+
+/ {
+    description = "BPI-R4 Kernel FIT Image";
+    #address-cells = <1>;
+
+    images {
+        kernel {
+            description = "BPI-R4 Kernel";
+            data = /incbin/("kernel.bin");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <0x46000000>;
+            entry = <0x46000000>;
+        };
+        ramdisk {
+            description = "Initrd";
+            data = /incbin/("initrd.img");
+            type = "ramdisk";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+        };
+    };
+
+    configurations {
+        default = "conf";
+        conf {
+            description = "Boot kernel with initrd";
+            kernel = "kernel";
+            ramdisk = "ramdisk";
+        };
+    };
+};
