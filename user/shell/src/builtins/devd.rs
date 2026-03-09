@@ -9,6 +9,7 @@
 //! Note: The devd protocol is being rewritten. Some commands may not work.
 
 use crate::println;
+use libf::time::Duration;
 use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
 use crate::output::CommandResult;
 
@@ -213,8 +214,7 @@ fn send_command(cmd: &[u8]) -> Result<&'static str, &'static str> {
         Err(_) => return Err("failed to create timer"),
     };
 
-    // 5 second timeout (Timer.set takes duration, kernel adds current time)
-    if timer.set(5_000_000_000).is_err() {
+    if timer.set(Duration::from_secs(5).as_nanos_saturating()).is_err() {
         return Err("failed to set timer");
     }
 

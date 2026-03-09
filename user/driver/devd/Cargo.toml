@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libf = { path = "../../libf" }
 abi = { path = "../../abi" }
 
 [features]

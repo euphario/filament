@@ -129,6 +129,16 @@ impl Duration {
         }
     }
 
+    /// Total duration in nanoseconds as u64, clamped at u64::MAX on overflow.
+    ///
+    /// Convenience for kernel APIs that take u64 nanoseconds (timer.set, sleep_ns).
+    pub const fn as_nanos_saturating(&self) -> u64 {
+        match self.as_nanos_u64() {
+            Some(n) => n,
+            None => u64::MAX,
+        }
+    }
+
     /// Checked addition. Returns `None` on overflow.
     pub const fn checked_add(self, rhs: Duration) -> Option<Duration> {
         let mut nanos = self.nanos + rhs.nanos;

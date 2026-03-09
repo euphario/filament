@@ -31,6 +31,7 @@ mod process;
 mod query;
 mod rules;
 
+use libf::time::Duration;
 use libsys::syscall;
 use libsys::{uinfo, unotice, uwarn, uerror, udebug};
 use libsys::ipc::{Port, Channel, EventLoop, ObjHandle, Mux, MuxFilter};
@@ -714,7 +715,7 @@ impl Devd {
     // =========================================================================
 
     fn now_ms() -> u64 {
-        syscall::gettime() / 1_000_000
+        Duration::from_nanos(syscall::gettime()).as_millis() as u64
     }
 
     /// Whether any state requires periodic polling (overflow clients only).

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 libsys = { path = "../../libsys" }
+libf = { path = "../../libf" }
 
 [profile.release]
 opt-level = "s"       # Optimize for size

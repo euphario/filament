@@ -37,6 +37,7 @@ macro_rules! println {
     }};
 }
 
+use libf::time::{Duration, Instant};
 use libsys::syscall;
 use libsys::ipc::{Process, Mux, MuxFilter};
 use libsys::vfs_client::VfsClient;
@@ -167,17 +168,16 @@ fn main() {
         // Log command execution for data path tracing (SSH only)
         let ssh = console::console().ssh_mode;
         let pipe_before = if ssh { console::console().pipe_writable() } else { 0 };
-        let t0 = if ssh { syscall::gettime() } else { 0 };
+        let t0 = Instant::now();
 
         execute_command(cmd);
 
         if ssh {
-            let t1 = syscall::gettime();
             let pipe_after = console::console().pipe_writable();
-            let elapsed_ms = (t1.saturating_sub(t0)) / 1_000_000;
+            let elapsed = t0.elapsed();
             let bytes_out = pipe_before.saturating_sub(pipe_after);
             libsys::udebug!("shell", "cmd_done";
-                elapsed_ms = elapsed_ms as u32,
+                elapsed_ms = elapsed.as_millis() as u32,
                 bytes_out = bytes_out as u32,
                 pipe_free = pipe_after as u32);
             libsys::ulog::flush();
@@ -548,14 +548,13 @@ fn cmd_pid() {
 }
 
 fn cmd_uptime() {
-    let ns = syscall::gettime();
-    let total_secs = ns / 1_000_000_000;
+    let d = Duration::from_nanos(syscall::gettime());
+    let total_secs = d.as_secs();
     let hours = total_secs / 3600;
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
-    let millis = (ns % 1_000_000_000) / 1_000_000;
 
-    print!("Uptime: {}h {}m {}.{:03}s", hours, mins, secs, millis);
+    print!("Uptime: {}h {}m {}.{:03}s", hours, mins, secs, d.subsec_millis());
     println!();
 }
 
@@ -1231,29 +1230,21 @@ fn cmd_cd(path_arg: &[u8]) {
     }
 
     // Resolve the target path relative to cwd
-    let mut resolved_buf = [0u8; cwd::MAX_PATH];
     let resolved = unsafe {
         let cwd = &*core::ptr::addr_of!(CWD);
-        cwd.resolve(path, &mut resolved_buf)
-    };
-    let resolved = match resolved {
-        Some(p) => p,
-        None => {
-            println!("cd: invalid path");
-            return;
-        }
+        cwd.resolve(path)
     };
 
     // "/" is always valid (no mount needed)
-    if resolved != b"/" {
+    if resolved.as_bytes() != b"/" {
         // Verify the directory exists via VFS
         if let Some(client) = get_vfs_client() {
-            match client.open(resolved, open_flags::DIR | open_flags::RDONLY) {
+            match client.open(resolved.as_bytes(), open_flags::DIR | open_flags::RDONLY) {
                 Ok(handle) => {
                     client.close(handle);
                 }
                 Err(e) => {
-                    builtins::ls::print_vfs_error(b"cd", resolved, e);
+                    builtins::ls::print_vfs_error(b"cd", resolved.as_bytes(), e);
                     return;
                 }
             }

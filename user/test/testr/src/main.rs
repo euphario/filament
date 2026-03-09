@@ -7,6 +7,7 @@
 #![no_std]
 #![no_main]
 
+use libf::time::Duration;
 use libsys::syscall;
 use libsys::ipc::{Mux, Process, Timer, MuxFilter};
 
@@ -17,8 +18,8 @@ static TESTS: &[&str] = &[
     "test_mux_stress",
 ];
 
-/// Per-test timeout in milliseconds
-const TEST_TIMEOUT_MS: u32 = 30_000;
+/// Per-test timeout
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn log(msg: &[u8]) {
     syscall::debug_write(msg);
@@ -102,7 +103,7 @@ fn run_test(name: &str) -> i32 {
 
     let mut timer = timer;
     // Timer.set takes duration in ns, kernel adds current time
-    if timer.set((TEST_TIMEOUT_MS as u64) * 1_000_000).is_err() {
+    if timer.set(TEST_TIMEOUT.as_nanos_saturating()).is_err() {
         log_str("  ERROR: timer.set failed\r\n");
         return 1;
     }

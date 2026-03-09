@@ -2,6 +2,7 @@
 //!
 //! Tests the unified handle API (Timer, Channel, Mux).
 
+use libf::time::Duration;
 use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
 use libsys::syscall::gettime;
 use crate::output::Output;
@@ -44,8 +45,8 @@ fn test_timer(out: &mut dyn Output) {
         }
     };
 
-    // 2. Arm timer for 500ms (Timer.set takes duration, kernel adds current time)
-    if let Err(_) = timer.set(500_000_000) {
+    // 2. Arm timer for 500ms
+    if let Err(_) = timer.set(Duration::from_millis(500).as_nanos_saturating()) {
         out.write(b"  ERROR: Failed to arm timer\r\n");
         return;
     }

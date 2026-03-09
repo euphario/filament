@@ -25,6 +25,7 @@ mod ip;
 mod icmp;
 mod nic;
 
+use libf::time::Duration;
 use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition, PortId, bus_msg,
 };
@@ -44,8 +45,8 @@ use nic::{NicTable, NicState};
 /// Tag for the NIC discovery timer in handle_event.
 const TAG_DISCOVERY_TIMER: u32 = 1;
 
-/// Discovery retry interval (500ms in nanoseconds).
-const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
+/// Discovery retry interval.
+const DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// NIC port name to discover.
 const NIC_PORT_NAME: &[u8] = b"net:0";
@@ -174,10 +175,10 @@ impl NetSvcDriver {
     fn arm_discovery_timer(&mut self, ctx: &mut dyn BusCtx) {
         // Timer::set() takes a relative duration — the kernel adds current time
         if let Some(ref mut timer) = self.discovery_timer {
-            let _ = timer.set(DISCOVERY_INTERVAL_NS);
+            let _ = timer.set(DISCOVERY_INTERVAL.as_nanos_saturating());
         } else {
             if let Ok(mut timer) = Timer::new() {
-                let _ = timer.set(DISCOVERY_INTERVAL_NS);
+                let _ = timer.set(DISCOVERY_INTERVAL.as_nanos_saturating());
                 let handle = timer.handle();
                 let _ = ctx.watch_handle(handle, TAG_DISCOVERY_TIMER);
                 self.discovery_timer = Some(timer);

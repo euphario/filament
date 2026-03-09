@@ -21,6 +21,7 @@
 use libsys::syscall::{self, Handle, ObjectType};
 use libsys::ipc::{Timer, ObjHandle};
 use libf::sync::SharedPipe;
+use libf::time::Duration;
 use libsys::supervision::SupervisionHandle;
 use libsys::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition,
@@ -231,7 +232,7 @@ impl ConsoledDriver {
         self.shell_pid = None;
 
         // Respawn after brief delay
-        syscall::sleep_us(100_000); // 100ms
+        syscall::sleep_ns(Duration::from_millis(100).as_nanos_saturating());
 
         // Drain stale UART input
         let mut buf = [0u8; 64];

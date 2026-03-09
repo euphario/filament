@@ -34,6 +34,7 @@ use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
+use libf::time::Duration;
 use libsys::bus::{BusMsg, BusError, BusCtx, Driver, Disposition, PortId, ConfigKey, bus_msg};
 use libsys::bus_runtime::driver_main;
 use libsys::ipc::Timer;
@@ -61,8 +62,8 @@ const TAG_SOCKET_SVC_PORT: u32 = 5;
 const TAG_SOCKET_CLIENT_BASE: u32 = 0x100;
 /// Socket service DataPort wake: TAG_SOCKET_DATA_BASE + slot_index
 const TAG_SOCKET_DATA_BASE: u32 = 0x200;
-const DISCOVERY_INTERVAL_NS: u64 = 500_000_000;
-const DHCP_FALLBACK_TIMEOUT_NS: u64 = 10_000_000_000; // 10 seconds
+const DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
+const DHCP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Coalescing window: drain all pending RX/TX CQEs, then poll smoltcp once.
 /// 2ms balances latency (interactive SSH) vs. batching (throughput).
 const COALESCE_MS: u64 = 2;
@@ -510,13 +511,13 @@ impl IpdDriver {
 
     fn arm_discovery_timer(&mut self, ctx: &mut dyn BusCtx) {
         if let Some(ref mut timer) = self.discovery_timer {
-            if timer.set(DISCOVERY_INTERVAL_NS).is_err() {
+            if timer.set(DISCOVERY_INTERVAL.as_nanos_saturating()).is_err() {
                 uerror!("ipd", "timer_set_failed"; tag = "discovery");
             }
         } else {
             match Timer::new() {
                 Ok(mut timer) => {
-                    if timer.set(DISCOVERY_INTERVAL_NS).is_err() {
+                    if timer.set(DISCOVERY_INTERVAL.as_nanos_saturating()).is_err() {
                         uerror!("ipd", "timer_set_failed"; tag = "discovery_new");
                     }
                     let handle = timer.handle();
@@ -593,7 +594,7 @@ impl IpdDriver {
     fn arm_dhcp_fallback_timer(&mut self, ctx: &mut dyn BusCtx) {
         match Timer::new() {
             Ok(mut timer) => {
-                if timer.set(DHCP_FALLBACK_TIMEOUT_NS).is_err() {
+                if timer.set(DHCP_FALLBACK_TIMEOUT.as_nanos_saturating()).is_err() {
                     uerror!("ipd", "timer_set_failed"; tag = "dhcp_fb");
                 }
                 let handle = timer.handle();

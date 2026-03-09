@@ -9,6 +9,7 @@
 //!   ps -vvv         - + KIDS, CAPS
 //!   ps -r           - Reset all stats, then show ps
 
+use libf::time::Duration;
 use libsys::syscall;
 use crate::output::{Table, Row, Align, CommandResult};
 
@@ -131,7 +132,7 @@ fn run_basic() -> Table {
 
     for i in 0..count {
         let info = &buf[i];
-        let cpu_ms = info.cpu_time_ns / 1_000_000;
+        let cpu_ms = Duration::from_nanos(info.cpu_time_ns).as_millis() as u64;
 
         let mut row = Row::empty()
             .uint(info.pid as u64)
@@ -209,7 +210,7 @@ fn run_extended(verbosity: u8) -> Table {
 
     for i in 0..count {
         let info = &buf[i];
-        let cpu_ms = info.cpu_time_ns / 1_000_000;
+        let cpu_ms = Duration::from_nanos(info.cpu_time_ns).as_millis() as u64;
 
         let mut row = Row::empty()
             .uint(info.pid as u64)

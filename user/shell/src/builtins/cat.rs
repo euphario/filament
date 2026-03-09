@@ -13,14 +13,8 @@ pub fn cmd_cat(args: &[u8]) -> CommandResult {
     }
 
     // Resolve path relative to cwd
-    let mut resolved_buf = [0u8; crate::cwd::MAX_PATH];
-    let path = match crate::get_cwd().resolve(path, &mut resolved_buf) {
-        Some(p) => p,
-        None => {
-            println!("cat: invalid path");
-            return CommandResult::None;
-        }
-    };
+    let resolved = crate::get_cwd().resolve(path);
+    let path = resolved.as_bytes();
 
     let client = match crate::get_vfs_client() {
         Some(c) => c,

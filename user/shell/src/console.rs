@@ -12,6 +12,7 @@
 //! | 70     | 2    | rows (u16 LE)                   |
 
 use libf::sync::SharedPipe;
+use libf::time::{Duration, Instant};
 use libsys::syscall;
 use libsys::Handle;
 
@@ -80,7 +81,7 @@ impl Console {
                     p = Some(pipe);
                     break;
                 }
-                syscall::sleep_ns(1_000_000); // 1ms
+                syscall::sleep_ns(Duration::from_millis(1).as_nanos_saturating());
             }
             match p {
                 Some(pipe) => pipe,
@@ -142,13 +143,13 @@ impl Console {
 
         // Wait with deadline — shmem wakes on any notify (including our own TX),
         // so we must loop until the deadline actually expires.
-        let deadline_ns = syscall::gettime() + (timeout_ms as u64) * 1_000_000;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         loop {
-            let now = syscall::gettime();
-            if now >= deadline_ns {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return None;
             }
-            let remaining_ms = ((deadline_ns - now) / 1_000_000) as u32;
+            let remaining_ms = remaining.as_millis() as u32;
             pipe.wait(remaining_ms.max(1));
 
             if pipe.pull(&mut byte) > 0 {

@@ -7,6 +7,7 @@
 #![no_std]
 #![no_main]
 
+use libf::time::Duration;
 use libsys::{uinfo, unotice, uwarn, uerror, udebug, ulog};
 use libsys::mmio::{MmioRegion, DmaPool};
 use libsys::ipc::{Msi, Irq};
@@ -93,9 +94,9 @@ const TAG_WIFI_TIMER: u32 = 100;
 const TAG_WIFI_IRQ: u32 = 101;
 
 // NAPI-style adaptive polling intervals
-const POLL_INTERVAL_NS: u64 = 1_000_000;    // 1ms — active polling
-const NORMAL_INTERVAL_NS: u64 = 50_000_000; // 50ms — idle
-const SLOW_TICK_NS: u64 = 500_000_000;      // 500ms — housekeeping
+const POLL_INTERVAL: Duration = Duration::from_millis(1);     // active polling
+const NORMAL_INTERVAL: Duration = Duration::from_millis(50);  // idle
+const SLOW_TICK: Duration = Duration::from_millis(500);       // housekeeping
 const POLL_IDLE_EXIT: u8 = 4;               // 4 empty polls → exit poll mode
 
 /// TX inflight table size — matches HW TX ring (2048 descriptors).
@@ -2185,7 +2186,7 @@ impl Driver for Wifi2 {
         self.init_radio(ctx)?;
 
         // Start poll timer — begins in normal (50ms) mode
-        ctx.start_timer(TAG_WIFI_TIMER, NORMAL_INTERVAL_NS)?;
+        ctx.start_timer(TAG_WIFI_TIMER, NORMAL_INTERVAL.as_nanos_saturating())?;
         self.last_housekeeping = libsys::syscall::gettime();
 
         unotice!("wifi2", "ready"; state = self.state.name());
@@ -2270,20 +2271,20 @@ impl Driver for Wifi2 {
                 self.idle_polls = 0;
                 if !self.poll_active {
                     self.poll_active = true;
-                    let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, POLL_INTERVAL_NS);
+                    let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, POLL_INTERVAL.as_nanos_saturating());
                 }
             } else if self.poll_active {
                 self.idle_polls += 1;
                 if self.idle_polls >= POLL_IDLE_EXIT {
                     self.poll_active = false;
                     self.idle_polls = 0;
-                    let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, NORMAL_INTERVAL_NS);
+                    let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, NORMAL_INTERVAL.as_nanos_saturating());
                 }
             }
 
             // Slow tick: wall-clock based (works at any timer interval)
             let now = libsys::syscall::gettime();
-            if now.wrapping_sub(self.last_housekeeping) >= SLOW_TICK_NS {
+            if now.wrapping_sub(self.last_housekeeping) >= SLOW_TICK.as_nanos_saturating() {
                 self.last_housekeeping = now;
                 self.tick = self.tick.wrapping_add(1);
                 self.slow_tick_housekeeping(dev);
@@ -2317,7 +2318,7 @@ impl Driver for Wifi2 {
         if !self.poll_active {
             self.poll_active = true;
             self.idle_polls = 0;
-            let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, POLL_INTERVAL_NS);
+            let _ = ctx.set_timer_interval(TAG_WIFI_TIMER, POLL_INTERVAL.as_nanos_saturating());
         }
     }
 

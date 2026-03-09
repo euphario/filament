@@ -30,6 +30,7 @@ use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering, fence};
 
+use crate::time::{Duration, Instant};
 use libsys::ipc::Shmem;
 use libsys::syscall;
 
@@ -263,14 +264,13 @@ impl SharedPipe {
             return n;
         }
 
-        let deadline = syscall::gettime() + (timeout_ms as u64) * 1_000_000;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         loop {
-            let now = syscall::gettime();
-            if now >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return 0;
             }
-            let remaining_ms = ((deadline - now) / 1_000_000) as u32;
-            self.wait(remaining_ms.max(1));
+            self.wait((remaining.as_millis() as u32).max(1));
 
             let n = self.incoming.pull(buf);
             if n > 0 {
@@ -546,14 +546,13 @@ impl<T: Copy> SharedChannel<T> {
             return Some(item);
         }
 
-        let deadline = syscall::gettime() + (timeout_ms as u64) * 1_000_000;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         loop {
-            let now = syscall::gettime();
-            if now >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return None;
             }
-            let remaining = ((deadline - now) / 1_000_000) as u32;
-            self.wait(remaining.max(1));
+            self.wait((remaining.as_millis() as u32).max(1));
 
             if let Some(item) = self.incoming.pull() {
                 return Some(item);

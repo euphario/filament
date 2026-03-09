@@ -4,6 +4,7 @@
 //!   mount              - List all registered mounts
 
 use crate::println;
+use libf::time::Duration;
 use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
 use libsys::query::{QueryHeader, MountsListResponse, MountListEntry, mount_transport, msg};
 use crate::output::CommandResult;
@@ -82,7 +83,7 @@ pub fn run(_args: &[u8]) -> CommandResult {
 fn recv_with_timeout(channel: &mut Channel, timeout_ms: u64) -> Option<[u8; 576]> {
     let mux = Mux::new().ok()?;
     let mut timer = Timer::new().ok()?;
-    timer.set(timeout_ms * 1_000_000).ok()?;
+    timer.set(Duration::from_millis(timeout_ms).as_nanos_saturating()).ok()?;
     mux.add(channel.handle(), MuxFilter::Readable).ok()?;
     mux.add(timer.handle(), MuxFilter::Readable).ok()?;
 

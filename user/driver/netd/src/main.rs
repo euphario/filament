@@ -16,6 +16,7 @@
 
 mod virtio;
 
+use libf::time::Duration;
 use libsys::syscall::{self, Handle};
 use libsys::mmio::{MmioRegion, DmaPool};
 use libsys::ipc::{PciDevice, Timer};
@@ -66,7 +67,7 @@ mod net_op {
 const SIDE_QUERY_NET_INFO: u16 = side_msg::QUERY_INFO;
 
 // RX poll timer: 10ms interval (until MSI-X interrupt support)
-const RX_POLL_INTERVAL_NS: u64 = 10_000_000;
+const RX_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TAG_RX_POLL: u32 = 1;
 
 // =============================================================================
@@ -649,7 +650,7 @@ impl Driver for NetDriver {
 
         // 13. Start RX poll timer (until MSI-X interrupt support)
         if let Ok(mut timer) = Timer::new() {
-            let _ = timer.set(RX_POLL_INTERVAL_NS);
+            let _ = timer.set(RX_POLL_INTERVAL.as_nanos_saturating());
             let handle = timer.handle();
             let _ = ctx.watch_handle(handle, TAG_RX_POLL);
             self.rx_poll_timer = Some(timer);
@@ -707,7 +708,7 @@ impl Driver for NetDriver {
 
             // Re-arm timer
             if let Some(ref mut timer) = self.rx_poll_timer {
-                let _ = timer.set(RX_POLL_INTERVAL_NS);
+                let _ = timer.set(RX_POLL_INTERVAL.as_nanos_saturating());
             }
         }
     }

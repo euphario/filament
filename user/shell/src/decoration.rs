@@ -9,6 +9,7 @@
 //! ```
 
 use crate::console;
+use libf::time::Duration;
 use libsys::syscall;
 
 /// Heartbeat toggle state
@@ -174,7 +175,7 @@ fn draw_status_bar() {
     let cols = unsafe { COLS };
     let rows = unsafe { ROWS };
 
-    let secs = (syscall::gettime() / 1_000_000_000) as u32;
+    let secs = Duration::from_nanos(syscall::gettime()).as_secs() as u32;
 
     let mut buf = [0u8; 128];
     let mut pos = 0;

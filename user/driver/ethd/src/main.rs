@@ -9,6 +9,7 @@
 mod uboot_mtk_eth;
 
 use uboot_mtk_eth::*;
+use libf::time::Duration;
 use libsys::syscall::Handle;
 use libsys::mmio::{MmioRegion, DmaPool, delay_us, cache_clean, cache_invalidate};
 use libsys::ipc::{Timer, Irq};
@@ -3638,7 +3639,7 @@ impl Driver for EthDriver {
             Err(_) => {
                 // Fallback: 10ms poll timer (QEMU)
                 if let Ok(mut timer) = Timer::new() {
-                    let _ = timer.set(10_000_000);  // 10ms in ns
+                    let _ = timer.set(Duration::from_millis(10).as_nanos_saturating());
                     let handle = timer.handle();
                     let _ = ctx.watch_handle(handle, self.poll_tag);
                     self.poll_timer = Some(timer);
@@ -3865,7 +3866,7 @@ impl Driver for EthDriver {
 
             // Re-arm the timer
             if let Some(ref mut timer) = self.poll_timer {
-                let _ = timer.set(10_000_000);  // 10ms
+                let _ = timer.set(Duration::from_millis(10).as_nanos_saturating());
             }
         }
     }
