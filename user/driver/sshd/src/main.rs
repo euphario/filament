@@ -20,6 +20,7 @@
 extern crate alloc;
 
 mod ssh;
+mod sftp;
 
 use alloc::vec::Vec;
 
@@ -72,6 +73,7 @@ enum SshState {
     Authentication,
     ChannelOpen,
     ShellRunning,
+    SftpRunning,
     Closing,
 }
 
@@ -134,6 +136,12 @@ struct SshSession {
     ssh_rx_pos: usize,
     ssh_rx_len: usize,
 
+    // SFTP subsystem handler (populated when subsystem="sftp" requested).
+    sftp_handler: Option<sftp::SftpHandler>,
+
+    // SFTP reassembly buffer: accumulates SSH channel data into SFTP packets.
+    sftp_rx: Vec<u8>,
+
     // Diagnostic: count CHANNEL_DATA packets logged for hex dump.
     tx_diag_count: u32,
 }
@@ -172,6 +180,8 @@ impl SshSession {
             tx_residual_off: 0,
             tx_residual_len: 0,
             ssh_rx: [0u8; 16384],
+            sftp_handler: None,
+            sftp_rx: Vec::new(),
             tx_diag_count: 0,
             ssh_rx_pos: 0,
             ssh_rx_len: 0,
@@ -203,7 +213,8 @@ impl SshSession {
                 SshState::Authentication => 5,
                 SshState::ChannelOpen => 6,
                 SshState::ShellRunning => 7,
-                SshState::Closing => 8,
+                SshState::SftpRunning => 8,
+                SshState::Closing => 9,
             };
 
             let ok = match self.state {
@@ -215,6 +226,7 @@ impl SshSession {
                 SshState::Authentication => self.do_authentication(),
                 SshState::ChannelOpen => self.do_channel_open(),
                 SshState::ShellRunning => self.do_shell_running(),
+                SshState::SftpRunning => self.do_sftp_running(),
                 SshState::Closing => {
                     uinfo!("sshd", "closing";);
                     libos::ulog::flush();
@@ -904,6 +916,57 @@ impl SshSession {
                 // window-change never wants a reply
                 true
             }
+            b"subsystem" => {
+                let (subsystem_name, _) = match ssh::read_string(body) {
+                    Some(r) => r,
+                    None => {
+                        if want_reply {
+                            let mut resp = [0u8; 8];
+                            resp[0] = 100; // CHANNEL_FAILURE
+                            ssh::write_u32(&mut resp[1..], self.remote_channel_id);
+                            self.send_packet(&resp[..5]);
+                        }
+                        return true;
+                    }
+                };
+
+                if subsystem_name == b"sftp" {
+                    uinfo!("sshd", "sftp_subsystem_requested";);
+                    libos::ulog::flush();
+
+                    match sftp::SftpHandler::new() {
+                        Some(handler) => {
+                            self.sftp_handler = Some(handler);
+                            if want_reply {
+                                let mut resp = [0u8; 8];
+                                resp[0] = ssh::msg::CHANNEL_SUCCESS;
+                                ssh::write_u32(&mut resp[1..], self.remote_channel_id);
+                                self.send_packet(&resp[..5]);
+                            }
+                            self.state = SshState::SftpRunning;
+                            uinfo!("sshd", "sftp_started";);
+                            libos::ulog::flush();
+                        }
+                        None => {
+                            uerror!("sshd", "sftp_init_failed";);
+                            if want_reply {
+                                let mut resp = [0u8; 8];
+                                resp[0] = 100; // CHANNEL_FAILURE
+                                ssh::write_u32(&mut resp[1..], self.remote_channel_id);
+                                self.send_packet(&resp[..5]);
+                            }
+                        }
+                    }
+                } else {
+                    if want_reply {
+                        let mut resp = [0u8; 8];
+                        resp[0] = 100; // CHANNEL_FAILURE
+                        ssh::write_u32(&mut resp[1..], self.remote_channel_id);
+                        self.send_packet(&resp[..5]);
+                    }
+                }
+                true
+            }
             b"exec" => {
                 if want_reply {
                     let mut resp = [0u8; 8];
@@ -1098,6 +1161,169 @@ impl SshSession {
                     timeout_count += 1;
                 }
             }
+        }
+    }
+
+    // =========================================================================
+    // SFTP subsystem bridge
+    // =========================================================================
+
+    /// SFTP running — bridge SSH channel ↔ SFTP protocol handler.
+    ///
+    /// SSH channel data carries SFTP packets (length-prefixed). We reassemble
+    /// them from potentially fragmented SSH frames, dispatch to SftpHandler,
+    /// and send responses back as SSH channel data.
+    fn do_sftp_running(&mut self) -> bool {
+        uinfo!("sshd", "sftp_loop_enter";);
+        libos::ulog::flush();
+
+        let mux = match Mux::new() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        let tcp_handle = self.stream.poll_handle();
+        let _ = mux.add(tcp_handle, MuxFilter::Readable);
+        let _ = mux.set_timeout(500);
+
+        loop {
+            // 1. Buffer available TCP data
+            self.buffer_available_tcp();
+
+            // 2. Parse and process SSH packets
+            loop {
+                match self.try_recv_packet() {
+                    Some(payload) => {
+                        if !self.handle_sftp_packet(&payload) {
+                            if self.state == SshState::Closing {
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            // 3. Check for EOF
+            if self.stream.is_eof() && self.ssh_rx_pos >= self.ssh_rx_len {
+                uinfo!("sshd", "sftp_tcp_eof";);
+                return false;
+            }
+
+            // 4. Check state transition
+            if self.state != SshState::SftpRunning {
+                return true;
+            }
+
+            // 5. Wait for activity
+            let _ = mux.wait();
+        }
+    }
+
+    /// Process a single SSH packet during SFTP-running state.
+    fn handle_sftp_packet(&mut self, payload: &[u8]) -> bool {
+        if payload.is_empty() {
+            return false;
+        }
+
+        match payload[0] {
+            ssh::msg::CHANNEL_DATA => {
+                let rest = &payload[1..];
+                let (_channel, rest) = match ssh::read_u32(rest) {
+                    Some(r) => r,
+                    None => return false,
+                };
+                let (data, _) = match ssh::read_string(rest) {
+                    Some(r) => r,
+                    None => return false,
+                };
+
+                // Track consumed bytes for window management
+                self.local_consumed += data.len() as u32;
+                self.send_window_adjust();
+
+                // Append to SFTP reassembly buffer
+                self.sftp_rx.extend_from_slice(data);
+
+                // Process complete SFTP packets
+                loop {
+                    if self.sftp_rx.len() < 4 {
+                        break;
+                    }
+                    let pkt_len = u32::from_be_bytes([
+                        self.sftp_rx[0], self.sftp_rx[1],
+                        self.sftp_rx[2], self.sftp_rx[3],
+                    ]) as usize;
+
+                    if pkt_len > 256 * 1024 {
+                        uerror!("sshd", "sftp_pkt_too_large"; len = pkt_len as u32);
+                        return false;
+                    }
+
+                    if self.sftp_rx.len() < 4 + pkt_len {
+                        break; // Incomplete — wait for more data
+                    }
+
+                    // Extract the SFTP packet body (without length prefix)
+                    let sftp_body: Vec<u8> = self.sftp_rx[4..4 + pkt_len].to_vec();
+
+                    // Remove consumed bytes
+                    let remaining = self.sftp_rx.len() - (4 + pkt_len);
+                    if remaining > 0 {
+                        self.sftp_rx.copy_within(4 + pkt_len.., 0);
+                    }
+                    self.sftp_rx.truncate(remaining);
+
+                    // Dispatch to SFTP handler
+                    if let Some(handler) = &mut self.sftp_handler {
+                        let mut response = Vec::new();
+                        handler.process(&sftp_body, &mut response);
+
+                        if !response.is_empty() {
+                            // Send response as SSH channel data
+                            // SFTP response needs length prefix
+                            let resp_len = response.len() as u32;
+                            let mut framed = Vec::with_capacity(4 + response.len());
+                            framed.extend_from_slice(&resp_len.to_be_bytes());
+                            framed.extend_from_slice(&response);
+
+                            // Send in chunks that fit in SSH channel data
+                            let mut offset = 0;
+                            while offset < framed.len() {
+                                let chunk = (framed.len() - offset).min(4096);
+                                let sent = self.send_channel_data(&framed[offset..offset + chunk]);
+                                if sent == 0 {
+                                    return false; // Connection error
+                                }
+                                offset += sent;
+                            }
+                        }
+                    }
+                }
+
+                true
+            }
+            ssh::msg::CHANNEL_WINDOW_ADJUST => {
+                if payload.len() >= 9 {
+                    let (_, rest) = ssh::read_u32(&payload[1..]).unwrap();
+                    let (bytes, _) = ssh::read_u32(rest).unwrap();
+                    self.remote_window = self.remote_window.saturating_add(bytes);
+                }
+                true
+            }
+            ssh::msg::CHANNEL_EOF | ssh::msg::CHANNEL_CLOSE => {
+                let mut resp = [0u8; 8];
+                resp[0] = ssh::msg::CHANNEL_CLOSE;
+                ssh::write_u32(&mut resp[1..], self.remote_channel_id);
+                self.send_packet(&resp[..5]);
+                self.state = SshState::Closing;
+                false
+            }
+            ssh::msg::CHANNEL_REQUEST => {
+                self.handle_channel_request(payload)
+            }
+            _ => true,
         }
     }
 
