@@ -967,7 +967,6 @@ impl IpdDriver {
 
     fn ipd_config_get(&self, key: &[u8], buf: &mut [u8]) -> usize {
         match key {
-            b"" => self.format_summary(buf),
             b"net.ip" => format_ip(buf, self.assigned_ip),
             b"net.prefix" => format_u64(self.assigned_prefix as u64, buf),
             b"net.gateway" => format_ip(buf, self.assigned_gateway),
@@ -992,123 +991,19 @@ impl IpdDriver {
                 buf[..len].copy_from_slice(&s[..len]);
                 len
             }
-            b"stats" => self.format_stats(buf),
-            b"diag.rx" => self.format_diag_rx(buf),
+            b"stats.rx_frames" => format_u64(self.stats.rx_frames as u64, buf),
+            b"stats.rx_bytes" => format_u64(self.stats.rx_bytes, buf),
+            b"stats.tx_frames" => format_u64(self.stats.tx_frames as u64, buf),
+            b"stats.tx_bytes" => format_u64(self.stats.tx_bytes, buf),
+            b"stats.tx_pool_drops" => format_u64(self.stats.tx_pool_drops as u64, buf),
+            b"stats.rx_pool_full" => format_u64(self.stats.rx_pool_full as u64, buf),
+            b"diag.last_rx_len" => format_u64(self.last_rx_len as u64, buf),
+            b"diag.pool_base" => format_hex(buf, self.pool_base_diag as u64),
+            b"diag.nic_state" => format_u64(self.nic_state as u64, buf),
             _ => 0,
         }
     }
 
-    fn format_summary(&self, buf: &mut [u8]) -> usize {
-        use core::fmt::Write;
-        struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
-        impl Write for BufWriter<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                let bytes = s.as_bytes();
-                let remaining = self.buf.len() - self.pos;
-                let to_write = bytes.len().min(remaining);
-                self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
-                self.pos += to_write;
-                Ok(())
-            }
-        }
-        let mut w = BufWriter { buf, pos: 0 };
-
-        let state = match self.ip_state {
-            IpState::Unconfigured => "unconfigured",
-            IpState::DhcpConfigured => "dhcp",
-            IpState::StaticFallback => "static_fallback",
-            IpState::StaticConfigured => "static",
-        };
-        let dhcp = match self.ip_state {
-            IpState::DhcpConfigured | IpState::Unconfigured => "on",
-            IpState::StaticFallback | IpState::StaticConfigured => "off",
-        };
-
-        let _ = core::write!(w,
-            "ip={}.{}.{}.{}\n\
-             prefix={}\n\
-             gateway={}.{}.{}.{}\n\
-             dhcp={}\n\
-             state={}\n",
-            self.assigned_ip[0], self.assigned_ip[1], self.assigned_ip[2], self.assigned_ip[3],
-            self.assigned_prefix,
-            self.assigned_gateway[0], self.assigned_gateway[1], self.assigned_gateway[2], self.assigned_gateway[3],
-            dhcp,
-            state
-        );
-        w.pos
-    }
-
-    fn format_stats(&self, buf: &mut [u8]) -> usize {
-        use core::fmt::Write;
-        struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
-        impl Write for BufWriter<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                let bytes = s.as_bytes();
-                let remaining = self.buf.len() - self.pos;
-                let to_write = bytes.len().min(remaining);
-                self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
-                self.pos += to_write;
-                Ok(())
-            }
-        }
-        let mut w = BufWriter { buf, pos: 0 };
-        let s = &self.stats;
-        let _ = core::write!(w,
-            "rx_frames={}\nrx_bytes={}\ntx_frames={}\ntx_bytes={}\n\
-             tx_pool_drops={}\nrx_pool_full={}\ntx_cqe_reclaimed={}\ntx_pool_full={}\n",
-            s.rx_frames, s.rx_bytes, s.tx_frames, s.tx_bytes,
-            s.tx_pool_drops, s.rx_pool_full, s.tx_cqe_reclaimed, s.tx_pool_full);
-        w.pos
-    }
-
-    fn format_diag_rx(&self, buf: &mut [u8]) -> usize {
-        use core::fmt::Write;
-        struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
-        impl Write for BufWriter<'_> {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                let bytes = s.as_bytes();
-                let remaining = self.buf.len() - self.pos;
-                let to_write = bytes.len().min(remaining);
-                self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
-                self.pos += to_write;
-                Ok(())
-            }
-        }
-        let mut w = BufWriter { buf, pos: 0 };
-        let _ = core::write!(w, "last_rx_len={}\nlast_rx_offset={}\npool_base=0x{:x}\n",
-            self.last_rx_len, self.last_rx_offset, self.pool_base_diag);
-        // Hex dump of first bytes
-        let _ = core::write!(w, "hdr=");
-        let cap = 20.min(self.last_rx_len as usize);
-        for i in 0..cap {
-            let _ = core::write!(w, "{:02x}", self.last_rx_hdr[i]);
-            if i % 6 == 5 && i + 1 < cap { let _ = core::write!(w, " "); }
-        }
-        let _ = core::write!(w, "\n");
-        // Parse Ethernet header if enough data
-        if cap >= 14 {
-            let _ = core::write!(w, "dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                self.last_rx_hdr[0], self.last_rx_hdr[1], self.last_rx_hdr[2],
-                self.last_rx_hdr[3], self.last_rx_hdr[4], self.last_rx_hdr[5]);
-            let _ = core::write!(w, "src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                self.last_rx_hdr[6], self.last_rx_hdr[7], self.last_rx_hdr[8],
-                self.last_rx_hdr[9], self.last_rx_hdr[10], self.last_rx_hdr[11]);
-            let ethertype = ((self.last_rx_hdr[12] as u16) << 8) | self.last_rx_hdr[13] as u16;
-            let _ = core::write!(w, "ethertype=0x{:04x}\n", ethertype);
-        }
-        let s = &self.stats;
-        let _ = core::write!(w, "rx_frames={}\ntx_frames={}\ntx_pool_drops={}\npending_acks={}\n",
-            s.rx_frames, s.tx_frames, s.tx_pool_drops, self.pending_acks);
-        let _ = core::write!(w, "mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5]);
-        let _ = core::write!(w, "ip={}.{}.{}.{}/{}\n",
-            self.assigned_ip[0], self.assigned_ip[1], self.assigned_ip[2], self.assigned_ip[3],
-            self.assigned_prefix);
-        let _ = core::write!(w, "ap_mode={}\nnic_state={}\n",
-            self.ap_mode, self.nic_state as u8);
-        w.pos
-    }
 
     fn ipd_config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize {
         match key {
@@ -1456,6 +1351,25 @@ fn format_ip(buf: &mut [u8], ip: [u8; 4]) -> usize {
     pos
 }
 
+fn format_hex(buf: &mut [u8], val: u64) -> usize {
+    let s = b"0x";
+    let mut pos = s.len().min(buf.len());
+    buf[..pos].copy_from_slice(&s[..pos]);
+    if val == 0 {
+        if pos < buf.len() { buf[pos] = b'0'; pos += 1; }
+        return pos;
+    }
+    // Find highest nibble
+    let nibbles = (64 - val.leading_zeros() as usize + 3) / 4;
+    for i in (0..nibbles).rev() {
+        if pos >= buf.len() { break; }
+        let nib = ((val >> (i * 4)) & 0xF) as u8;
+        buf[pos] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        pos += 1;
+    }
+    pos
+}
+
 fn format_u64(mut val: u64, buf: &mut [u8]) -> usize {
     if val == 0 {
         if !buf.is_empty() {
@@ -1662,8 +1576,15 @@ const IPD_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_write(b"net.gateway"),
     ConfigKey::read_write(b"net.dhcp"),
     ConfigKey::read_only(b"hw.mac"),
-    ConfigKey::read_only(b"stats"),
-    ConfigKey::read_only(b"diag.rx"),
+    ConfigKey::read_only(b"stats.rx_frames"),
+    ConfigKey::read_only(b"stats.rx_bytes"),
+    ConfigKey::read_only(b"stats.tx_frames"),
+    ConfigKey::read_only(b"stats.tx_bytes"),
+    ConfigKey::read_only(b"stats.tx_pool_drops"),
+    ConfigKey::read_only(b"stats.rx_pool_full"),
+    ConfigKey::read_only(b"diag.last_rx_len"),
+    ConfigKey::read_only(b"diag.pool_base"),
+    ConfigKey::read_only(b"diag.nic_state"),
 ];
 
 // =============================================================================

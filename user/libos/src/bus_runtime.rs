@@ -3057,7 +3057,6 @@ fn append_with_source(buf: &mut [u8], pos: usize, prefix: &[u8], data: &[u8]) ->
 /// For each key, calls `config_get()` and emits `key=value\n`.
 /// Flushes the buffer via `respond_info()` when it approaches full,
 /// so drivers with 100+ keys don't overflow.
-/// Appends a `keys=` line listing all writable keys.
 fn send_config_summary<D: Driver>(
     driver: &D, seq_id: u32, ctx: &mut RuntimeCtx, buf: &mut [u8],
 ) {
@@ -3073,29 +3072,6 @@ fn send_config_summary<D: Driver>(
         }
 
         pos += append_kv(driver, key.name, &mut buf[pos..]);
-    }
-
-    // Append keys= line (writable keys only)
-    let writable_count = keys.iter().filter(|k| k.writable).count().min(16);
-    if writable_count > 0 {
-        // Flush if keys= line might not fit
-        if pos + 6 + writable_count * 32 > buf.len() {
-            let _ = ctx.respond_info(seq_id, &buf[..pos]);
-            pos = 0;
-        }
-        pos += copy_static(&mut buf[pos..], b"keys=");
-        let mut first = true;
-        for key in keys {
-            if !key.writable { continue; }
-            if !first {
-                if pos < buf.len() { buf[pos] = b','; pos += 1; }
-            }
-            first = false;
-            let nlen = key.name.len().min(buf.len() - pos);
-            buf[pos..pos + nlen].copy_from_slice(&key.name[..nlen]);
-            pos += nlen;
-        }
-        if pos < buf.len() { buf[pos] = b'\n'; pos += 1; }
     }
 
     if pos > 0 {
