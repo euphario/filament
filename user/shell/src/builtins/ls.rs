@@ -113,6 +113,8 @@ pub fn print_vfs_error(cmd: &[u8], path: &[u8], e: libos::vfs_client::VfsError) 
         VfsError::ConnectFailed => b"connect failed",
         VfsError::TooMany => b"too many open files",
         VfsError::IoError => b"I/O error",
+        VfsError::NoSpace => b"no space left on device",
+        VfsError::Exists => b"file exists",
     };
     crate::console::write(msg);
     println!();

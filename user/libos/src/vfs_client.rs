@@ -14,7 +14,7 @@
 use crate::data_port::DataPort;
 use libsys::ipc::{Channel, Timer, Mux, MuxFilter};
 use crate::ring::{IoSqe, IoCqe, io_status};
-use crate::vfs_proto::{fs_op, file_type, VfsDirEntry, VfsStat};
+use crate::vfs_proto::{fs_op, open_flags, file_type, VfsDirEntry, VfsStat};
 use crate::query::{
     QueryHeader, ResolvePath, ResolvePathResponse, MountsListResponse, MountListEntry,
     mount_transport, msg, error,
@@ -67,6 +67,10 @@ pub enum VfsError {
     NoMount,
     /// Permission denied
     Permission,
+    /// No space left on device
+    NoSpace,
+    /// File already exists
+    Exists,
 }
 
 impl VfsError {
@@ -77,9 +81,10 @@ impl VfsError {
         match cqe.result {
             vfs_error::NOT_FOUND => VfsError::NotFound,
             vfs_error::PERMISSION => VfsError::Permission,
-            vfs_error::NO_SPACE => VfsError::PoolFull,
+            vfs_error::NO_SPACE => VfsError::NoSpace,
             vfs_error::NOT_DIR => VfsError::NotDir,
             vfs_error::IS_DIR => VfsError::IsDir,
+            vfs_error::EXISTS => VfsError::Exists,
             vfs_error::NO_MOUNT => VfsError::NoMount,
             vfs_error::TOO_MANY => VfsError::TooMany,
             vfs_error::READ_ONLY => VfsError::ReadOnly,
@@ -332,6 +337,159 @@ impl VfsClient {
             data_offset: 0,
             data_len: 0,
             param: fs_handle as u64,
+        };
+
+        if !port.submit(&sqe) {
+            return Err(VfsError::RingFull);
+        }
+        port.notify();
+
+        let cqe = poll_completion(port, tag)?;
+        port.reset_pool();
+
+        if cqe.status != io_status::OK {
+            return Err(VfsError::from_cqe(&cqe));
+        }
+
+        Ok(())
+    }
+
+    /// Write data to an open file at `file_offset`.
+    pub fn write(
+        &mut self,
+        handle: u32,
+        file_offset: u64,
+        data: &[u8],
+    ) -> Result<usize, VfsError> {
+        let (conn_idx, fs_handle) = decode_handle(handle);
+
+        if conn_idx >= MAX_CONNECTIONS || self.connections[conn_idx].is_none() {
+            return Err(VfsError::NotFound);
+        }
+
+        let slot_size = crate::ring::POOL_SLOT_SIZE as usize;
+        let mut total = 0usize;
+
+        while total < data.len() {
+            let chunk = (data.len() - total).min(slot_size);
+            let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
+
+            let chunk_len = chunk as u32;
+            let offset = port.alloc(chunk_len).ok_or(VfsError::PoolFull)?;
+            port.pool_write(offset, &data[total..total + chunk]);
+
+            let tag = port.next_tag();
+            let sqe = IoSqe {
+                opcode: fs_op::WRITE,
+                flags: 0,
+                priority: 0,
+                tag,
+                lba: file_offset + total as u64,
+                data_offset: offset,
+                data_len: chunk_len,
+                param: fs_handle as u64,
+            };
+
+            if !port.submit(&sqe) {
+                port.reset_pool();
+                return Err(VfsError::RingFull);
+            }
+            port.notify();
+
+            let cqe = poll_completion(port, tag)?;
+
+            if cqe.status != io_status::OK {
+                port.reset_pool();
+                return Err(VfsError::from_cqe(&cqe));
+            }
+
+            let transferred = cqe.transferred as usize;
+            port.reset_pool();
+            total += transferred;
+
+            // Short write = out of space
+            if transferred < chunk {
+                break;
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// Create and open a new file. Convenience wrapper around open(CREATE).
+    pub fn create(&mut self, path: &[u8]) -> Result<u32, VfsError> {
+        self.open(path, open_flags::RDWR | open_flags::CREATE | open_flags::TRUNC)
+    }
+
+    /// Create a directory.
+    pub fn mkdir(&mut self, path: &[u8]) -> Result<(), VfsError> {
+        let (shmem_id, remaining, rem_len) = self.resolve_path(path)?;
+        let conn_idx = self.get_connection(shmem_id)?;
+        let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
+
+        let mut fs_path = [0u8; 256];
+        fs_path[0] = b'/';
+        let copy_len = rem_len.min(255);
+        fs_path[1..1 + copy_len].copy_from_slice(&remaining[..copy_len]);
+        let fs_path_len = 1 + copy_len;
+
+        let path_len = fs_path_len as u32;
+        let offset = port.alloc(path_len).ok_or(VfsError::PoolFull)?;
+        port.pool_write(offset, &fs_path[..fs_path_len]);
+
+        let tag = port.next_tag();
+        let sqe = IoSqe {
+            opcode: fs_op::MKDIR,
+            flags: 0,
+            priority: 0,
+            tag,
+            lba: 0,
+            data_offset: offset,
+            data_len: path_len,
+            param: 0,
+        };
+
+        if !port.submit(&sqe) {
+            return Err(VfsError::RingFull);
+        }
+        port.notify();
+
+        let cqe = poll_completion(port, tag)?;
+        port.reset_pool();
+
+        if cqe.status != io_status::OK {
+            return Err(VfsError::from_cqe(&cqe));
+        }
+
+        Ok(())
+    }
+
+    /// Delete a file.
+    pub fn unlink(&mut self, path: &[u8]) -> Result<(), VfsError> {
+        let (shmem_id, remaining, rem_len) = self.resolve_path(path)?;
+        let conn_idx = self.get_connection(shmem_id)?;
+        let port = &mut self.connections[conn_idx].as_mut().unwrap().port;
+
+        let mut fs_path = [0u8; 256];
+        fs_path[0] = b'/';
+        let copy_len = rem_len.min(255);
+        fs_path[1..1 + copy_len].copy_from_slice(&remaining[..copy_len]);
+        let fs_path_len = 1 + copy_len;
+
+        let path_len = fs_path_len as u32;
+        let offset = port.alloc(path_len).ok_or(VfsError::PoolFull)?;
+        port.pool_write(offset, &fs_path[..fs_path_len]);
+
+        let tag = port.next_tag();
+        let sqe = IoSqe {
+            opcode: fs_op::UNLINK,
+            flags: 0,
+            priority: 0,
+            tag,
+            lba: 0,
+            data_offset: offset,
+            data_len: path_len,
+            param: 0,
         };
 
         if !port.submit(&sqe) {
