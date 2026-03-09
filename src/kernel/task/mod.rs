@@ -1158,6 +1158,7 @@ pub(crate) fn scheduler() -> super::lock::SpinLockGuard<'static, Scheduler> {
 /// This function is `pub(crate)` to prevent external code from holding the
 /// lock across function calls. External code should use `try_with_scheduler()`.
 #[inline]
+#[track_caller]
 pub(crate) fn try_scheduler() -> Option<super::lock::SpinLockGuard<'static, Scheduler>> {
     SCHEDULER.try_lock()
 }
@@ -1180,6 +1181,7 @@ pub(crate) fn try_scheduler() -> Option<super::lock::SpinLockGuard<'static, Sche
 /// returns. This prevents the common bug of holding the scheduler lock while
 /// calling into other subsystems (uaccess, IPC, etc.) that might also need it.
 #[inline]
+#[track_caller]
 pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
     let mut guard = SCHEDULER.lock();
     f(&mut *guard)
@@ -1204,6 +1206,7 @@ pub fn with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> R {
 /// }
 /// ```
 #[inline]
+#[track_caller]
 pub fn try_with_scheduler<R, F: FnOnce(&mut Scheduler) -> R>(f: F) -> Option<R> {
     SCHEDULER.try_lock().map(|mut guard| f(&mut *guard))
 }

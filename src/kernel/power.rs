@@ -277,8 +277,8 @@ fn push_cpu_state_to_bus(update: &[u8; 12]) {
 
 /// Push OPP table to the CPU bus owner channel.
 /// Called once when the CPU bus is claimed (from bus controller).
-pub fn push_opp_table_to_bus(channel: crate::kernel::ipc::ChannelId) {
-    use crate::kernel::ipc::{self, Message, MessageType, waker, WakeReason};
+pub fn push_opp_table_to_bus(channel: crate::kernel::ipc::ChannelId, wakes: &mut crate::kernel::bus::DeferredWakes) {
+    use crate::kernel::ipc::{self, Message, MessageType};
     use crate::platform::current::cpufreq;
 
     let count = cpufreq::opp_count();
@@ -297,8 +297,6 @@ pub fn push_opp_table_to_bus(channel: crate::kernel::ipc::ChannelId) {
     msg.header.payload_len = payload_len as u32;
 
     if let Ok(peer) = ipc::send_unchecked(channel, msg) {
-        let wake_list = crate::kernel::object_service::object_service()
-            .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
-        waker::wake(&wake_list, WakeReason::Readable);
+        wakes.push(peer, abi::mux_filter::READABLE);
     }
 }

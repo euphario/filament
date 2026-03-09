@@ -57,7 +57,7 @@ use crate::kernel::lock::{SpinLock, lock_class};
 
 pub use types::{BusType, BusInfo, DeviceInfo, bus_caps};
 pub use protocol::StateChangeReason;
-pub use controller::BusController;
+pub use controller::{BusController, DeferredWakes};
 
 use super::ipc::{ChannelId, Message};
 use super::process::Pid;
@@ -245,12 +245,12 @@ impl BusRegistry {
     }
 
     /// Process cleanup when a process exits
-    pub fn process_cleanup(&mut self, pid: Pid) {
+    pub fn process_cleanup(&mut self, pid: Pid, wakes: &mut controller::DeferredWakes) {
         for bus in self.buses[..self.bus_count].iter_mut() {
             // Check if this is the owner (driver process)
             // If so, reset bus hardware and notify supervisor
             if bus.is_owner(pid) {
-                bus.handle_owner_exit(pid);
+                bus.handle_owner_exit(pid, wakes);
             }
             // Check if this is the supervisor (devd)
             // Independent check — not else-if
@@ -418,9 +418,11 @@ pub fn init_complete() -> bool {
 
 /// Handle process cleanup (called when a process exits)
 pub fn process_cleanup(pid: Pid) {
+    let mut wakes = controller::DeferredWakes::new();
     with_bus_registry(|registry| {
-        registry.process_cleanup(pid);
+        registry.process_cleanup(pid, &mut wakes);
     });
+    wakes.execute();
 }
 
 /// Reset all buses to Safe state (for devd restart)
@@ -467,13 +469,17 @@ pub fn handle_port_connect(suffix: &str, client_channel: ChannelId, client_pid: 
         _ => return Err(BusError::NotFound),
     };
 
-    with_bus_registry(|registry| {
+    // Collect deferred wakes inside bus lock, execute after releasing
+    let mut wakes = controller::DeferredWakes::new();
+    let result = with_bus_registry(|registry| {
         if let Some(bus) = registry.find(bus_type, index) {
-            bus.handle_connect(client_channel, client_pid)
+            bus.handle_connect(client_channel, client_pid, &mut wakes)
         } else {
             Err(BusError::NotFound)
         }
-    })
+    });
+    wakes.execute();
+    result
 }
 
 /// Process a message sent to a kernel bus channel
@@ -674,7 +680,8 @@ pub fn test() {
     assert!(bus.check_invariants());
 
     // Simulate owner exit
-    bus.handle_owner_exit(2);
+    let mut wakes = controller::DeferredWakes::new();
+    bus.handle_owner_exit(2, &mut wakes);
     assert!(bus.state() == BusState::Safe);
     assert!(bus.check_invariants());
 

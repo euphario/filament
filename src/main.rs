@@ -1190,7 +1190,8 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
                     elf::ElfError::SignatureInvalid => "sig_invalid",
                 };
                 print_str_uart(err_str);
-                print_str_uart("\r\n  System halted.\r\n");
+                uart::write_bytes(b"\x1b[r\x1b[2J\x1b[H\x1b[?25h");
+                print_str_uart("  System halted.\r\n");
                 loop {
                     unsafe { core::arch::asm!("wfe"); }
                 }
@@ -1341,8 +1342,8 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
     }
 
     // Use only direct UART output - no println! which may fault
-    // Push past any scroll region with blank lines
-    for _ in 0..30 { print_str_uart("\r\n"); }
+    // Reset terminal: clear scroll region, clear screen, cursor to top, show cursor
+    uart::write_bytes(b"\x1b[r\x1b[2J\x1b[H\x1b[?25h");
     print_str_uart("=== KERNEL EXCEPTION ===\r\n");
 
     // Decode exception class

@@ -260,6 +260,7 @@ impl Default for SubscriberSet {
 /// If the wake list overflowed (subscribers were dropped), enqueues
 /// WakeSweep microtasks for the subscribers that *were* successfully
 /// woken — they'll re-poll their Mux and discover any missed events.
+#[track_caller]
 pub fn wake(list: &WakeList, _reason: WakeReason) {
     for sub in list.iter() {
         wake_one(&sub);
@@ -283,6 +284,7 @@ pub fn wake(list: &WakeList, _reason: WakeReason) {
 /// SERIALIZATION: Uses try_scheduler() to avoid deadlock when called from
 /// contexts that already hold the scheduler lock (e.g., reap_terminated).
 /// If lock is held, defers wake via microtask queue.
+#[track_caller]
 fn wake_one(sub: &Subscriber) {
     // Use try_scheduler to avoid deadlock if called from reap_terminated
     if let Some(mut sched) = task::try_scheduler() {
@@ -302,6 +304,7 @@ fn wake_one(sub: &Subscriber) {
 /// Prefer using WakeList when possible.
 /// SERIALIZATION: Uses try_scheduler internally for SMP safety.
 /// If scheduler lock is held, defers wake.
+#[track_caller]
 pub fn wake_pid(pid: u32) {
     wake_one(&Subscriber::simple(pid));
 }

@@ -47,9 +47,11 @@ pub mod lock_class {
     pub const MICROTASK: u8 = 15;
     /// ObjectService per-task table locks
     pub const OBJ_SERVICE: u8 = 20;
-    /// Bus registry — between OBJ_SERVICE and SUBSYSTEM (acquires IPC locks)
+    /// Bus registry — between OBJ_SERVICE and IPC locks (acquires channel/port locks)
     pub const BUS: u8 = 25;
-    /// Subsystem locks: CHANNEL_TABLE, PORT_REGISTRY, IRQ_TABLE, LOG_RING
+    /// IPC channel table — locked before port registry when both needed
+    pub const CHANNEL: u8 = 28;
+    /// Subsystem locks: PORT_REGISTRY, SUPERVISION_TABLE, IRQ_TABLE, LOG_RING
     pub const SUBSYSTEM: u8 = 30;
     /// Resource locks: DMA_POOL, SHMEM, PMM, ASID_ALLOCATOR, VM_OBJECTS
     pub const RESOURCE: u8 = 40;
@@ -59,7 +61,6 @@ pub mod lock_class {
 // Debug Statistics (for diagnosing lock contention + ordering enforcement)
 // ============================================================================
 
-#[cfg(debug_assertions)]
 mod stats {
     use super::*;
 
@@ -88,6 +89,7 @@ mod stats {
     /// Panics if:
     /// - Nesting depth exceeds MAX_LOCK_DEPTH
     /// - Class is <= the top of the stack (ordering violation), unless class == 0
+    #[track_caller]
     pub fn increment_depth(cpu: u32, class: u8) {
         let cpu_idx = cpu as usize;
         if cpu_idx >= LOCK_DEPTH.len() {
@@ -105,9 +107,10 @@ mod stats {
         if class != lock_class::UNORDERED && depth > 0 {
             let top = HELD_CLASSES[cpu_idx][depth - 1].load(Ordering::Relaxed) as u8;
             if top != lock_class::UNORDERED && class <= top {
+                let caller = core::panic::Location::caller();
                 panic!(
-                    "Lock ordering violation on CPU {}: acquiring class {} while holding class {} (depth {})",
-                    cpu, class, top, depth
+                    "Lock ordering violation on CPU {}: acquiring class {} while holding class {} (depth {}) at {}:{}",
+                    cpu, class, top, depth, caller.file(), caller.line()
                 );
             }
         }
@@ -172,9 +175,8 @@ pub struct SpinLock<T> {
     next_ticket: AtomicU32,
     now_serving: AtomicU32,
     data: UnsafeCell<T>,
-    /// Lock ordering class (always present, zero-cost in release — only checked in debug)
+    /// Lock ordering class
     lock_class: u8,
-    #[cfg(debug_assertions)]
     owner_cpu: AtomicU32,
 }
 
@@ -194,7 +196,6 @@ impl<T> SpinLock<T> {
             now_serving: AtomicU32::new(0),
             data: UnsafeCell::new(data),
             lock_class: class,
-            #[cfg(debug_assertions)]
             owner_cpu: AtomicU32::new(u32::MAX),
         }
     }
@@ -206,40 +207,33 @@ impl<T> SpinLock<T> {
     ///
     /// # Panics
     ///
-    /// In debug builds, panics if the same CPU tries to acquire a lock it already holds.
+    /// Panics if the same CPU tries to acquire a lock it already holds,
+    /// or if lock ordering is violated.
     #[inline]
+    #[track_caller]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         // Step 1: Disable IRQs and save state
         let irqs_were_enabled = disable_irqs_save();
 
         // Step 2: Take a ticket and wait for our turn
-        #[cfg(debug_assertions)]
         let cpu = cpu_id();
 
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         while self.now_serving.load(Ordering::Acquire) != ticket {
-            #[cfg(debug_assertions)]
-            {
-                // Check for deadlock (same CPU already holds lock)
-                if self.owner_cpu.load(Ordering::Relaxed) == cpu {
-                    panic!("SpinLock deadlock: CPU {} already holds this lock", cpu);
-                }
+            // Check for deadlock (same CPU already holds lock)
+            if self.owner_cpu.load(Ordering::Relaxed) == cpu {
+                panic!("SpinLock deadlock: CPU {} already holds this lock", cpu);
             }
             core::hint::spin_loop();
         }
 
-        #[cfg(debug_assertions)]
-        {
-            self.owner_cpu.store(cpu, Ordering::Relaxed);
-            stats::increment_depth(cpu, self.lock_class);
-        }
+        self.owner_cpu.store(cpu, Ordering::Relaxed);
+        stats::increment_depth(cpu, self.lock_class);
 
         SpinLockGuard {
             lock: self,
             irqs_were_enabled,
-            #[cfg(debug_assertions)]
             owner_cpu: cpu,
-            #[cfg(debug_assertions)]
             lock_class: self.lock_class,
         }
     }
@@ -248,6 +242,7 @@ impl<T> SpinLock<T> {
     ///
     /// Returns `Some(guard)` if lock was acquired, `None` if already held.
     #[inline]
+    #[track_caller]
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         // Step 1: Disable IRQs and save state
         let irqs_were_enabled = disable_irqs_save();
@@ -263,20 +258,14 @@ impl<T> SpinLock<T> {
             return None;
         }
 
-        #[cfg(debug_assertions)]
         let cpu = cpu_id();
-        #[cfg(debug_assertions)]
-        {
-            self.owner_cpu.store(cpu, Ordering::Relaxed);
-            stats::increment_depth(cpu, self.lock_class);
-        }
+        self.owner_cpu.store(cpu, Ordering::Relaxed);
+        stats::increment_depth(cpu, self.lock_class);
 
         Some(SpinLockGuard {
             lock: self,
             irqs_were_enabled,
-            #[cfg(debug_assertions)]
             owner_cpu: cpu,
-            #[cfg(debug_assertions)]
             lock_class: self.lock_class,
         })
     }
@@ -329,9 +318,7 @@ impl<T> SpinLock<T> {
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
     irqs_were_enabled: bool,
-    #[cfg(debug_assertions)]
     owner_cpu: u32,
-    #[cfg(debug_assertions)]
     lock_class: u8,
 }
 
@@ -356,12 +343,9 @@ impl<'a, T> DerefMut for SpinLockGuard<'a, T> {
 impl<'a, T> Drop for SpinLockGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
-        // Step 1: Update debug stats and clear owner
-        #[cfg(debug_assertions)]
-        {
-            stats::decrement_depth(self.owner_cpu, self.lock_class);
-            self.lock.owner_cpu.store(u32::MAX, Ordering::Relaxed);
-        }
+        // Step 1: Update lock ordering stats and clear owner
+        stats::decrement_depth(self.owner_cpu, self.lock_class);
+        self.lock.owner_cpu.store(u32::MAX, Ordering::Relaxed);
 
         // Step 2: Release spinlock — advance now_serving to next ticket
         self.lock.now_serving.fetch_add(1, Ordering::Release);
@@ -393,9 +377,8 @@ fn restore_irqs(were_enabled: bool) {
     }
 }
 
-/// Get current CPU ID (for debug deadlock detection).
+/// Get current CPU ID (for deadlock detection).
 #[inline]
-#[cfg(debug_assertions)]
 fn cpu_id() -> u32 {
     let mpidr: u64;
     unsafe {
@@ -405,27 +388,18 @@ fn cpu_id() -> u32 {
     (mpidr & 0xFF) as u32
 }
 
-/// Get the current lock nesting depth for this CPU (debug builds only).
+/// Get the current lock nesting depth for this CPU.
 ///
 /// Returns 0 if no locks are held, or the number of nested locks.
 /// This is useful for debugging and ensuring locks are properly released.
-#[cfg(debug_assertions)]
 pub fn current_lock_depth() -> u32 {
     stats::get_depth(cpu_id())
-}
-
-/// Get the current lock nesting depth for this CPU.
-/// Always returns 0 in release builds.
-#[cfg(not(debug_assertions))]
-pub fn current_lock_depth() -> u32 {
-    0
 }
 
 /// Assert that no locks are currently held on this CPU.
 ///
 /// Use this before blocking operations or at context switch points.
-/// Panics in debug builds if any locks are held.
-#[cfg(debug_assertions)]
+/// Panics if any locks are held.
 pub fn assert_no_locks_held() {
     let depth = current_lock_depth();
     if depth > 0 {
@@ -435,11 +409,6 @@ pub fn assert_no_locks_held() {
         );
     }
 }
-
-/// Assert that no locks are currently held (no-op in release builds).
-#[cfg(not(debug_assertions))]
-#[inline]
-pub fn assert_no_locks_held() {}
 
 // ============================================================================
 // Read-Write Lock (for future use)
@@ -672,8 +641,7 @@ pub fn test() {
         kdebug!("lock", "rwlock_multi_ok");
     }
 
-    // Test 8: Lock depth tracking (debug builds only)
-    #[cfg(debug_assertions)]
+    // Test 8: Lock depth tracking
     {
         static DEPTH_TEST: SpinLock<u32> = SpinLock::new(0, 0);
 

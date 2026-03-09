@@ -274,6 +274,7 @@ impl ObjectService {
     /// Acquire lock on a single task's table.
     ///
     /// Returns a TableGuard that proves the lock is held.
+    #[track_caller]
     pub fn lock_table(&self, task_id: TaskId) -> Result<TableGuard<'_>, KernelError> {
         let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
         let guard = self.table_slot(slot).lock();
@@ -281,6 +282,7 @@ impl ObjectService {
     }
 
     /// Lock a table by slot index directly (internal use)
+    #[track_caller]
     fn lock_slot(&self, slot: usize) -> Result<TableGuard<'_>, KernelError> {
         if slot >= MAX_TASKS {
             return Err(KernelError::NoProcess);
@@ -440,6 +442,7 @@ impl ObjectService {
     }
 
     /// Access the full table for a task (for complex operations like Mux polling)
+    #[track_caller]
     pub fn with_table<F, R>(&self, task_id: TaskId, f: F) -> Result<R, KernelError>
     where
         F: FnOnce(&HandleTable) -> R,
@@ -450,6 +453,7 @@ impl ObjectService {
     }
 
     /// Access the full table mutably for a task
+    #[track_caller]
     pub fn with_table_mut<F, R>(&self, task_id: TaskId, f: F) -> Result<R, KernelError>
     where
         F: FnOnce(&mut HandleTable) -> R,

@@ -1099,6 +1099,35 @@ pub fn flush() {
     while drain_one() {}
 }
 
+/// Try to flush pending records — skips if LOG_RING lock is held.
+/// Safe to call from panic handler where LOG_RING might already be locked.
+pub fn try_flush() {
+    // Best-effort: try_lock to avoid deadlock in panic handler
+    for _ in 0..64 {
+        let record_buf_opt = {
+            let guard = LOG_RING.try_lock();
+            match guard {
+                Some(mut ring) => {
+                    let mut buf = [0u8; MAX_RECORD_SIZE];
+                    let len = ring.drain_read(&mut buf);
+                    len.map(|l| (buf, l))
+                }
+                None => return, // Lock held, give up
+            }
+        };
+        let Some((buf, len)) = record_buf_opt else {
+            return; // No more records
+        };
+        if !drain_suppressed() {
+            let mut text_buf = [0u8; 1024];
+            let text_len = format_record(&buf[..len], &mut text_buf);
+            if text_len > 0 {
+                crate::platform::current::uart::write_bytes(&text_buf[..text_len]);
+            }
+        }
+    }
+}
+
 /// Try to drain records (non-blocking, for timer interrupt)
 pub fn try_drain(max_records: usize) -> usize {
     let mut count = 0;

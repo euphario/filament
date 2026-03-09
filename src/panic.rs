@@ -5,16 +5,32 @@ use crate::println_direct;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Flush any pending log messages before panic output
-    crate::klog::flush();
+    // Prevent re-entrant panics from looping forever.
+    // If we panic inside the panic handler, halt immediately.
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static PANICKING: AtomicBool = AtomicBool::new(false);
+    if PANICKING.swap(true, Ordering::Relaxed) {
+        // Re-entrant panic — halt without touching any locks
+        loop {
+            unsafe { core::arch::asm!("wfe"); }
+        }
+    }
 
-    // Flush UART output buffer (userspace writes)
+    // Try to flush pending log messages — skip if lock is held
+    crate::klog::try_flush();
+
+    // Flush UART output buffer (userspace writes, lock-free)
     while crate::platform::current::uart::has_buffered_output() {
         crate::platform::current::uart::flush_buffer();
     }
 
-    // Use direct UART output for panic - we need immediate visibility
-    println_direct!();
+    // Reset terminal so panic output is visible above shell decorations:
+    // - Reset scroll region (CSI r)
+    // - Clear screen (CSI 2J)
+    // - Move cursor to top-left (CSI H)
+    // - Show cursor if hidden (CSI ?25h)
+    crate::platform::current::uart::write_bytes(b"\x1b[r\x1b[2J\x1b[H\x1b[?25h");
+
     println_direct!("=== KERNEL PANIC ===");
 
     if let Some(location) = info.location() {
@@ -55,9 +71,10 @@ fn panic(info: &PanicInfo) -> ! {
     println_direct!("    LR:      {:#018x}", lr);
     println_direct!("    FP:      {:#018x}", fp);
 
-    // Current task info
+    // Current task info — use try_with_scheduler to avoid deadlock
+    // if the scheduler lock is already held
     let slot = crate::kernel::task::current_slot();
-    let (pid, name) = crate::kernel::task::with_scheduler(|sched| {
+    let task_info = crate::kernel::task::try_with_scheduler(|sched| {
         if let Some(t) = sched.task(slot) {
             (t.id, t.name)
         } else {
@@ -65,12 +82,16 @@ fn panic(info: &PanicInfo) -> ! {
         }
     });
     println_direct!("    SLOT:    {}", slot);
-    println_direct!("    PID:     {}", pid);
-    let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-    if name_len > 0 {
-        if let Ok(s) = core::str::from_utf8(&name[..name_len]) {
-            println_direct!("    NAME:    {}", s);
+    if let Some((pid, name)) = task_info {
+        println_direct!("    PID:     {}", pid);
+        let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        if name_len > 0 {
+            if let Ok(s) = core::str::from_utf8(&name[..name_len]) {
+                println_direct!("    NAME:    {}", s);
+            }
         }
+    } else {
+        println_direct!("    PID:     (scheduler locked)");
     }
 
     // Uptime

@@ -156,6 +156,7 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
     // Track deferred actions from read dispatch
     let mut increment_ipc_recv = false;
     let mut process_lazy_check: Option<u32> = None;
+    let mut shmem_wait: Option<(u32, u32)> = None; // (shmem_id, timeout_ms) — deferred
 
     // For other types, get mutable ref and dispatch
     let result = object_service().with_table_mut(task_id, |table| {
@@ -184,7 +185,27 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                 }
             }
             Object::Port(_) => unreachable!(), // Handled above
-            Object::Shmem(s) => read_shmem(s, buf_ptr, buf_len, task_id),
+            Object::Shmem(s) => {
+                // Metadata query (buf_len >= 16) is safe inline.
+                // WAIT operation (buf_len < 16) calls shmem::wait → with_scheduler,
+                // so defer it outside the table lock.
+                if buf_len >= 16 {
+                    read_shmem(s, buf_ptr, buf_len, task_id)
+                } else {
+                    let timeout_ms = if buf_len >= 4 {
+                        let mut tb = [0u8; 4];
+                        if uaccess::copy_from_user(&mut tb, buf_ptr).is_ok() {
+                            u32::from_le_bytes(tb)
+                        } else {
+                            return KernelError::BadAddress.to_errno();
+                        }
+                    } else {
+                        0
+                    };
+                    shmem_wait = Some((s.shmem_id(), timeout_ms));
+                    0 // Sentinel — real wait happens outside table lock
+                }
+            }
             Object::Console(c) => read_console(c, buf_ptr, buf_len, task_id),
             Object::Klog(k) => read_klog(k, buf_ptr, buf_len),
             Object::Mux(_) => unreachable!(), // Handled above
@@ -201,6 +222,15 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             _ => KernelError::NotSupported.to_errno(),
         }
     });
+
+    // Deferred shmem wait (shmem::wait calls with_scheduler — must be outside table lock)
+    if let Some((shmem_id, timeout_ms)) = shmem_wait {
+        match shmem::wait(task_id, shmem_id, timeout_ms) {
+            Ok(()) => return 0,
+            Err(-11) => return 0, // EAGAIN = blocked, will wake later
+            Err(e) => return e,
+        }
+    }
 
     // Deferred actions after table lock release (lock ordering)
     if increment_ipc_recv {
@@ -278,6 +308,7 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         ShmemNotify(u32, u32), // (shmem_id, caller_pid)
         ChannelWake(ChannelWriteResult),
         SupervisionWake(waker::WakeList),
+        RingWake(waker::WakeList),
         TimerDeadline(u64),
     }
 
@@ -337,7 +368,10 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::Console(c) => (write_console(c, buf_ptr, buf_len), PendingAction::None),
             Object::Mux(m) => (write_mux(m, buf_ptr, buf_len), PendingAction::None),
             Object::PciDevice(d) => (write_pci_device(d, buf_ptr, buf_len, task_id), PendingAction::None),
-            Object::Ring(r) => (write_ring(r, buf_ptr, buf_len, task_id), PendingAction::None),
+            Object::Ring(r) => {
+                let (errno, wake_list) = write_ring(r, buf_ptr, buf_len, task_id);
+                (errno, if wake_list.is_empty() { PendingAction::None } else { PendingAction::RingWake(wake_list) })
+            }
             Object::BusCreator(bc) => (write_bus_creator(bc, buf_ptr, buf_len), PendingAction::None),
             Object::SupervisionParent(sp) => {
                 let r = write_supervision_parent(sp, buf_ptr, buf_len);
@@ -357,6 +391,8 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             // Handle deferred actions AFTER table lock is released
             match pending {
                 PendingAction::ShmemNotify(shmem_id, caller_pid) => {
+                    // Wake shmem waiters (calls with_scheduler — safe, no lock held)
+                    let _ = shmem::notify(caller_pid, shmem_id);
                     notify_shmem_objects(shmem_id, caller_pid);
                 }
                 PendingAction::ChannelWake(r) => {
@@ -381,6 +417,9 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                     }
                 }
                 PendingAction::SupervisionWake(wake_list) => {
+                    waker::wake(&wake_list, ipc::WakeReason::Readable);
+                }
+                PendingAction::RingWake(wake_list) => {
                     waker::wake(&wake_list, ipc::WakeReason::Readable);
                 }
                 PendingAction::TimerDeadline(deadline) => {
@@ -417,6 +456,9 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
     // Phase 1: Dispatch under table lock (Ring may need deferred scheduler call)
     let mut ring_deferred: Option<MapRingDeferred> = None;
 
+    // Phase 1: Extract info under table lock, defer scheduler calls
+    let mut shmem_deferred: Option<u32> = None; // shmem_id needing map
+
     let result = object_service().with_table_mut(task_id, |table| {
         let Some(entry) = table.get_mut(handle) else {
             return KernelError::BadHandle.to_errno();
@@ -432,7 +474,16 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
 
         // Dispatch to type-specific map
         match &mut entry.object {
-            Object::Shmem(s) => map_shmem(s, task_id),
+            Object::Shmem(s) => {
+                // If already mapped, return immediately
+                if s.vaddr() != 0 {
+                    s.vaddr() as i64
+                } else {
+                    // Defer shmem::map — it calls with_scheduler (lock ordering)
+                    shmem_deferred = Some(s.shmem_id());
+                    0 // Sentinel — real mapping happens outside table lock
+                }
+            }
             Object::DmaPool(d) => map_dma_pool(d, task_id),
             Object::Mmio(m) => map_mmio(m, task_id),
             Object::Ring(r) => {
@@ -447,6 +498,24 @@ pub fn map(handle_raw: u32, flags: u32) -> i64 {
             _ => KernelError::NotSupported.to_errno(),
         }
     });
+
+    // Deferred shmem mapping (shmem::map calls with_scheduler — must be outside table lock)
+    if let Some(shmem_id) = shmem_deferred {
+        match shmem::map(task_id, shmem_id) {
+            Ok((vaddr, _paddr)) => {
+                // Store vaddr back in the ShmemObject
+                let _ = object_service().with_table_mut(task_id, |table| {
+                    if let Some(entry) = table.get_mut(handle) {
+                        if let Object::Shmem(s) = &mut entry.object {
+                            s.set_vaddr(vaddr);
+                        }
+                    }
+                });
+                return vaddr as i64;
+            }
+            Err(e) => return e,
+        }
+    }
 
     // Phase 2-3: Ring deferred mapping (scheduler call outside table lock)
     if let Some(deferred) = ring_deferred {
@@ -2465,29 +2534,9 @@ fn write_shmem(s: &mut super::ShmemObject, buf_ptr: u64, buf_len: usize, task_id
         }
         1 => {
             // NOTIFY: wake waiters
-            // NOTE: We return a special value to indicate notify_shmem_objects should be
-            // called AFTER the ObjectService lock is released. The actual notification
-            // is done by shmem::notify() and the return value is handled by the caller.
-            let shmem_id = s.shmem_id();
-
-            let result = shmem::notify(task_id, shmem_id);
-
-            // Return result with high bit set to indicate pending notify_shmem_objects
-            // We encode: (shmem_id << 32) | result, but since we return i64,
-            // we use a simpler approach: return (result | PENDING_NOTIFY_FLAG)
-            // and store shmem_id in the ShmemObject for later retrieval.
-            // Actually, we'll use a different approach: write_shmem_notify returns
-            // both the result AND the shmem_id, and the caller handles notify_shmem_objects.
-            match result {
-                Ok(woken) => {
-                    // Encode: positive result in low bits, shmem_id in high bits
-                    // We return a special struct or just return the result and let caller
-                    // do the notify based on checking if it was a NOTIFY command.
-                    // Simplest: just return the result; caller checks if buf_len==1 && cmd==1
-                    woken as i64
-                }
-                Err(e) => e,
-            }
+            // shmem::notify() calls with_scheduler — must be deferred outside table lock.
+            // Caller detects cmd==1 and creates PendingAction::ShmemNotify.
+            0
         }
         2 => {
             // SET_PUBLIC: make region accessible by any process
@@ -2958,18 +3007,16 @@ fn read_ring(r: &mut super::RingObject, _buf_ptr: u64, _buf_len: usize, task_id:
 /// - After writing data to TX ring, call write() to wake peer
 /// - buf contains optional notification data (usually empty)
 ///
-/// Returns: 0 on success, negative error
-fn write_ring(r: &mut super::RingObject, _buf_ptr: u64, _buf_len: usize, _task_id: u32) -> i64 {
-    use crate::kernel::ipc::waker::WakeList;
-
-    // Wake peer if subscribed
+/// Returns: (errno, WakeList) — caller wakes OUTSIDE table lock
+fn write_ring(r: &mut super::RingObject, _buf_ptr: u64, _buf_len: usize, _task_id: u32) -> (i64, waker::WakeList) {
+    // Collect subscriber for deferred wake (lock ordering: OBJ_SERVICE before SCHEDULER)
     if let Some(sub) = r.subscriber() {
-        let mut wake_list = WakeList::new();
+        let mut wake_list = waker::WakeList::new();
         wake_list.push(sub);
-        waker::wake(&wake_list, ipc::WakeReason::Readable);
+        (0, wake_list)
+    } else {
+        (0, waker::WakeList::new())
     }
-
-    0 // Success
 }
 
 /// Write a BusDevice to a bus (RegisterDevice from probed)

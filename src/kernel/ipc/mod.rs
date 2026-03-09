@@ -117,8 +117,8 @@ use port::PortRegistry;
 
 use super::lock::SpinLock;
 
-/// Global channel table
-static CHANNEL_TABLE: SpinLock<ChannelTable> = SpinLock::new(crate::kernel::lock::lock_class::SUBSYSTEM, ChannelTable::new());
+/// Global channel table — class CHANNEL (28), locked before PORT_REGISTRY (30)
+static CHANNEL_TABLE: SpinLock<ChannelTable> = SpinLock::new(crate::kernel::lock::lock_class::CHANNEL, ChannelTable::new());
 
 /// Global port registry
 static PORT_REGISTRY: SpinLock<PortRegistry> = SpinLock::new(crate::kernel::lock::lock_class::SUBSYSTEM, PortRegistry::new());

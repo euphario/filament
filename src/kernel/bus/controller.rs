@@ -16,6 +16,40 @@ use crate::{kinfo, kdebug, kerror};
 /// Maximum devices per bus (for tracking bus mastering)
 pub const MAX_DEVICES_PER_BUS: usize = 32;
 
+/// Deferred wakes — collected inside bus registry lock, executed outside.
+///
+/// Lock ordering requires OBJ_SERVICE(20) before BUS(25), but bus controller
+/// methods run inside with_bus_registry (BUS=25). wake_channel needs OBJ_SERVICE.
+/// Solution: collect PeerInfo during bus operations, wake after releasing BUS lock.
+pub struct DeferredWakes {
+    peers: [Option<(ipc::PeerInfo, u8)>; 8], // (peer, event_filter)
+    count: usize,
+}
+
+impl DeferredWakes {
+    pub const fn new() -> Self {
+        Self { peers: [None; 8], count: 0 }
+    }
+
+    pub fn push(&mut self, peer: ipc::PeerInfo, event: u8) {
+        if self.count < self.peers.len() {
+            self.peers[self.count] = Some((peer, event));
+            self.count += 1;
+        }
+    }
+
+    /// Execute all deferred wakes. Must be called OUTSIDE the bus registry lock.
+    pub fn execute(self) {
+        for i in 0..self.count {
+            if let Some((peer, event)) = self.peers[i] {
+                let wake_list = crate::kernel::object_service::object_service()
+                    .wake_channel(peer.task_id, peer.channel_id, event);
+                waker::wake(&wake_list, WakeReason::Readable);
+            }
+        }
+    }
+}
+
 /// Bus control port name prefix
 pub const BUS_PORT_PREFIX: &str = "/";
 
@@ -533,7 +567,7 @@ impl BusController {
     /// Accepts one owner connection at a time. Bus must be in Safe state.
     /// Supervisor (devd) channels are set separately when devd connects
     /// via the supervision protocol.
-    pub fn handle_connect(&mut self, client_channel: ChannelId, client_pid: Pid) -> Result<(), BusError> {
+    pub fn handle_connect(&mut self, client_channel: ChannelId, client_pid: Pid, wakes: &mut DeferredWakes) -> Result<(), BusError> {
         if self.state != BusState::Safe {
             return Err(BusError::Busy);
         }
@@ -559,15 +593,17 @@ impl BusController {
             crate::klog::suppress_drain();
         }
 
-        // Send state snapshot to owner so it knows hardware details
-        self.send_state_snapshot(client_channel)?;
+        // Send state snapshot to owner — collect peer for deferred wake
+        if let Some(peer) = self.send_state_snapshot(client_channel)? {
+            wakes.push(peer, abi::mux_filter::READABLE);
+        }
 
         // Send enumerated device list (if any devices)
-        self.send_device_list(client_channel)?;
+        self.send_device_list(client_channel, wakes)?;
 
         // CPU bus: send OPP table so cpud knows available frequencies
         if self.bus_type == BusType::Cpu {
-            crate::kernel::power::push_opp_table_to_bus(client_channel);
+            crate::kernel::power::push_opp_table_to_bus(client_channel, wakes);
         }
 
         Ok(())
@@ -583,15 +619,13 @@ impl BusController {
     }
 
     /// Handle owner (driver) disconnecting/exiting
-    pub fn handle_owner_exit(&mut self, owner_pid: Pid) {
+    pub fn handle_owner_exit(&mut self, owner_pid: Pid, wakes: &mut DeferredWakes) {
         kdebug!("bus", "owner_exit"; name = self.port_name_str(), pid = owner_pid as u64);
 
-        // Close the kernel-owned owner channel
+        // Close the kernel-owned owner channel — collect peer for deferred wake
         if let Some(ch) = self.owner_ch {
             if let Ok(Some(peer)) = ipc::close_unchecked(ch) {
-                let wake_list = crate::kernel::object_service::object_service()
-                    .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::CLOSED);
-                waker::wake(&wake_list, WakeReason::Closed);
+                wakes.push(peer, abi::mux_filter::CLOSED);
             }
         }
 
@@ -612,7 +646,7 @@ impl BusController {
     }
 
     /// Handle atomic handoff to new owner
-    pub fn handle_handoff(&mut self, new_channel: ChannelId, new_pid: Pid) -> Result<(), BusError> {
+    pub fn handle_handoff(&mut self, new_channel: ChannelId, new_pid: Pid, wakes: &mut DeferredWakes) -> Result<(), BusError> {
         if self.state != BusState::Claimed {
             return Err(BusError::NotClaimed);
         }
@@ -623,15 +657,19 @@ impl BusController {
         self.owner_ch = Some(new_channel);
         self.owner_pid = Some(new_pid);
 
-        // Send snapshot and device list to new owner
-        self.send_state_snapshot(new_channel)?;
-        self.send_device_list(new_channel)?;
+        // Send snapshot and device list to new owner (wakes deferred)
+        if let Some(peer) = self.send_state_snapshot(new_channel)? {
+            wakes.push(peer, abi::mux_filter::READABLE);
+        }
+        self.send_device_list(new_channel, wakes)?;
 
         Ok(())
     }
 
     /// Send state snapshot to a channel
-    fn send_state_snapshot(&self, channel: ChannelId) -> Result<(), BusError> {
+    /// Send state snapshot, returning peer info for deferred wake.
+    /// Caller must wake the peer OUTSIDE the bus registry lock.
+    fn send_state_snapshot(&self, channel: ChannelId) -> Result<Option<ipc::PeerInfo>, BusError> {
         let snapshot = StateSnapshot {
             msg_type: BusControlMsgType::StateSnapshot as u8,
             bus_type: self.bus_type as u8,
@@ -652,12 +690,7 @@ impl BusController {
             msg.payload[..bytes.len()].copy_from_slice(&bytes);
 
             match ipc::send_unchecked(channel, msg) {
-                Ok(peer) => {
-                    let wake_list = crate::kernel::object_service::object_service()
-                        .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
-                    waker::wake(&wake_list, WakeReason::Readable);
-                    Ok(())
-                }
+                Ok(peer) => Ok(Some(peer)),
                 Err(_) => Err(BusError::SendFailed),
             }
         }
@@ -813,7 +846,7 @@ impl BusController {
 
     /// Send device list to a channel (after StateSnapshot)
     /// Chunks devices into IPC-sized messages (max 17 per chunk at 32 bytes each)
-    fn send_device_list(&self, channel: ChannelId) -> Result<(), BusError> {
+    fn send_device_list(&self, channel: ChannelId, wakes: &mut DeferredWakes) -> Result<(), BusError> {
         if self.enum_count == 0 {
             return Ok(());
         }
@@ -854,9 +887,7 @@ impl BusController {
 
             match ipc::send_unchecked(channel, msg) {
                 Ok(peer) => {
-                    let wake_list = crate::kernel::object_service::object_service()
-                        .wake_channel(peer.task_id, peer.channel_id, abi::mux_filter::READABLE);
-                    waker::wake(&wake_list, WakeReason::Readable);
+                    wakes.push(peer, abi::mux_filter::READABLE);
                 }
                 Err(_) => return Err(BusError::SendFailed),
             }
