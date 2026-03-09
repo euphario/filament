@@ -4,15 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libsys = { path = "../libsys" }
+# Target-only deps: libsys needs bare-metal, crypto crates conflict with host core
+libsys = { path = "../libsys", optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+hmac = { version = "0.12", default-features = false, optional = true }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"], optional = true }
+chacha20 = { version = "0.9", default-features = false, optional = true }
+poly1305 = { version = "0.8", default-features = false, optional = true }
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"], optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"], optional = true }
+sha1 = { version = "0.10", default-features = false, optional = true }
+aes = { version = "0.8", default-features = false, optional = true }
 
-# RustCrypto crates (all no_std compatible)
-sha2 = { version = "0.10", default-features = false }
-hmac = { version = "0.12", default-features = false }
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
-chacha20 = { version = "0.9", default-features = false }
-poly1305 = { version = "0.8", default-features = false }
-curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
-sha1 = { version = "0.10", default-features = false }
-aes = { version = "0.8", default-features = false }
+[features]
+default = ["target"]
+# Enable all target-only deps (libsys + crypto). Disabled for host tests.
+target = ["libsys", "sha2", "hmac", "chacha20poly1305", "chacha20", "poly1305",
+          "curve25519-dalek", "ed25519-dalek", "sha1", "aes"]

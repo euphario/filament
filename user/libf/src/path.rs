@@ -170,8 +170,9 @@ impl Path {
 
         // Strip trailing slashes for parent calculation
         let bytes = strip_trailing_sep(&self.inner);
-        if bytes.is_empty() {
-            // Was all slashes (root) — no parent
+
+        // Root or all-slashes → no parent
+        if bytes.is_empty() || (bytes.len() == 1 && bytes[0] == SEP) {
             return None;
         }
 
@@ -183,11 +184,7 @@ impl Path {
             Some(pos) => Some(Path::new(&self.inner[..pos])),
             None => {
                 // No slash — relative path, parent is empty
-                if bytes.len() == self.inner.len() {
-                    Some(Path::new(b""))
-                } else {
-                    None
-                }
+                Some(Path::new(b""))
             }
         }
     }
@@ -317,7 +314,10 @@ impl Path {
                 Component::ParentDir => {
                     // Pop last component if there is one
                     if let Some(last_sep) = out.iter().rposition(|&b| b == SEP) {
-                        if absolute || last_sep > 0 {
+                        if last_sep == 0 && absolute {
+                            // Don't go above root — truncate to just "/"
+                            out.truncate(1);
+                        } else {
                             out.truncate(last_sep);
                         }
                     } else if !absolute && !out.is_empty() {

@@ -1,0 +1,2 @@
+# Intentionally empty — cannot override parent's build-std here.
+# Use `./test.sh` to run host tests (it uses CARGO env vars to bypass parent config).

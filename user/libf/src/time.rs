@@ -244,18 +244,20 @@ impl fmt::Display for Duration {
 }
 
 // ============================================================================
-// Instant
+// Instant (requires libsys — not available in host test builds)
 // ============================================================================
 
 /// A point in monotonic time — mirrors `std::time::Instant`.
 ///
 /// Wraps `libsys::syscall::gettime()` which returns nanoseconds
 /// from an unspecified monotonic epoch.
+#[cfg(feature = "target")]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Instant {
     ns: u64,
 }
 
+#[cfg(feature = "target")]
 impl Instant {
     /// Returns the current time.
     pub fn now() -> Self {
@@ -302,6 +304,7 @@ impl Instant {
     }
 }
 
+#[cfg(feature = "target")]
 impl Add<Duration> for Instant {
     type Output = Instant;
     fn add(self, rhs: Duration) -> Instant {
@@ -309,12 +312,14 @@ impl Add<Duration> for Instant {
     }
 }
 
+#[cfg(feature = "target")]
 impl AddAssign<Duration> for Instant {
     fn add_assign(&mut self, rhs: Duration) {
         *self = *self + rhs;
     }
 }
 
+#[cfg(feature = "target")]
 impl Sub<Duration> for Instant {
     type Output = Instant;
     fn sub(self, rhs: Duration) -> Instant {
@@ -322,12 +327,14 @@ impl Sub<Duration> for Instant {
     }
 }
 
+#[cfg(feature = "target")]
 impl SubAssign<Duration> for Instant {
     fn sub_assign(&mut self, rhs: Duration) {
         *self = *self - rhs;
     }
 }
 
+#[cfg(feature = "target")]
 impl Sub<Instant> for Instant {
     type Output = Duration;
     fn sub(self, rhs: Instant) -> Duration {
@@ -335,6 +342,7 @@ impl Sub<Instant> for Instant {
     }
 }
 
+#[cfg(feature = "target")]
 impl fmt::Debug for Instant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Instant({}ns)", self.ns)
