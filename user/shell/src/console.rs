@@ -81,7 +81,7 @@ impl Console {
                     p = Some(pipe);
                     break;
                 }
-                syscall::sleep_ns(Duration::from_millis(1).as_nanos_saturating());
+                libf::time::sleep(Duration::from_millis(1));
             }
             match p {
                 Some(pipe) => pipe,

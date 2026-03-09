@@ -254,6 +254,16 @@ impl fmt::Display for Duration {
 }
 
 // ============================================================================
+// sleep (requires libsys — not available in host test builds)
+// ============================================================================
+
+/// Sleep for a `Duration` — mirrors `std::thread::sleep`.
+#[cfg(feature = "target")]
+pub fn sleep(duration: Duration) {
+    libsys::syscall::sleep_ns(duration.as_nanos_saturating());
+}
+
+// ============================================================================
 // Instant (requires libsys — not available in host test builds)
 // ============================================================================
 

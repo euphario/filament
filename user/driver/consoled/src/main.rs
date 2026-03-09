@@ -232,7 +232,7 @@ impl ConsoledDriver {
         self.shell_pid = None;
 
         // Respawn after brief delay
-        syscall::sleep_ns(Duration::from_millis(100).as_nanos_saturating());
+        libf::time::sleep(Duration::from_millis(100));
 
         // Drain stale UART input
         let mut buf = [0u8; 64];

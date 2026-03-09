@@ -1361,7 +1361,7 @@ fn main() {
         match TcpListener::bind(addr) {
             Ok(l) => break l,
             Err(_) => {
-                syscall::sleep_ns(Duration::from_secs(1).as_nanos_saturating());
+                libf::time::sleep(Duration::from_secs(1));
             }
         }
     };
@@ -1394,13 +1394,13 @@ fn main() {
 
         // Re-bind for next connection
         drop(listener);
-        syscall::sleep_ns(Duration::from_millis(100).as_nanos_saturating());
+        libf::time::sleep(Duration::from_millis(100));
         listener = loop {
             let addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED, SSH_PORT);
             match TcpListener::bind(addr) {
                 Ok(l) => break l,
                 Err(_) => {
-                    syscall::sleep_ns(Duration::from_millis(500).as_nanos_saturating());
+                    libf::time::sleep(Duration::from_millis(500));
                 }
             }
         };
