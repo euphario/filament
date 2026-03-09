@@ -1,6 +1,6 @@
 //! FAT16/FAT32 Filesystem Driver
 //!
-//! Read-only FAT16/FAT32 driver that serves the VFS protocol over DataPort.
+//! Read-write FAT16/FAT32 driver that serves the VFS protocol over DataPort.
 //! Consumes a partition block port, provides a VFS protocol port.
 //!
 //! ## Architecture
@@ -8,7 +8,7 @@
 //! ```text
 //! ┌─────────────────────────────────────┐
 //! │  vfsd (connects as consumer)       │
-//! │  VFS protocol: OPEN, READ, READDIR │
+//! │  VFS protocol: full read/write     │
 //! ├─────────────────────────────────────┤
 //! │  fatfsd (this driver)              │
 //! │  provides: fat0: (Filesystem)      │
@@ -26,7 +26,7 @@
 //! 3. Reads BPB at sector 0, detects FAT16 or FAT32
 //! 4. Caches FAT table (windowed for FAT32)
 //! 5. Creates VFS DataPort (provider), registers as Filesystem port
-//! 6. Serves VFS requests: OPEN, READ, READDIR, STAT, CLOSE
+//! 6. Serves VFS requests: OPEN, READ, WRITE, READDIR, STAT, MKDIR, UNLINK, CLOSE
 
 #![no_std]
 #![no_main]
@@ -55,11 +55,18 @@ struct OpenFile {
     is_dir: bool,
     start_cluster: u32,
     size: u32,
+    /// LBA of the directory sector containing this file's entry (for size updates).
+    dir_entry_lba: u64,
+    /// Byte offset within that sector (0..511) of the 32-byte dir entry.
+    dir_entry_offset: u16,
 }
 
 impl OpenFile {
     const fn empty() -> Self {
-        Self { in_use: false, is_dir: false, start_cluster: 0, size: 0 }
+        Self {
+            in_use: false, is_dir: false, start_cluster: 0, size: 0,
+            dir_entry_lba: 0, dir_entry_offset: 0,
+        }
     }
 }
 
@@ -97,6 +104,11 @@ struct FatfsDriver {
     fat_cache_base: u32,
     fat_cache_valid: bool,
 
+    // FAT write support — dirty tracking (1 bit per cache entry, 128 u64 words)
+    fat_cache_dirty: [u64; FAT_CACHE_ENTRIES / 64],
+    /// Next cluster index to check when allocating (avoids O(n) scan every time)
+    free_cluster_hint: u32,
+
     // Open files
     open_files: [OpenFile; MAX_OPEN_FILES],
 
@@ -126,6 +138,8 @@ impl FatfsDriver {
             fat_cache: [0u32; FAT_CACHE_ENTRIES],
             fat_cache_base: 0,
             fat_cache_valid: false,
+            fat_cache_dirty: [0u64; FAT_CACHE_ENTRIES / 64],
+            free_cluster_hint: 2,
             open_files: [OpenFile::empty(); MAX_OPEN_FILES],
             port_name: [0; 32],
             port_name_len: 0,
@@ -173,6 +187,46 @@ impl FatfsDriver {
                     }
                     port.free(offset);
                     return false;
+                }
+            }
+            port.wait(10);
+        }
+        port.free(offset);
+        false
+    }
+
+    fn write_block(&self, lba: u64, data: &[u8], ctx: &mut dyn BusCtx) -> bool {
+        let port_id = match self.consumer_port {
+            Some(id) => id,
+            None => return false,
+        };
+
+        let port = match ctx.block_port(port_id) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let len = data.len() as u32;
+        let offset = match port.alloc(len) {
+            Some(o) => o,
+            None => return false,
+        };
+
+        // Copy data into pool, then submit write
+        port.pool_write(offset, data);
+
+        let tag = match port.submit_write(lba, offset, len) {
+            Ok(t) => t,
+            Err(_) => { port.free(offset); return false; }
+        };
+
+        port.notify();
+
+        for _ in 0..100 {
+            if let Some(cqe) = port.poll_completion() {
+                if cqe.tag == tag {
+                    port.free(offset);
+                    return cqe.status == io_status::OK as u16;
                 }
             }
             port.wait(10);
@@ -361,6 +415,221 @@ impl FatfsDriver {
     }
 
     // =========================================================================
+    // FAT mutation (write support)
+    // =========================================================================
+
+    fn mark_fat_dirty(&mut self, cache_idx: usize) {
+        let word = cache_idx / 64;
+        let bit = cache_idx % 64;
+        self.fat_cache_dirty[word] |= 1u64 << bit;
+    }
+
+    fn is_fat_dirty(&self, cache_idx: usize) -> bool {
+        let word = cache_idx / 64;
+        let bit = cache_idx % 64;
+        (self.fat_cache_dirty[word] >> bit) & 1 != 0
+    }
+
+    /// Write a FAT entry in the cache and mark it dirty.
+    fn set_fat_entry(&mut self, cluster: u32, value: u32) {
+        if cluster < self.fat_cache_base {
+            return;
+        }
+        let idx = (cluster - self.fat_cache_base) as usize;
+        if idx >= FAT_CACHE_ENTRIES {
+            return;
+        }
+        self.fat_cache[idx] = if self.is_fat32 { value & 0x0FFF_FFFF } else { value };
+        self.mark_fat_dirty(idx);
+    }
+
+    /// Flush all dirty FAT cache entries to disk.
+    ///
+    /// Groups dirty entries by sector, reads each sector, patches the modified
+    /// entries, and writes it back to both FAT copies.
+    fn flush_fat(&mut self, ctx: &mut dyn BusCtx) -> bool {
+        let entry_size: u32 = if self.is_fat32 { 4 } else { 2 };
+        let bps = self.bytes_per_sector as u32;
+        let entries_per_sector = bps / entry_size;
+        let mut sector_buf = [0u8; 512];
+
+        // Scan dirty words to find which sectors need flushing
+        let mut idx = 0usize;
+        while idx < FAT_CACHE_ENTRIES {
+            let word = idx / 64;
+            if word >= self.fat_cache_dirty.len() {
+                break;
+            }
+            if self.fat_cache_dirty[word] == 0 {
+                idx += 64;
+                continue;
+            }
+
+            // Found a dirty word — process each set bit
+            let mut bits = self.fat_cache_dirty[word];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let cache_idx = word * 64 + bit;
+                bits &= bits - 1; // Clear lowest set bit
+
+                let cluster = self.fat_cache_base + cache_idx as u32;
+
+                // Which FAT sector does this cluster entry live in?
+                let byte_offset = cluster as u64 * entry_size as u64;
+                let fat_sector = (byte_offset / bps as u64) as u32;
+                let offset_in_sector = (byte_offset % bps as u64) as usize;
+
+                // Read the FAT sector
+                let fat_lba = self.fat_start_lba as u64 + fat_sector as u64;
+                if !self.read_block(fat_lba, &mut sector_buf[..bps as usize], ctx) {
+                    uerror!("fatfsd", "flush_fat_read_failed"; sector = fat_sector);
+                    return false;
+                }
+
+                // Patch ALL dirty entries that fall in this same sector
+                let sector_base_cluster = (fat_sector as u64 * bps as u64 / entry_size as u64) as u32;
+                let sector_end_cluster = sector_base_cluster + entries_per_sector;
+
+                for cl in sector_base_cluster..sector_end_cluster {
+                    if cl < self.fat_cache_base {
+                        continue;
+                    }
+                    let ci = (cl - self.fat_cache_base) as usize;
+                    if ci >= FAT_CACHE_ENTRIES || !self.is_fat_dirty(ci) {
+                        continue;
+                    }
+                    let off = ((cl - sector_base_cluster) * entry_size) as usize;
+                    if self.is_fat32 {
+                        // Preserve upper 4 bits of existing entry
+                        let existing = u32::from_le_bytes([
+                            sector_buf[off], sector_buf[off+1],
+                            sector_buf[off+2], sector_buf[off+3],
+                        ]);
+                        let val = (existing & 0xF000_0000) | (self.fat_cache[ci] & 0x0FFF_FFFF);
+                        sector_buf[off..off+4].copy_from_slice(&val.to_le_bytes());
+                    } else {
+                        let val = self.fat_cache[ci] as u16;
+                        sector_buf[off..off+2].copy_from_slice(&val.to_le_bytes());
+                    }
+                    // Clear dirty bit
+                    let w = ci / 64;
+                    let b = ci % 64;
+                    self.fat_cache_dirty[w] &= !(1u64 << b);
+                }
+
+                // Write to FAT copy 1
+                if !self.write_block(fat_lba, &sector_buf[..bps as usize], ctx) {
+                    uerror!("fatfsd", "flush_fat_write_failed"; sector = fat_sector);
+                    return false;
+                }
+
+                // Write to FAT copy 2 (if present)
+                if self.num_fats > 1 {
+                    let fat2_lba = fat_lba + self.fat_size_sectors as u64;
+                    if !self.write_block(fat2_lba, &sector_buf[..bps as usize], ctx) {
+                        uerror!("fatfsd", "flush_fat2_write_failed"; sector = fat_sector);
+                        // Non-fatal: FAT1 is the primary
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Allocate a free cluster. Returns the cluster number or None if full.
+    fn alloc_cluster(&mut self, ctx: &mut dyn BusCtx) -> Option<u32> {
+        let entry_size: u32 = if self.is_fat32 { 4 } else { 2 };
+        let total_fat_entries = (self.fat_size_sectors * self.bytes_per_sector as u32) / entry_size;
+        // Clusters 0 and 1 are reserved
+        let max_cluster = total_fat_entries.min(self.total_sectors / self.sectors_per_cluster as u32 + 2);
+
+        let start = self.free_cluster_hint.max(2);
+
+        // Scan from hint to end, then wrap around from 2 to hint
+        for pass in 0..2 {
+            let (from, to) = if pass == 0 { (start, max_cluster) } else { (2, start) };
+
+            let mut cluster = from;
+            while cluster < to {
+                // Ensure this cluster is in the cache window
+                if !self.fat_cache_valid
+                    || cluster < self.fat_cache_base
+                    || (cluster - self.fat_cache_base) as usize >= FAT_CACHE_ENTRIES
+                {
+                    // Flush dirty entries before sliding the window
+                    if !self.flush_fat(ctx) {
+                        return None;
+                    }
+                    if !self.cache_fat_window(cluster, ctx) {
+                        return None;
+                    }
+                }
+
+                let idx = (cluster - self.fat_cache_base) as usize;
+                if self.fat_cache[idx] == 0 {
+                    // Free cluster found — mark as end-of-chain
+                    let eoc = if self.is_fat32 { 0x0FFF_FFFF } else { 0xFFFF };
+                    self.fat_cache[idx] = eoc;
+                    self.mark_fat_dirty(idx);
+                    self.free_cluster_hint = cluster + 1;
+                    return Some(cluster);
+                }
+                cluster += 1;
+            }
+        }
+        None // Disk full
+    }
+
+    /// Link `new_cluster` to the end of the chain ending at `last_cluster`.
+    fn extend_chain(&mut self, last_cluster: u32, new_cluster: u32, ctx: &mut dyn BusCtx) -> bool {
+        // Ensure last_cluster is in cache
+        if !self.fat_cache_valid
+            || last_cluster < self.fat_cache_base
+            || (last_cluster - self.fat_cache_base) as usize >= FAT_CACHE_ENTRIES
+        {
+            if !self.flush_fat(ctx) { return false; }
+            if !self.cache_fat_window(last_cluster, ctx) { return false; }
+        }
+        self.set_fat_entry(last_cluster, new_cluster);
+        true
+    }
+
+    /// Free an entire cluster chain starting at `cluster`.
+    fn free_chain(&mut self, mut cluster: u32, ctx: &mut dyn BusCtx) -> bool {
+        loop {
+            if cluster < 2 {
+                break;
+            }
+
+            // Ensure cluster is in cache
+            if !self.fat_cache_valid
+                || cluster < self.fat_cache_base
+                || (cluster - self.fat_cache_base) as usize >= FAT_CACHE_ENTRIES
+            {
+                if !self.flush_fat(ctx) { return false; }
+                if !self.cache_fat_window(cluster, ctx) { return false; }
+            }
+
+            let idx = (cluster - self.fat_cache_base) as usize;
+            let next = self.fat_cache[idx];
+            self.fat_cache[idx] = 0; // Mark as free
+            self.mark_fat_dirty(idx);
+
+            // Update hint if this cluster is earlier
+            if cluster < self.free_cluster_hint {
+                self.free_cluster_hint = cluster;
+            }
+
+            let eoc = if self.is_fat32 { 0x0FFF_FFF8 } else { 0xFFF8 };
+            if next >= eoc || next < 2 {
+                break;
+            }
+            cluster = next;
+        }
+        true
+    }
+
+    // =========================================================================
     // FAT16 directory entry parsing
     // =========================================================================
 
@@ -513,24 +782,86 @@ impl FatfsDriver {
             return;
         }
 
+        let is_create = (flags & open_flags::CREATE) != 0;
+        let is_trunc = (flags & open_flags::TRUNC) != 0;
+
         // Search root directory for the file
         match self.find_in_root(path, ctx) {
-            Some((is_dir, start_cluster, file_size)) => {
+            Some((is_dir, start_cluster, file_size, entry_lba, entry_off)) => {
                 if is_dir_open && !is_dir {
                     Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NOT_DIR);
                     return;
                 }
+
+                let (final_cluster, final_size) = if is_trunc && !is_dir {
+                    // Truncate: free existing cluster chain, update dir entry
+                    if start_cluster >= 2 {
+                        self.free_chain(start_cluster, ctx);
+                        self.flush_fat(ctx);
+                    }
+                    self.update_dir_entry_size(entry_lba, entry_off, 0, ctx);
+                    // Allocate a fresh cluster for the now-empty file
+                    let cl = self.alloc_cluster(ctx).unwrap_or(0);
+                    if cl >= 2 {
+                        self.flush_fat(ctx);
+                        // Update cluster in dir entry
+                        self.update_dir_entry_cluster(entry_lba, entry_off, cl, ctx);
+                    }
+                    (cl, 0)
+                } else {
+                    (start_cluster, file_size)
+                };
+
                 if let Some(handle) = self.alloc_handle() {
-                    self.open_files[handle as usize].is_dir = is_dir;
-                    self.open_files[handle as usize].start_cluster = start_cluster;
-                    self.open_files[handle as usize].size = file_size;
+                    let f = &mut self.open_files[handle as usize];
+                    f.is_dir = is_dir;
+                    f.start_cluster = final_cluster;
+                    f.size = final_size;
+                    f.dir_entry_lba = entry_lba;
+                    f.dir_entry_offset = entry_off;
                     Self::complete_vfs_result(ctx, vfs_id, sqe.tag, handle, 0);
                 } else {
                     Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::TOO_MANY);
                 }
             }
             None => {
-                Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NOT_FOUND);
+                if !is_create {
+                    Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NOT_FOUND);
+                    return;
+                }
+
+                // CREATE: allocate cluster and create directory entry
+                let cluster = match self.alloc_cluster(ctx) {
+                    Some(c) => c,
+                    None => {
+                        Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NO_SPACE);
+                        return;
+                    }
+                };
+                if !self.flush_fat(ctx) {
+                    Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+                    return;
+                }
+
+                let (entry_lba, entry_off) = match self.create_dir_entry(0, path, false, cluster, ctx) {
+                    Some(pos) => pos,
+                    None => {
+                        Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+                        return;
+                    }
+                };
+
+                if let Some(handle) = self.alloc_handle() {
+                    let f = &mut self.open_files[handle as usize];
+                    f.is_dir = false;
+                    f.start_cluster = cluster;
+                    f.size = 0;
+                    f.dir_entry_lba = entry_lba;
+                    f.dir_entry_offset = entry_off;
+                    Self::complete_vfs_result(ctx, vfs_id, sqe.tag, handle, 0);
+                } else {
+                    Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::TOO_MANY);
+                }
             }
         }
     }
@@ -806,32 +1137,508 @@ impl FatfsDriver {
         Self::complete_vfs_result(ctx, vfs_id, sqe.tag, 0, 0);
     }
 
+    fn handle_vfs_write(&mut self, sqe: &IoSqe, ctx: &mut dyn BusCtx) {
+        let vfs_id = match self.vfs_port {
+            Some(id) => id,
+            None => return,
+        };
+        let handle = sqe.param as u32;
+        let file_offset = sqe.lba;
+        let data_pool_offset = sqe.data_offset;
+        let data_len = sqe.data_len;
+
+        let file = match self.get_file(handle) {
+            Some(f) => *f,
+            None => {
+                Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NOT_FOUND);
+                return;
+            }
+        };
+
+        if file.is_dir {
+            Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IS_DIR);
+            return;
+        }
+
+        if data_len == 0 {
+            Self::complete_vfs_result(ctx, vfs_id, sqe.tag, 0, 0);
+            return;
+        }
+
+        let cluster_sz = self.cluster_size();
+        let bps = self.bytes_per_sector as usize;
+        let spc = self.sectors_per_cluster as u32;
+
+        // Walk to the cluster at file_offset, extending chain as needed
+        let target_cluster_idx = (file_offset / cluster_sz as u64) as u32;
+
+        // If file has no cluster yet (empty file after CREATE), allocate one
+        let mut start_cluster = file.start_cluster;
+        if start_cluster < 2 {
+            match self.alloc_cluster(ctx) {
+                Some(c) => {
+                    start_cluster = c;
+                    self.open_files[handle as usize].start_cluster = c;
+                    // Update dir entry with new cluster
+                    self.update_dir_entry_cluster(
+                        file.dir_entry_lba, file.dir_entry_offset, c, ctx,
+                    );
+                    self.flush_fat(ctx);
+                }
+                None => {
+                    Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NO_SPACE);
+                    return;
+                }
+            }
+        }
+
+        let mut cluster = start_cluster;
+        let mut last_cluster = cluster;
+
+        for _ in 0..target_cluster_idx {
+            last_cluster = cluster;
+            match self.next_cluster(cluster, ctx) {
+                Some(c) => cluster = c,
+                None => {
+                    // Need to extend chain
+                    let new_c = match self.alloc_cluster(ctx) {
+                        Some(c) => c,
+                        None => {
+                            Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NO_SPACE);
+                            return;
+                        }
+                    };
+                    if !self.extend_chain(last_cluster, new_c, ctx) || !self.flush_fat(ctx) {
+                        Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+                        return;
+                    }
+                    cluster = new_c;
+                }
+            }
+        }
+
+        // Now write data sector by sector
+        let mut total_written = 0u32;
+        let mut cluster_offset = (file_offset % cluster_sz as u64) as u32;
+        let mut sector_buf = [0u8; 512];
+        let mut src_buf = [0u8; 512];
+        last_cluster = cluster;
+
+        while total_written < data_len {
+            let sector_in_cluster = cluster_offset / self.bytes_per_sector as u32;
+            let offset_in_sector = cluster_offset % self.bytes_per_sector as u32;
+            let lba_base = self.cluster_to_lba(cluster);
+
+            for sec in sector_in_cluster..spc {
+                if total_written >= data_len {
+                    break;
+                }
+
+                let sec_lba = lba_base + sec as u64;
+                let start = if sec == sector_in_cluster { offset_in_sector as usize } else { 0 };
+                let available = bps - start;
+                let needed = (data_len - total_written) as usize;
+                let copy_len = available.min(needed);
+
+                // If partial sector write, read-modify-write
+                if start > 0 || copy_len < bps {
+                    if !self.read_block(sec_lba, &mut sector_buf[..bps], ctx) {
+                        Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+                        return;
+                    }
+                }
+
+                // Read source data from VFS pool
+                if let Some(port) = ctx.block_port(vfs_id) {
+                    let src_offset = data_pool_offset + total_written;
+                    if let Some(slice) = port.pool_slice(src_offset, copy_len as u32) {
+                        src_buf[..copy_len].copy_from_slice(slice);
+                    }
+                }
+                sector_buf[start..start + copy_len].copy_from_slice(&src_buf[..copy_len]);
+
+                if !self.write_block(sec_lba, &sector_buf[..bps], ctx) {
+                    Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+                    return;
+                }
+
+                total_written += copy_len as u32;
+            }
+
+            cluster_offset = 0;
+
+            // Move to next cluster if more data to write
+            if total_written < data_len {
+                last_cluster = cluster;
+                match self.next_cluster(cluster, ctx) {
+                    Some(c) => cluster = c,
+                    None => {
+                        let new_c = match self.alloc_cluster(ctx) {
+                            Some(c) => c,
+                            None => {
+                                // Partial write — update size and return what we wrote
+                                break;
+                            }
+                        };
+                        if !self.extend_chain(last_cluster, new_c, ctx) || !self.flush_fat(ctx) {
+                            break;
+                        }
+                        cluster = new_c;
+                    }
+                }
+            }
+        }
+
+        // Update file size if it grew
+        let end_offset = file_offset as u32 + total_written;
+        if end_offset > file.size {
+            self.open_files[handle as usize].size = end_offset;
+            self.update_dir_entry_size(file.dir_entry_lba, file.dir_entry_offset, end_offset, ctx);
+        }
+
+        Self::complete_vfs_result(ctx, vfs_id, sqe.tag, 0, total_written);
+    }
+
+    fn handle_vfs_mkdir(&mut self, sqe: &IoSqe, ctx: &mut dyn BusCtx) {
+        let vfs_id = match self.vfs_port {
+            Some(id) => id,
+            None => return,
+        };
+
+        // Read path from pool
+        let mut path_buf = [0u8; 256];
+        let path_len = (sqe.data_len as usize).min(256);
+        let path = {
+            if let Some(port) = ctx.block_port(vfs_id) {
+                if let Some(slice) = port.pool_slice(sqe.data_offset, path_len as u32) {
+                    path_buf[..path_len].copy_from_slice(slice);
+                    &path_buf[..path_len]
+                } else {
+                    &[]
+                }
+            } else {
+                &[]
+            }
+        };
+
+        if path.is_empty() {
+            Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NOT_FOUND);
+            return;
+        }
+
+        let path = if !path.is_empty() && path[0] == b'/' { &path[1..] } else { path };
+
+        // Check if already exists
+        if self.find_in_root(path, ctx).is_some() {
+            Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::EXISTS);
+            return;
+        }
+
+        // Allocate a cluster for the new directory
+        let cluster = match self.alloc_cluster(ctx) {
+            Some(c) => c,
+            None => {
+                Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NO_SPACE);
+                return;
+            }
+        };
+        if !self.flush_fat(ctx) {
+            Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+            return;
+        }
+
+        // Zero-fill the directory cluster
+        let bps = self.bytes_per_sector as usize;
+        let mut sector_buf = [0u8; 512];
+        sector_buf[..bps].fill(0);
+        let lba_base = self.cluster_to_lba(cluster);
+        for sec in 0..self.sectors_per_cluster as u32 {
+            if !self.write_block(lba_base + sec as u64, &sector_buf[..bps], ctx) {
+                Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+                return;
+            }
+        }
+
+        // Write . and .. entries
+        let dot_name: [u8; 11] = *b".          ";
+        let dotdot_name: [u8; 11] = *b"..         ";
+        let root_cl = if self.is_fat32 { self.root_cluster } else { 0 };
+
+        Self::format_dir_entry(&mut sector_buf, 0, &dot_name, 0x10, cluster, 0);
+        Self::format_dir_entry(&mut sector_buf, 32, &dotdot_name, 0x10, root_cl, 0);
+        if !self.write_block(lba_base, &sector_buf[..bps], ctx) {
+            Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+            return;
+        }
+
+        // Create entry in root directory
+        match self.create_dir_entry(0, path, true, cluster, ctx) {
+            Some(_) => Self::complete_vfs_result(ctx, vfs_id, sqe.tag, 0, 0),
+            None => Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR),
+        }
+    }
+
+    fn handle_vfs_unlink(&mut self, sqe: &IoSqe, ctx: &mut dyn BusCtx) {
+        let vfs_id = match self.vfs_port {
+            Some(id) => id,
+            None => return,
+        };
+
+        // Read path from pool
+        let mut path_buf = [0u8; 256];
+        let path_len = (sqe.data_len as usize).min(256);
+        let path = {
+            if let Some(port) = ctx.block_port(vfs_id) {
+                if let Some(slice) = port.pool_slice(sqe.data_offset, path_len as u32) {
+                    path_buf[..path_len].copy_from_slice(slice);
+                    &path_buf[..path_len]
+                } else {
+                    &[]
+                }
+            } else {
+                &[]
+            }
+        };
+
+        if path.is_empty() {
+            Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NOT_FOUND);
+            return;
+        }
+
+        let path = if !path.is_empty() && path[0] == b'/' { &path[1..] } else { path };
+
+        match self.find_in_root(path, ctx) {
+            Some((is_dir, cluster, _size, entry_lba, entry_off)) => {
+                if is_dir {
+                    // TODO: check directory is empty before deleting
+                    Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IS_DIR);
+                    return;
+                }
+                if self.delete_dir_entry(entry_lba, entry_off, cluster, ctx) {
+                    Self::complete_vfs_result(ctx, vfs_id, sqe.tag, 0, 0);
+                } else {
+                    Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+                }
+            }
+            None => {
+                Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::NOT_FOUND);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Directory write helpers
+    // =========================================================================
+
+    /// Convert a filename to 8.3 format. Returns None if the name is too long or invalid.
+    fn to_8_3(name: &[u8]) -> Option<[u8; 11]> {
+        let mut result = [b' '; 11];
+
+        // Find the last dot for extension splitting
+        let dot_pos = name.iter().rposition(|&b| b == b'.');
+        let (base, ext) = match dot_pos {
+            Some(pos) => (&name[..pos], &name[pos+1..]),
+            None => (name, &[] as &[u8]),
+        };
+
+        if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+            return None;
+        }
+
+        for (i, &b) in base.iter().enumerate() {
+            result[i] = to_upper(b);
+        }
+        for (i, &b) in ext.iter().enumerate() {
+            result[8 + i] = to_upper(b);
+        }
+        Some(result)
+    }
+
+    /// Write a 32-byte directory entry into a sector buffer at `offset`.
+    fn format_dir_entry(buf: &mut [u8], offset: usize, name_8_3: &[u8; 11], attr: u8, cluster: u32, size: u32) {
+        let e = &mut buf[offset..offset + 32];
+        e[..11].copy_from_slice(name_8_3);
+        e[11] = attr;
+        e[12..20].fill(0); // Reserved, create time/date, access date
+        e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+        e[22..26].fill(0); // Write time/date (TODO: real timestamps)
+        e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+        e[28..32].copy_from_slice(&size.to_le_bytes());
+    }
+
+    /// Find a free slot in a directory and create an entry.
+    /// Returns (entry_lba, entry_offset_in_sector) on success.
+    fn create_dir_entry(
+        &mut self,
+        parent_cluster: u32,
+        name: &[u8],
+        is_dir: bool,
+        initial_cluster: u32,
+        ctx: &mut dyn BusCtx,
+    ) -> Option<(u64, u16)> {
+        let name_8_3 = Self::to_8_3(name)?;
+        let attr: u8 = if is_dir { 0x10 } else { 0x20 }; // DIR or ARCHIVE
+
+        let bps = self.bytes_per_sector as usize;
+        let entries_per_sector = bps / 32;
+        let mut sector_buf = [0u8; 512];
+
+        // Resolve parent: cluster 0 = root directory
+        if parent_cluster == 0 && !self.is_fat32 {
+            // FAT16 root — fixed region
+            for sec in 0..self.root_dir_sectors {
+                let lba = self.root_dir_start_lba as u64 + sec as u64;
+                if !self.read_block(lba, &mut sector_buf[..bps], ctx) {
+                    return None;
+                }
+                for i in 0..entries_per_sector {
+                    let off = i * 32;
+                    if sector_buf[off] == 0x00 || sector_buf[off] == 0xE5 {
+                        Self::format_dir_entry(&mut sector_buf, off, &name_8_3, attr, initial_cluster, 0);
+                        if !self.write_block(lba, &sector_buf[..bps], ctx) {
+                            return None;
+                        }
+                        return Some((lba, off as u16));
+                    }
+                }
+            }
+            return None; // Root directory full (FAT16 has fixed size)
+        }
+
+        // Cluster-chain directory (FAT32 root or any subdirectory)
+        let start = if parent_cluster == 0 { self.root_cluster } else { parent_cluster };
+        let mut cluster = start;
+        let mut last_cluster = cluster;
+
+        loop {
+            let lba_base = self.cluster_to_lba(cluster);
+            for sec in 0..self.sectors_per_cluster as u32 {
+                let lba = lba_base + sec as u64;
+                if !self.read_block(lba, &mut sector_buf[..bps], ctx) {
+                    return None;
+                }
+                for i in 0..entries_per_sector {
+                    let off = i * 32;
+                    if sector_buf[off] == 0x00 || sector_buf[off] == 0xE5 {
+                        Self::format_dir_entry(&mut sector_buf, off, &name_8_3, attr, initial_cluster, 0);
+                        if !self.write_block(lba, &sector_buf[..bps], ctx) {
+                            return None;
+                        }
+                        return Some((lba, off as u16));
+                    }
+                }
+            }
+            last_cluster = cluster;
+            match self.next_cluster(cluster, ctx) {
+                Some(c) => cluster = c,
+                None => break,
+            }
+        }
+
+        // No free slot found — extend the directory by one cluster
+        let new_cluster = self.alloc_cluster(ctx)?;
+        if !self.extend_chain(last_cluster, new_cluster, ctx) {
+            return None;
+        }
+        if !self.flush_fat(ctx) {
+            return None;
+        }
+
+        // Zero-fill the new cluster
+        sector_buf[..bps].fill(0);
+        let lba_base = self.cluster_to_lba(new_cluster);
+        for sec in 0..self.sectors_per_cluster as u32 {
+            if !self.write_block(lba_base + sec as u64, &sector_buf[..bps], ctx) {
+                return None;
+            }
+        }
+
+        // Write entry at first slot of new cluster
+        Self::format_dir_entry(&mut sector_buf, 0, &name_8_3, attr, initial_cluster, 0);
+        if !self.write_block(lba_base, &sector_buf[..bps], ctx) {
+            return None;
+        }
+        Some((lba_base, 0))
+    }
+
+    /// Update the file size in the on-disk directory entry.
+    fn update_dir_entry_size(&self, lba: u64, offset: u16, new_size: u32, ctx: &mut dyn BusCtx) -> bool {
+        let bps = self.bytes_per_sector as usize;
+        let mut sector_buf = [0u8; 512];
+        if !self.read_block(lba, &mut sector_buf[..bps], ctx) {
+            return false;
+        }
+        let off = offset as usize;
+        sector_buf[off+28..off+32].copy_from_slice(&new_size.to_le_bytes());
+        self.write_block(lba, &sector_buf[..bps], ctx)
+    }
+
+    /// Update the start cluster in the on-disk directory entry.
+    fn update_dir_entry_cluster(&self, lba: u64, offset: u16, cluster: u32, ctx: &mut dyn BusCtx) -> bool {
+        let bps = self.bytes_per_sector as usize;
+        let mut sector_buf = [0u8; 512];
+        if !self.read_block(lba, &mut sector_buf[..bps], ctx) {
+            return false;
+        }
+        let off = offset as usize;
+        // High 16 bits at offset 20-21
+        sector_buf[off+20..off+22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+        // Low 16 bits at offset 26-27
+        sector_buf[off+26..off+28].copy_from_slice(&(cluster as u16).to_le_bytes());
+        self.write_block(lba, &sector_buf[..bps], ctx)
+    }
+
+    /// Mark a directory entry as deleted (0xE5) and free its cluster chain.
+    fn delete_dir_entry(&mut self, lba: u64, offset: u16, cluster: u32, ctx: &mut dyn BusCtx) -> bool {
+        let bps = self.bytes_per_sector as usize;
+        let mut sector_buf = [0u8; 512];
+        if !self.read_block(lba, &mut sector_buf[..bps], ctx) {
+            return false;
+        }
+        sector_buf[offset as usize] = 0xE5;
+        if !self.write_block(lba, &sector_buf[..bps], ctx) {
+            return false;
+        }
+        if cluster >= 2 {
+            if !self.free_chain(cluster, ctx) {
+                return false;
+            }
+            if !self.flush_fat(ctx) {
+                return false;
+            }
+        }
+        true
+    }
+
     // =========================================================================
     // Root directory search
     // =========================================================================
 
     /// Search root directory for a file/dir by name (case-insensitive 8.3 match).
-    /// Returns (is_dir, start_cluster, file_size).
-    fn find_in_root(&mut self, name: &[u8], ctx: &mut dyn BusCtx) -> Option<(bool, u32, u32)> {
+    /// Returns (is_dir, start_cluster, file_size, entry_lba, entry_offset).
+    fn find_in_root(
+        &mut self, name: &[u8], ctx: &mut dyn BusCtx,
+    ) -> Option<(bool, u32, u32, u64, u16)> {
         let mut sector_buf = [0u8; 512];
+        let bps = self.bytes_per_sector as usize;
+        let entries_per_sector = bps / 32;
 
         if self.is_fat32 {
-            // FAT32: root directory is a cluster chain
             let mut cluster = self.root_cluster;
             loop {
-                let lba = self.cluster_to_lba(cluster);
+                let base_lba = self.cluster_to_lba(cluster);
                 for sec in 0..self.sectors_per_cluster as u32 {
-                    if !self.read_block(lba + sec as u64, &mut sector_buf[..self.bytes_per_sector as usize], ctx) {
+                    let lba = base_lba + sec as u64;
+                    if !self.read_block(lba, &mut sector_buf[..bps], ctx) {
                         return None;
                     }
-                    let entries_per_sector = self.bytes_per_sector as usize / 32;
                     for i in 0..entries_per_sector {
                         let offset = i * 32;
                         match self.parse_dir_entry(&sector_buf, offset) {
                             Some((_, 0, _, _, _)) => continue,
                             Some((entry_name, entry_len, is_dir, cl, size)) => {
                                 if name_eq_ci(&entry_name[..entry_len], name) {
-                                    return Some((is_dir, cl, size));
+                                    return Some((is_dir, cl, size, lba, offset as u16));
                                 }
                             }
                             None => return None,
@@ -844,20 +1651,18 @@ impl FatfsDriver {
                 }
             }
         } else {
-            // FAT16: fixed root directory region
             for sec in 0..self.root_dir_sectors {
                 let lba = self.root_dir_start_lba as u64 + sec as u64;
-                if !self.read_block(lba, &mut sector_buf[..self.bytes_per_sector as usize], ctx) {
+                if !self.read_block(lba, &mut sector_buf[..bps], ctx) {
                     return None;
                 }
-                let entries_per_sector = self.bytes_per_sector as usize / 32;
                 for i in 0..entries_per_sector {
                     let offset = i * 32;
                     match self.parse_dir_entry(&sector_buf, offset) {
                         Some((_, 0, _, _, _)) => continue,
                         Some((entry_name, entry_len, is_dir, cluster, size)) => {
                             if name_eq_ci(&entry_name[..entry_len], name) {
-                                return Some((is_dir, cluster, size));
+                                return Some((is_dir, cluster, size, lba, offset as u16));
                             }
                         }
                         None => return None,
@@ -917,12 +1722,14 @@ impl FatfsDriver {
                 match sqe.opcode {
                     fs_op::OPEN => self.handle_vfs_open(&sqe, ctx),
                     fs_op::READ => self.handle_vfs_read(&sqe, ctx),
+                    fs_op::WRITE => self.handle_vfs_write(&sqe, ctx),
                     fs_op::READDIR => self.handle_vfs_readdir(&sqe, ctx),
                     fs_op::STAT => self.handle_vfs_stat(&sqe, ctx),
                     fs_op::CLOSE => self.handle_vfs_close(&sqe, ctx),
+                    fs_op::MKDIR => self.handle_vfs_mkdir(&sqe, ctx),
+                    fs_op::UNLINK => self.handle_vfs_unlink(&sqe, ctx),
                     _ => {
-                        // Unsupported op (WRITE, MKDIR, etc. - read only)
-                        Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::READ_ONLY);
+                        Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
                     }
                 }
             }
@@ -1086,9 +1893,9 @@ impl FatfsDriver {
         };
 
         if self.is_fat32 {
-            append(&mut buf, &mut pos, b"FAT32 Filesystem Driver (read-only)\n");
+            append(&mut buf, &mut pos, b"FAT32 Filesystem Driver\n");
         } else {
-            append(&mut buf, &mut pos, b"FAT16 Filesystem Driver (read-only)\n");
+            append(&mut buf, &mut pos, b"FAT16 Filesystem Driver\n");
         }
         append(&mut buf, &mut pos, b"  Port: ");
         append(&mut buf, &mut pos, &self.port_name[..self.port_name_len]);
@@ -1198,7 +2005,7 @@ impl Driver for FatfsDriver {
                 let len = format_u32(&mut tmp, self.num_fats as u32);
                 copy_to_buf(buf, 0, &tmp[..len])
             }
-            b"fs.readonly" => copy_to_buf(buf, 0, b"true"),
+            b"fs.readonly" => copy_to_buf(buf, 0, b"false"),
             b"mount.path" => copy_to_buf(buf, 0, &self.port_name[..self.port_name_len]),
             b"stats.open_files" => {
                 let count = self.open_files.iter().filter(|f| f.in_use).count() as u32;
@@ -1246,6 +2053,10 @@ fn main() {
 
 fn to_lower(c: u8) -> u8 {
     if c >= b'A' && c <= b'Z' { c + 32 } else { c }
+}
+
+fn to_upper(c: u8) -> u8 {
+    if c >= b'a' && c <= b'z' { c - 32 } else { c }
 }
 
 fn name_eq_ci(a: &[u8], b: &[u8]) -> bool {
