@@ -113,7 +113,7 @@ pub enum WakeReason { Readable, Writable, Closed, Accepted, Timeout }
 
 ### 7. Bus Framework Is The Only Way To Write Drivers
 
-All userspace drivers use the bus framework (`libsys/src/bus.rs`). No exceptions.
+All userspace drivers use the bus framework (`libos/src/bus.rs`). No exceptions.
 
 ```rust
 struct MyDriver { /* domain state */ }
@@ -256,7 +256,8 @@ bpi-r4-kernel/
 │   ├── arch/aarch64/       # ARM64-specific code
 │   └── platform/mt7988/    # MT7988A SoC code
 ├── user/
-│   ├── libsys/            # Kernel interface (raw syscalls, IPC, bus)
+│   ├── libsys/            # Kernel boundary (syscalls, IPC, error types)
+│   ├── libos/             # Driver SDK (bus framework, devd, VFS, logging)
 │   ├── libf/               # Standard library (fmt, str, parse — mirrors std)
 │   ├── shell/              # Shell program
 │   └── driver/
@@ -452,10 +453,10 @@ MT_WFDMA_EXT_CSR_HIF_MISC = 0xd7044
 ### Driver Stack Migration (COMPLETE)
 See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for architecture.
 
-- `libsys/src/ring.rs` - Ring protocol with IoSqe/IoCqe/SideEntry
-- `libsys/src/data_port.rs` - DataPort API with Layer trait
-- `devd/src/ports.rs` - Port hierarchy with parent/child
-- `devd/src/rules.rs` - Auto-spawn rules for port events
+- `user/libsys/src/ring.rs` - Ring protocol with IoSqe/IoCqe/SideEntry
+- `user/libsys/src/data_port.rs` - DataPort API with Layer trait
+- `user/devd/src/ports.rs` - Port hierarchy with parent/child
+- `user/devd/src/rules.rs` - Auto-spawn rules for port events
 - Consumer block ports registered with Mux for event-driven callbacks
 - partd uses async forwarding with inflight table (no blocking)
 - fatfsd uses kernel-backed `wait()` instead of `sleep_us()` polling
@@ -465,6 +466,18 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
 - Legacy Service framework removed; devd, consoled, shell all use `ipc` directly
 - Legacy syscalls (6-17, 28-30, 80+) removed from kernel enum, return Invalid
 - IPC cohesion fixes applied: sidechannel doorbell, send_down() deadline enforcement
+
+### Crate Architecture Split (COMPLETE)
+- **libsys split into libsys + libos** — clean separation of concerns
+  - **libsys** (~3,200 lines): kernel boundary — syscalls, IPC, error types, allocator, ring protocol, data ports
+  - **libos** (~14,400 lines): driver SDK — bus framework, query protocol, devd client, VFS, structured logging, MMIO/DMA
+  - Dependency graph: `abi ← libsys ← libos ← drivers/shell` and `abi ← libsys ← libf ↗ libos`
+  - HashMap deduplication: libos depends on libf (no cycle), deleted duplicate hash_map.rs
+  - Panic flush callback: `libsys::set_panic_flush()` registered by libos's `driver_main()`
+- **Key files**:
+  - `user/libsys/src/lib.rs` - Kernel boundary: syscall, ipc, error, half_ring, ring, data_port, io, sync
+  - `user/libos/src/lib.rs` - Driver SDK: bus, bus_runtime, devd, vfs_client, ulog, mmio, dma, query, wire
+  - `user/libos/Cargo.toml` - Depends on abi + libsys + libf
 
 ### libf Standard Library (IN PROGRESS)
 - `user/libf/` — Filament's standard library, mirrors Rust std signatures
@@ -482,6 +495,20 @@ See [docs/architecture/DRIVER_STACK.md](docs/architecture/DRIVER_STACK.md) for a
 ---
 
 ## Changelog (Recent)
+
+### 2026-03-09
+- **Crate architecture split: libsys → libsys + libos**
+  - libsys (19,767 lines) was two things: kernel boundary AND driver SDK
+  - Split into libsys (~3,200 lines, kernel boundary) + libos (~14,400 lines, driver SDK)
+  - 24 modules moved: bus, bus_runtime, query, devd, vfs_client, ulog, mmio, dma, etc.
+  - ring.rs and data_port.rs kept in libsys (shared memory IPC primitives needed by libf::net)
+  - libos re-exports ring/data_port from libsys for convenience
+  - Panic flush callback: `libsys::set_panic_flush()` replaces direct ulog::flush() in panic handler
+  - All 21 driver crates updated: imports changed from `libsys::bus` → `libos::bus`, etc.
+- **HashMap deduplication**
+  - libos now depends on libf (no cycle since libf doesn't depend on libos)
+  - Removed duplicate hash_map.rs from libos, uses `libf::collections::HashMap`
+  - DataPortConfig/GeometryInfo defined as structs in libsys::data_port (was type alias to bus.rs)
 
 ### 2026-02-09
 - **libf standard library** (`user/libf/`)
