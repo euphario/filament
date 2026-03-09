@@ -241,6 +241,7 @@ name = "libos"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "libf",
  "libsys",
 ]
 

@@ -25,7 +25,7 @@ use libsys::ipc::{Channel, Irq, Mux, MuxFilter};
 use libsys::mailbox::Mailbox;
 use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, query_flags, port_type as qport_type, error as query_error};
 use libsys::syscall::{self, Handle, LogLevel};
-use crate::hash_map::HashMap;
+use libf::collections::HashMap;
 
 // ============================================================================
 // Constants

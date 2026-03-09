@@ -11,7 +11,6 @@
 extern crate alloc;
 
 pub mod serialize;
-pub mod hash_map;
 pub mod blk;
 
 #[macro_use]

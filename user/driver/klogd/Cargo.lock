@@ -15,10 +15,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libf"
+version = "0.1.0"
+
+[[package]]
 name = "libos"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "libf",
  "libsys",
 ]
 

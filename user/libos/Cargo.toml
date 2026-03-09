@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 abi = { path = "../abi" }
 libsys = { path = "../libsys" }
+libf = { path = "../libf", default-features = false }
 
 [features]
 default = []
