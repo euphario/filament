@@ -18,6 +18,7 @@ pub mod io;
 pub mod half_ring;
 pub mod query;
 pub mod wire;
+pub mod hash_map;
 pub mod mmio;
 pub mod dma;
 pub mod ring;

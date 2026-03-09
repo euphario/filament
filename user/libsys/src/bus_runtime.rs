@@ -25,6 +25,7 @@ use crate::ipc::{Channel, Irq, Mux, MuxFilter};
 use crate::mailbox::Mailbox;
 use crate::query::{QueryHeader, ServiceInfoResult, SpawnChildContext, SpawnContextResponse, msg as query_msg, query_flags, port_type as qport_type, error as query_error};
 use crate::syscall::{self, Handle, LogLevel};
+use crate::hash_map::HashMap;
 
 // ============================================================================
 // Constants
@@ -32,9 +33,6 @@ use crate::syscall::{self, Handle, LogLevel};
 
 /// Maximum block ports (provider + consumer combined).
 const MAX_BLOCK_PORTS: usize = MAX_PORTS;
-
-/// Maximum driver-registered handles.
-const MAX_DRIVER_HANDLES: usize = 32;
 
 /// Maximum children this driver can relay for.
 const MAX_CHILDREN: usize = 8;
@@ -88,48 +86,25 @@ struct ManagedTimer {
 
 /// Maps Mux handles to tags for dispatch.
 struct HandleRegistry {
-    entries: [(Handle, u32); MAX_DRIVER_HANDLES],
-    count: usize,
+    map: HashMap<Handle, u32>,
 }
 
 impl HandleRegistry {
-    const fn new() -> Self {
-        Self {
-            entries: [(Handle(0), 0); MAX_DRIVER_HANDLES],
-            count: 0,
-        }
+    fn new() -> Self {
+        Self { map: HashMap::new() }
     }
 
     fn add(&mut self, handle: Handle, tag: u32) -> bool {
-        if self.count >= MAX_DRIVER_HANDLES {
-            return false;
-        }
-        self.entries[self.count] = (handle, tag);
-        self.count += 1;
+        self.map.insert(handle, tag);
         true
     }
 
     fn remove(&mut self, handle: Handle) -> bool {
-        for i in 0..self.count {
-            if self.entries[i].0 == handle {
-                // Swap with last
-                self.count -= 1;
-                if i < self.count {
-                    self.entries[i] = self.entries[self.count];
-                }
-                return true;
-            }
-        }
-        false
+        self.map.remove(&handle).is_some()
     }
 
     fn find_tag(&self, handle: Handle) -> Option<u32> {
-        for i in 0..self.count {
-            if self.entries[i].0 == handle {
-                return Some(self.entries[i].1);
-            }
-        }
-        None
+        self.map.get(&handle).copied()
     }
 }
 

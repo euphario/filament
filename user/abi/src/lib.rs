@@ -391,7 +391,7 @@ pub mod prot {
 
 /// User-visible handle to kernel objects
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Handle(pub u32);
 
 impl Handle {
