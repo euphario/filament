@@ -11,13 +11,16 @@
 
 extern crate alloc;
 
+pub mod collections;
 pub mod crypto;
 pub mod fmt;
 pub mod io;
 pub mod net;
 pub mod parse;
+pub mod path;
 pub mod str;
 pub mod sync;
+pub mod time;
 
 /// Prelude — import everything a typical program needs.
 ///
@@ -33,10 +36,15 @@ pub mod prelude {
     pub use alloc::boxed::Box;
     pub use alloc::format;
 
+    // Collections
+    pub use alloc::collections::VecDeque;
+
     // libf utilities
     pub use crate::fmt::{StackStr, BufWriter};
     pub use crate::str::{trim, eq_ignore_ascii_case};
     pub use crate::parse::parse_u32;
+    pub use crate::time::{Duration, Instant};
+    pub use crate::path::{Path, PathBuf};
 
     // libsys essentials
     pub use libsys::error::{SysError, SysResult};
