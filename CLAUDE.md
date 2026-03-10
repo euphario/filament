@@ -149,6 +149,28 @@ Tomorrow:  core + alloc + std       (real target, crates.io unlocked)
 - **Don't force std's design** - Where Filament's model is cleaner (object handles vs file descriptors), lean into Filament. Mirror the signatures, not the implementation.
 - **No std dependency** - libf is `no_std`. The port to real `std` happens later, when a concrete crate need arises.
 
+### 9. Shape Over Noise
+
+Code must be understandable from its visual shape alone. If you have to read every line to know what a block does, it's too dense. The goal: a human can scan a function and understand its structure without loading every line into working memory.
+
+- **Named helpers are comprehension tools** - `exec_driver(binary, port, caps, priority)` tells you what happens at the call site. The path-building details are in the helper body, available when you need them. A 6-line inline sequence of `path_buf` construction, `copy_from_slice`, `from_utf8` is noise at the call site.
+- **Write it once** - If the same logic appears twice, extract it. Not for DRY dogma — because two copies means two places a reader has to verify are identical.
+- **No traits for one impl** - A trait with exactly one implementation is indirection without value. When the implementation changes, you change the implementation — you don't swap in a different trait impl. Delete the trait, keep the functions.
+- **Dispatch reads like a table of contents** - Match arms, if-chains, and event handlers should be short enough to see as a pattern. Extract the mechanics into named methods so the dispatch site shows *what* happens, not *how*.
+
+```rust
+// Good: shape tells the story
+if parsed.is_set {
+    self.handle_config_set(&parsed, idx);
+} else if parsed.service.is_empty() {
+    self.handle_broadcast_get(parsed.key, idx);
+} else {
+    self.handle_targeted_get(parsed.service, parsed.key, idx);
+}
+
+// Bad: 40 lines of buffer manipulation inline in the match arm
+```
+
 ---
 
 ## Key Principles (Summary)
