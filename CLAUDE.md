@@ -151,8 +151,9 @@ Tomorrow:  core + alloc + std       (real target, crates.io unlocked)
 
 ### 9. Shape Over Noise
 
-Code must be understandable from its visual shape alone. If you have to read every line to know what a block does, it's too dense. The goal: a human can scan a function and understand its structure without loading every line into working memory.
+A function should do one thing and do it well. If you can't summarize what a function does in a single sentence, it probably does too much. Code must be understandable from its visual shape alone — a human can scan a function and understand its structure without loading every line into working memory.
 
+- **Single-sentence test** - If you can't describe a function's purpose in one sentence, split it. `handle_admin_command` parses and dispatches. `handle_targeted_get` sends a query and relays the response. Each is one sentence, one job.
 - **Named helpers are comprehension tools** - `exec_driver(binary, port, caps, priority)` tells you what happens at the call site. The path-building details are in the helper body, available when you need them. A 6-line inline sequence of `path_buf` construction, `copy_from_slice`, `from_utf8` is noise at the call site.
 - **Write it once** - If the same logic appears twice, extract it. Not for DRY dogma — because two copies means two places a reader has to verify are identical.
 - **No traits for one impl** - A trait with exactly one implementation is indirection without value. When the implementation changes, you change the implementation — you don't swap in a different trait impl. Delete the trait, keep the functions.

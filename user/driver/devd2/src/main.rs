@@ -13,6 +13,7 @@ use libsys::syscall;
 use libsys::ipc::{Channel, Port, Mux, MuxFilter};
 use libos::{uinfo, uwarn, uerror, udebug};
 use libos::bus_client::BusClient;
+use libos::wire::WireWriter;
 
 // =============================================================================
 // Constants
@@ -553,59 +554,70 @@ impl Devd2 {
     }
 
     fn handle_targeted_get(&mut self, service: &[u8], key: &[u8], admin_idx: usize) {
-        let mut reply = [0u8; 512];
-        let pos = match self.bus.query(service, key, 500_000_000) {
-            Ok(qr) if !qr.is_error => copy_slice(&mut reply, qr.value()),
-            Ok(qr) => format_error(&mut reply, qr.value()),
-            Err(_) => format_error(&mut reply, b"timeout"),
+        let mut buf = [0u8; 512];
+        let pos = {
+            let mut w = WireWriter::new(&mut buf);
+            match self.bus.query(service, key, 500_000_000) {
+                Ok(qr) if !qr.is_error => { w.put_bytes(qr.value()); }
+                Ok(qr) => write_error(&mut w, qr.value()),
+                Err(_) => write_error(&mut w, b"timeout"),
+            };
+            w.finish()
         };
-        self.send_admin_reply_buf(admin_idx, &reply[..pos]);
+        self.send_admin_reply_buf(admin_idx, &buf[..pos]);
     }
 
     fn handle_broadcast_get(&mut self, key: &[u8], admin_idx: usize) {
-        let mut reply = [0u8; 1024];
-        let mut pos = 0;
+        let mut buf = [0u8; 1024];
+        let pos = {
+            let mut w = WireWriter::new(&mut buf);
 
-        // Snapshot service names to avoid borrowing self during bus queries
-        let svc_snapshot = self.snapshot_service_names();
+            // Snapshot service names to avoid borrowing self during bus queries
+            let svc_snapshot = self.snapshot_service_names();
 
-        for (name, len) in &svc_snapshot {
-            if *len == 0 { break; }
-            let name = &name[..*len as usize];
-            match self.bus.query(name, key, 200_000_000) {
-                Ok(qr) if !qr.is_error && !qr.value().is_empty() => {
-                    let val = qr.value();
-                    pos += copy_slice(&mut reply[pos..], b"[");
-                    pos += copy_slice(&mut reply[pos..], name);
-                    pos += copy_slice(&mut reply[pos..], b"]\n");
-                    pos += copy_slice(&mut reply[pos..], val);
-                    if reply[pos - 1] != b'\n' {
-                        pos += copy_slice(&mut reply[pos..], b"\n");
+            for (name, len) in &svc_snapshot {
+                if *len == 0 { break; }
+                let name = &name[..*len as usize];
+                match self.bus.query(name, key, 200_000_000) {
+                    Ok(qr) if !qr.is_error && !qr.value().is_empty() => {
+                        let val = qr.value();
+                        w.put_bytes(b"[");
+                        w.put_bytes(name);
+                        w.put_bytes(b"]\n");
+                        w.put_bytes(val);
+                        if !val.ends_with(b"\n") {
+                            w.put_bytes(b"\n");
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        self.send_admin_reply_buf(admin_idx, &reply[..pos]);
+            w.finish()
+        };
+        self.send_admin_reply_buf(admin_idx, &buf[..pos]);
     }
 
     fn handle_config_set(&mut self, cmd: &ConfigCmd<'_>, admin_idx: usize) {
-        let mut reply = [0u8; 256];
-        let addr = if cmd.service.is_empty() { b"*" as &[u8] } else { cmd.service };
+        let mut buf = [0u8; 256];
+        let pos = {
+            let mut w = WireWriter::new(&mut buf);
+            let addr = if cmd.service.is_empty() { b"*" as &[u8] } else { cmd.service };
 
-        let pos = match self.bus.send_set(addr, cmd.key, cmd.value) {
-            Ok(seq) => match self.bus.wait_reply(seq, 500_000_000) {
-                Ok(qr) if !qr.is_error => {
-                    let val = qr.value();
-                    if val.is_empty() { copy_slice(&mut reply, b"OK\n") }
-                    else { copy_slice(&mut reply, val) }
-                }
-                Ok(qr) => format_error(&mut reply, qr.value()),
-                Err(_) => format_error(&mut reply, b"timeout"),
-            },
-            Err(_) => format_error(&mut reply, b"send failed"),
+            match self.bus.send_set(addr, cmd.key, cmd.value) {
+                Ok(seq) => match self.bus.wait_reply(seq, 500_000_000) {
+                    Ok(qr) if !qr.is_error => {
+                        let val = qr.value();
+                        if val.is_empty() { w.put_bytes(b"OK\n"); }
+                        else { w.put_bytes(val); }
+                    }
+                    Ok(qr) => write_error(&mut w, qr.value()),
+                    Err(_) => write_error(&mut w, b"timeout"),
+                },
+                Err(_) => write_error(&mut w, b"send failed"),
+            };
+            w.finish()
         };
-        self.send_admin_reply_buf(admin_idx, &reply[..pos]);
+        self.send_admin_reply_buf(admin_idx, &buf[..pos]);
     }
 
     /// Send a reply buffer to an admin client.
@@ -628,23 +640,18 @@ impl Devd2 {
 
     /// Format "name state pid\n" for each service into buf. Returns bytes written.
     fn format_service_list(&self, buf: &mut [u8]) -> usize {
-        let mut pos = 0;
+        let mut w = WireWriter::new(buf);
         for slot in &self.services {
             if let Some(svc) = slot {
-                let name = svc.name_str().as_bytes();
-                let state = svc.state.as_str().as_bytes();
-                let pid = format_u32(svc.pid);
-                let need = name.len() + 1 + state.len() + 1 + pid.len() + 1;
-                if pos + need > buf.len() { break; }
-                pos += copy_slice(&mut buf[pos..], name);
-                buf[pos] = b' '; pos += 1;
-                pos += copy_slice(&mut buf[pos..], state);
-                buf[pos] = b' '; pos += 1;
-                pos += copy_slice(&mut buf[pos..], pid.as_bytes());
-                buf[pos] = b'\n'; pos += 1;
+                w.put_bytes(svc.name_str().as_bytes());
+                w.put_bytes(b" ");
+                w.put_bytes(svc.state.as_str().as_bytes());
+                w.put_bytes(b" ");
+                w.put_bytes(format_u32(svc.pid).as_bytes());
+                w.put_bytes(b"\n");
             }
         }
-        pos
+        w.finish()
     }
 }
 
@@ -665,12 +672,11 @@ fn extract_bus_fields<'a>(buf: &'a [u8], header: &BusMsgHeader) -> (&'a [u8], &'
     )
 }
 
-/// Format "ERR <msg>\n" into buf. Returns bytes written.
-fn format_error(buf: &mut [u8], msg: &[u8]) -> usize {
-    let mut pos = copy_slice(buf, b"ERR ");
-    pos += copy_slice(&mut buf[pos..], msg);
-    pos += copy_slice(&mut buf[pos..], b"\n");
-    pos
+/// Write "ERR <msg>\n" into a WireWriter.
+fn write_error(w: &mut WireWriter<'_>, msg: &[u8]) {
+    w.put_bytes(b"ERR ");
+    w.put_bytes(msg);
+    w.put_bytes(b"\n");
 }
 
 // =============================================================================
@@ -755,21 +761,18 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
-fn copy_slice(dst: &mut [u8], src: &[u8]) -> usize {
-    let len = src.len().min(dst.len());
-    dst[..len].copy_from_slice(&src[..len]);
-    len
-}
-
 /// Build "bin/<binary>" path, create mailbox, exec. Returns pid on success.
 fn exec_driver(binary: &[u8], port_name: &[u8], caps: u64, priority: u8) -> Result<u32, u32> {
     let mb_buf = build_mailbox(port_name, priority);
 
     let mut path_buf = [0u8; 32];
-    path_buf[..4].copy_from_slice(b"bin/");
-    let blen = binary.len().min(28);
-    path_buf[4..4 + blen].copy_from_slice(&binary[..blen]);
-    let path = core::str::from_utf8(&path_buf[..4 + blen]).unwrap_or("bin/???");
+    let path_len = {
+        let mut w = WireWriter::new(&mut path_buf);
+        w.put_bytes(b"bin/");
+        w.put_bytes(binary);
+        w.finish()
+    };
+    let path = core::str::from_utf8(&path_buf[..path_len]).unwrap_or("bin/???");
 
     match syscall::exec_with_mailbox(path, caps, &mb_buf) {
         Ok((pid, _)) => Ok(pid),
@@ -785,24 +788,17 @@ fn build_mailbox(port_name: &[u8], priority: u8) -> [u8; 256] {
     let mut hdr = MailboxHeader::empty();
     hdr.priority = priority;
     hdr.flags = abi::mailbox_flags::PARENT_WRITTEN;
-
-    // KV: "port.name" = port_name at [64..)
-    let key = b"port.name";
-    let klen = key.len();
-    let vlen = port_name.len().min(64);
-    let mut pos = 64usize;
-    buf[pos] = klen as u8; pos += 1;
-    buf[pos..pos + klen].copy_from_slice(key); pos += klen;
-    buf[pos] = vlen as u8; pos += 1;
-    buf[pos..pos + vlen].copy_from_slice(&port_name[..vlen]);
-
     hdr.kv_count = 1;
 
-    // Write header
     let hdr_bytes = unsafe {
         core::slice::from_raw_parts(&hdr as *const MailboxHeader as *const u8, 64)
     };
     buf[..64].copy_from_slice(hdr_bytes);
+
+    // KV: "port.name" = port_name at [64..)
+    let mut w = WireWriter::new(&mut buf[64..]);
+    w.put_len_u8_bytes(b"port.name");
+    w.put_len_u8_bytes(port_name);
 
     buf
 }
