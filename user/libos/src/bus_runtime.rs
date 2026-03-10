@@ -1802,16 +1802,54 @@ impl<D: Driver> DriverRuntime<D> {
                 }
                 let key = &payload[key_start..key_end];
 
-                // Call driver's config_get
-                let mut reply_val = [0u8; 256];
-                let val_len = self.driver.config_get(key, &mut reply_val);
+                if key.is_empty() {
+                    // Empty key = full config summary (all keys)
+                    let mut reply_val = [0u8; 512];
+                    let mut pos = 0;
+                    for ck in self.driver.config_keys() {
+                        let kname = ck.name;
+                        let mut val_buf = [0u8; 128];
+                        let vlen = self.driver.config_get(kname, &mut val_buf);
+                        if vlen > 0 && pos + kname.len() + 1 + vlen + 1 <= reply_val.len() {
+                            reply_val[pos..pos + kname.len()].copy_from_slice(kname);
+                            pos += kname.len();
+                            reply_val[pos] = b'=';
+                            pos += 1;
+                            reply_val[pos..pos + vlen].copy_from_slice(&val_buf[..vlen]);
+                            pos += vlen;
+                            reply_val[pos] = b'\n';
+                            pos += 1;
+                        }
+                    }
+                    if let Some(ref mut bc) = self.ctx.bus_client {
+                        if pos > 0 {
+                            let _ = bc.send_reply(header.seq_id, &reply_val[..pos]);
+                        } else {
+                            let _ = bc.send_error_reply(header.seq_id, b"no_config");
+                        }
+                    }
+                } else {
+                    // Specific key lookup
+                    let mut reply_val = [0u8; 256];
+                    let val_len = self.driver.config_get(key, &mut reply_val);
 
-                // Auto-reply via busd
-                if let Some(ref mut bc) = self.ctx.bus_client {
-                    if val_len > 0 {
-                        let _ = bc.send_reply(header.seq_id, &reply_val[..val_len]);
-                    } else {
-                        let _ = bc.send_error_reply(header.seq_id, b"not_found");
+                    if let Some(ref mut bc) = self.ctx.bus_client {
+                        if val_len > 0 {
+                            // Format as key=value\n for consistency with summary format
+                            let mut formatted = [0u8; 384];
+                            let mut pos = 0;
+                            formatted[pos..pos + key.len()].copy_from_slice(key);
+                            pos += key.len();
+                            formatted[pos] = b'=';
+                            pos += 1;
+                            formatted[pos..pos + val_len].copy_from_slice(&reply_val[..val_len]);
+                            pos += val_len;
+                            formatted[pos] = b'\n';
+                            pos += 1;
+                            let _ = bc.send_reply(header.seq_id, &formatted[..pos]);
+                        } else {
+                            let _ = bc.send_error_reply(header.seq_id, b"not_found");
+                        }
                     }
                 }
             }

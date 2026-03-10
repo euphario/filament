@@ -276,23 +276,13 @@ impl Devd2 {
         priority: u8,
         _port_info: &PortInfo,
     ) {
-        // Build mailbox with port info so child knows what to claim.
-        let mb_buf = build_mailbox(port_name, priority);
-
-        // Format binary path: "bin/<binary>"
-        let mut path_buf = [0u8; 32];
-        path_buf[..4].copy_from_slice(b"bin/");
-        let blen = binary.len().min(28);
-        path_buf[4..4 + blen].copy_from_slice(&binary.as_bytes()[..blen]);
-        let path = core::str::from_utf8(&path_buf[..4 + blen]).unwrap_or("bin/???");
-
-        match syscall::exec_with_mailbox(path, caps, &mb_buf) {
-            Ok((pid, _shmem_handle)) => {
+        match exec_driver(binary.as_bytes(), port_name, caps, priority) {
+            Ok(pid) => {
                 uinfo!("devd2", "spawned"; binary = binary, pid = pid, port = core::str::from_utf8(port_name).unwrap_or("?"));
                 self.add_service(pid, binary.as_bytes(), port_name, caps, priority);
             }
             Err(errno) => {
-                uerror!("devd2", "spawn_failed"; binary = binary, errno = errno as u32);
+                uerror!("devd2", "spawn_failed"; binary = binary, errno = errno);
             }
         }
     }
@@ -429,26 +419,21 @@ impl Devd2 {
                 (svc.name, svc.name_len, svc.trigger_port, svc.trigger_port_len, svc.caps, svc.priority)
             };
 
-            let binary = core::str::from_utf8(&name_buf[..name_len as usize]).unwrap_or("?");
+            let binary = &name_buf[..name_len as usize];
             let port_name = &port_buf[..port_len as usize];
-            let mb_buf = build_mailbox(port_name, priority);
 
-            let mut path_buf = [0u8; 32];
-            path_buf[..4].copy_from_slice(b"bin/");
-            let blen = (name_len as usize).min(28);
-            path_buf[4..4 + blen].copy_from_slice(&name_buf[..blen]);
-            let path = core::str::from_utf8(&path_buf[..4 + blen]).unwrap_or("bin/???");
-
-            match syscall::exec_with_mailbox(path, caps, &mb_buf) {
-                Ok((pid, _)) => {
-                    uinfo!("devd2", "restarted"; binary = binary, pid = pid);
+            match exec_driver(binary, port_name, caps, priority) {
+                Ok(pid) => {
+                    uinfo!("devd2", "restarted";
+                        binary = core::str::from_utf8(binary).unwrap_or("?"), pid = pid);
                     if let Some(ref mut svc) = self.services[i] {
                         svc.pid = pid;
                         svc.state = ServiceState::Starting;
                     }
                 }
                 Err(errno) => {
-                    uerror!("devd2", "restart_failed"; binary = binary, errno = errno as u32);
+                    uerror!("devd2", "restart_failed";
+                        binary = core::str::from_utf8(binary).unwrap_or("?"), errno = errno as u32);
                 }
             }
         }
@@ -481,14 +466,13 @@ impl Devd2 {
                 let value_end = (value_start + header.value_len as usize).min(len);
 
                 let key = &buf[key_start..key_start + header.key_len as usize];
-                let _value = &buf[value_start..value_end];
+                let value = &buf[value_start..value_end];
 
                 if key == b"state" {
-                    // Driver reported state change via busd
                     let addr = &buf[payload_start..payload_start + header.addr_len as usize];
                     udebug!("devd2", "state_event";
                         from = core::str::from_utf8(addr).unwrap_or("?"),
-                        state = core::str::from_utf8(_value).unwrap_or("?")
+                        state = core::str::from_utf8(value).unwrap_or("?")
                     );
                 }
             }
@@ -507,38 +491,10 @@ impl Devd2 {
         let key = &buf[key_start..key_end];
 
         if key == b"services" || key == b"list" {
-            // Reply with service list
             let mut reply = [0u8; 512];
-            let mut pos = 0;
-            for slot in &self.services {
-                if let Some(svc) = slot {
-                    let name = svc.name_str();
-                    let state = svc.state.as_str();
-                    // Format: "name state pid\n"
-                    let line = name.as_bytes();
-                    let sline = state.as_bytes();
-                    if pos + line.len() + sline.len() + 12 < reply.len() {
-                        reply[pos..pos + line.len()].copy_from_slice(line);
-                        pos += line.len();
-                        reply[pos] = b' ';
-                        pos += 1;
-                        reply[pos..pos + sline.len()].copy_from_slice(sline);
-                        pos += sline.len();
-                        reply[pos] = b' ';
-                        pos += 1;
-                        // PID as decimal
-                        let pid_str = format_u32(svc.pid);
-                        let plen = pid_str.len();
-                        reply[pos..pos + plen].copy_from_slice(pid_str.as_bytes());
-                        pos += plen;
-                        reply[pos] = b'\n';
-                        pos += 1;
-                    }
-                }
-            }
+            let pos = self.format_service_list(&mut reply);
             let _ = self.bus.send_reply(header.seq_id, &reply[..pos]);
         } else {
-            // Unknown key — error reply
             let _ = self.bus.send_error_reply(header.seq_id, b"unknown key");
         }
     }
@@ -602,50 +558,288 @@ impl Devd2 {
             return;
         }
 
-        let _cmd = &buf[..n];
+        let cmd = &buf[..n];
 
-        // Parse admin commands (simple text protocol for shell compatibility)
-        // The shell sends raw query protocol messages (QueryHeader format)
-        // For now, handle the most common: CONFIG_GET for "devc list"
-        // which is routed through devd → busd → driver
+        // Wire format from config.rs:
+        //   CONFIG <service> GET [key]\n   → targeted get
+        //   CONFIG GET [key]\n             → broadcast get
+        //   CONFIG <service> SET <key> <value>\n → targeted set
+        //   CONFIG SET <key> <value>\n     → broadcast set
+        let parsed = match parse_config_cmd(cmd) {
+            Some(p) => p,
+            None => return,
+        };
 
-        // Respond with service list for any query
+        // Local queries devd2 can answer without busd
+        if parsed.key == b"services" || parsed.key == b"list" {
+            self.send_service_list(idx);
+            return;
+        }
+
+        if parsed.is_set {
+            self.handle_config_set(&parsed, idx);
+        } else if parsed.service.is_empty() {
+            self.handle_broadcast_get(parsed.key, idx);
+        } else {
+            self.handle_targeted_get(parsed.service, parsed.key, idx);
+        }
+    }
+
+    fn handle_targeted_get(&mut self, service: &[u8], key: &[u8], admin_idx: usize) {
         let mut reply = [0u8; 512];
+        let pos = match self.bus.query(service, key, 500_000_000) {
+            Ok(qr) if !qr.is_error => {
+                let val = qr.value();
+                copy_slice(&mut reply, val)
+            }
+            Ok(qr) => {
+                // Error reply from driver — forward it
+                let val = qr.value();
+                let mut pos = copy_slice(&mut reply, b"ERR ");
+                pos += copy_slice(&mut reply[pos..], val);
+                pos += copy_slice(&mut reply[pos..], b"\n");
+                pos
+            }
+            Err(_) => {
+                copy_slice(&mut reply, b"ERR timeout\n")
+            }
+        };
+
+        if let Some(ref client) = self.admin_clients[admin_idx] {
+            let _ = client.channel.send(&reply[..pos]);
+        }
+    }
+
+    fn handle_broadcast_get(&mut self, key: &[u8], admin_idx: usize) {
+        let mut reply = [0u8; 1024];
         let mut pos = 0;
+
+        // Collect service names first to avoid borrowing self during iteration
+        let mut svc_names: [[u8; 16]; MAX_SERVICES] = [[0; 16]; MAX_SERVICES];
+        let mut svc_lens: [u8; MAX_SERVICES] = [0; MAX_SERVICES];
+        let mut svc_count = 0;
         for slot in &self.services {
             if let Some(svc) = slot {
-                let name = svc.name_str();
-                let state = svc.state.as_str();
-                let line = name.as_bytes();
-                let sline = state.as_bytes();
-                if pos + line.len() + sline.len() + 12 < reply.len() {
-                    reply[pos..pos + line.len()].copy_from_slice(line);
-                    pos += line.len();
-                    reply[pos] = b' ';
-                    pos += 1;
-                    reply[pos..pos + sline.len()].copy_from_slice(sline);
-                    pos += sline.len();
-                    reply[pos] = b' ';
-                    pos += 1;
-                    let pid_str = format_u32(svc.pid);
-                    let plen = pid_str.len();
-                    reply[pos..pos + plen].copy_from_slice(pid_str.as_bytes());
-                    pos += plen;
-                    reply[pos] = b'\n';
-                    pos += 1;
-                }
+                svc_names[svc_count] = svc.name;
+                svc_lens[svc_count] = svc.name_len;
+                svc_count += 1;
             }
         }
 
-        if let Some(ref client) = self.admin_clients[idx] {
+        for i in 0..svc_count {
+            let name = &svc_names[i][..svc_lens[i] as usize];
+            match self.bus.query(name, key, 200_000_000) {
+                Ok(qr) if !qr.is_error => {
+                    let val = qr.value();
+                    if !val.is_empty() {
+                        // [source] header
+                        pos += copy_slice(&mut reply[pos..], b"[");
+                        pos += copy_slice(&mut reply[pos..], name);
+                        pos += copy_slice(&mut reply[pos..], b"]\n");
+                        pos += copy_slice(&mut reply[pos..], val);
+                        // Ensure trailing newline
+                        if pos > 0 && reply[pos - 1] != b'\n' {
+                            pos += copy_slice(&mut reply[pos..], b"\n");
+                        }
+                    }
+                }
+                _ => {} // Skip services that don't respond or error
+            }
+        }
+
+        if let Some(ref client) = self.admin_clients[admin_idx] {
             let _ = client.channel.send(&reply[..pos]);
         }
+    }
+
+    fn handle_config_set(&mut self, cmd: &ConfigCmd<'_>, admin_idx: usize) {
+        let mut reply = [0u8; 256];
+
+        let addr = if cmd.service.is_empty() { b"*" as &[u8] } else { cmd.service };
+        let pos = match self.bus.send_set(addr, cmd.key, cmd.value) {
+            Ok(seq) => {
+                // Wait for reply
+                match self.bus.wait_reply(seq, 500_000_000) {
+                    Ok(qr) if !qr.is_error => {
+                        let val = qr.value();
+                        if val.is_empty() {
+                            copy_slice(&mut reply, b"OK\n")
+                        } else {
+                            copy_slice(&mut reply, val)
+                        }
+                    }
+                    Ok(qr) => {
+                        let val = qr.value();
+                        let mut pos = copy_slice(&mut reply, b"ERR ");
+                        pos += copy_slice(&mut reply[pos..], val);
+                        pos += copy_slice(&mut reply[pos..], b"\n");
+                        pos
+                    }
+                    Err(_) => copy_slice(&mut reply, b"ERR timeout\n"),
+                }
+            }
+            Err(_) => copy_slice(&mut reply, b"ERR send failed\n"),
+        };
+
+        if let Some(ref client) = self.admin_clients[admin_idx] {
+            let _ = client.channel.send(&reply[..pos]);
+        }
+    }
+
+    fn send_service_list(&self, admin_idx: usize) {
+        let mut reply = [0u8; 512];
+        let pos = self.format_service_list(&mut reply);
+        if let Some(ref client) = self.admin_clients[admin_idx] {
+            let _ = client.channel.send(&reply[..pos]);
+        }
+    }
+
+    /// Format "name state pid\n" for each service into buf. Returns bytes written.
+    fn format_service_list(&self, buf: &mut [u8]) -> usize {
+        let mut pos = 0;
+        for slot in &self.services {
+            if let Some(svc) = slot {
+                let name = svc.name_str().as_bytes();
+                let state = svc.state.as_str().as_bytes();
+                let pid = format_u32(svc.pid);
+                let need = name.len() + 1 + state.len() + 1 + pid.len() + 1;
+                if pos + need > buf.len() { break; }
+                pos += copy_slice(&mut buf[pos..], name);
+                buf[pos] = b' '; pos += 1;
+                pos += copy_slice(&mut buf[pos..], state);
+                buf[pos] = b' '; pos += 1;
+                pos += copy_slice(&mut buf[pos..], pid.as_bytes());
+                buf[pos] = b'\n'; pos += 1;
+            }
+        }
+        pos
     }
 }
 
 // =============================================================================
 // Helpers
 // =============================================================================
+
+// =============================================================================
+// CONFIG Command Parser
+// =============================================================================
+
+struct ConfigCmd<'a> {
+    service: &'a [u8],  // empty = broadcast
+    is_set: bool,
+    key: &'a [u8],      // empty = full summary
+    value: &'a [u8],    // only for SET
+}
+
+/// Parse the text CONFIG protocol from config.rs.
+///
+/// Formats:
+///   CONFIG <service> GET [key]\n
+///   CONFIG GET [key]\n
+///   CONFIG <service> SET <key> <value>\n
+///   CONFIG SET <key> <value>\n
+fn parse_config_cmd(cmd: &[u8]) -> Option<ConfigCmd<'_>> {
+    // Strip trailing newline/whitespace
+    let mut end = cmd.len();
+    while end > 0 && (cmd[end - 1] == b'\n' || cmd[end - 1] == b'\r' || cmd[end - 1] == b' ') {
+        end -= 1;
+    }
+    let cmd = &cmd[..end];
+
+    // Must start with "CONFIG "
+    if cmd.len() < 10 || &cmd[..7] != b"CONFIG " {
+        return None;
+    }
+    let rest = &cmd[7..];
+
+    // Split into up to 4 space-separated tokens
+    let mut tokens: [&[u8]; 4] = [&[], &[], &[], &[]];
+    let mut token_count = 0;
+    let mut pos = 0;
+
+    while pos < rest.len() && token_count < 4 {
+        // Skip spaces
+        while pos < rest.len() && rest[pos] == b' ' { pos += 1; }
+        if pos >= rest.len() { break; }
+
+        let start = pos;
+        // For the 4th token (SET value), take everything remaining
+        if token_count == 3 {
+            tokens[token_count] = &rest[start..];
+            token_count += 1;
+            break;
+        }
+        while pos < rest.len() && rest[pos] != b' ' { pos += 1; }
+        tokens[token_count] = &rest[start..pos];
+        token_count += 1;
+    }
+
+    if token_count == 0 { return None; }
+
+    // Detect: first token is GET/SET → broadcast (no service)
+    if eq_ci(tokens[0], b"GET") {
+        Some(ConfigCmd {
+            service: &[],
+            is_set: false,
+            key: if token_count > 1 { tokens[1] } else { &[] },
+            value: &[],
+        })
+    } else if eq_ci(tokens[0], b"SET") {
+        Some(ConfigCmd {
+            service: &[],
+            is_set: true,
+            key: if token_count > 1 { tokens[1] } else { &[] },
+            value: if token_count > 2 { tokens[2] } else { &[] },
+        })
+    } else if token_count >= 2 && eq_ci(tokens[1], b"GET") {
+        Some(ConfigCmd {
+            service: tokens[0],
+            is_set: false,
+            key: if token_count > 2 { tokens[2] } else { &[] },
+            value: &[],
+        })
+    } else if token_count >= 2 && eq_ci(tokens[1], b"SET") {
+        Some(ConfigCmd {
+            service: tokens[0],
+            is_set: true,
+            key: if token_count > 2 { tokens[2] } else { &[] },
+            value: if token_count > 3 { tokens[3] } else { &[] },
+        })
+    } else {
+        None
+    }
+}
+
+/// Case-insensitive byte comparison.
+fn eq_ci(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    for i in 0..a.len() {
+        if a[i].to_ascii_uppercase() != b[i].to_ascii_uppercase() { return false; }
+    }
+    true
+}
+
+fn copy_slice(dst: &mut [u8], src: &[u8]) -> usize {
+    let len = src.len().min(dst.len());
+    dst[..len].copy_from_slice(&src[..len]);
+    len
+}
+
+/// Build "bin/<binary>" path, create mailbox, exec. Returns pid on success.
+fn exec_driver(binary: &[u8], port_name: &[u8], caps: u64, priority: u8) -> Result<u32, u32> {
+    let mb_buf = build_mailbox(port_name, priority);
+
+    let mut path_buf = [0u8; 32];
+    path_buf[..4].copy_from_slice(b"bin/");
+    let blen = binary.len().min(28);
+    path_buf[4..4 + blen].copy_from_slice(&binary[..blen]);
+    let path = core::str::from_utf8(&path_buf[..4 + blen]).unwrap_or("bin/???");
+
+    match syscall::exec_with_mailbox(path, caps, &mb_buf) {
+        Ok((pid, _)) => Ok(pid),
+        Err(errno) => Err(errno as u32),
+    }
+}
 
 /// Build a mailbox buffer with port name for a spawned child.
 fn build_mailbox(port_name: &[u8], priority: u8) -> [u8; 256] {

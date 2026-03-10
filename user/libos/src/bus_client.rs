@@ -210,34 +210,41 @@ impl BusClient {
     }
 
     /// Wait for a reply matching the given seq_id with timeout.
-    fn wait_reply(&mut self, seq_id: u16, timeout_ns: u64) -> Result<QueryReply, SysError> {
-        let mut buf = [0u8; MSG_BUF_SIZE];
-        let len = self.channel.recv_deadline(&mut buf, timeout_ns)?;
+    /// Discards non-matching messages (events, other replies) and retries
+    /// up to 8 times within the timeout window.
+    pub fn wait_reply(&mut self, seq_id: u16, timeout_ns: u64) -> Result<QueryReply, SysError> {
+        for _ in 0..8 {
+            let mut buf = [0u8; MSG_BUF_SIZE];
+            let len = self.channel.recv_deadline(&mut buf, timeout_ns)?;
 
-        if len < BusMsgHeader::SIZE {
-            return Err(SysError::InvalidArgument);
+            if len < BusMsgHeader::SIZE {
+                continue;
+            }
+
+            let header = match BusMsgHeader::read_from(&buf[..len]) {
+                Some(h) => h,
+                None => continue,
+            };
+
+            if header.msg_type != bus_msg_type::REPLY || header.seq_id != seq_id {
+                // Non-matching message (event, stale reply) — discard and retry
+                continue;
+            }
+
+            let is_error = (header.flags & bus_msg_flags::ERROR) != 0;
+            let payload_start = BusMsgHeader::SIZE;
+            let value_start = payload_start + header.addr_len as usize + header.key_len as usize;
+            let value_end = (value_start + header.value_len as usize).min(len);
+
+            return Ok(QueryReply {
+                value_start,
+                value_end,
+                is_error,
+                buf,
+            });
         }
 
-        let header = BusMsgHeader::read_from(&buf[..len])
-            .ok_or(SysError::InvalidArgument)?;
-
-        if header.msg_type != bus_msg_type::REPLY || header.seq_id != seq_id {
-            // Got a different message — for now, discard and return error
-            // Future: buffer non-matching messages
-            return Err(SysError::WouldBlock);
-        }
-
-        let is_error = (header.flags & bus_msg_flags::ERROR) != 0;
-        let payload_start = BusMsgHeader::SIZE;
-        let value_start = payload_start + header.addr_len as usize + header.key_len as usize;
-        let value_end = (value_start + header.value_len as usize).min(len);
-
-        Ok(QueryReply {
-            value_start,
-            value_end,
-            is_error,
-            buf,
-        })
+        Err(SysError::Timeout)
     }
 }
 
