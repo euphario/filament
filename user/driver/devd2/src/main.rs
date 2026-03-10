@@ -76,6 +76,9 @@ struct Service {
     pid: u32,
     name: [u8; 16],
     name_len: u8,
+    /// Bus path — unique identity, e.g. "/uart:0/consoled"
+    path: [u8; 48],
+    path_len: u8,
     state: ServiceState,
     trigger_port: [u8; 32],
     trigger_port_len: u8,
@@ -88,6 +91,10 @@ struct Service {
 impl Service {
     fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("?")
+    }
+
+    fn path_bytes(&self) -> &[u8] {
+        &self.path[..self.path_len as usize]
     }
 }
 
@@ -300,10 +307,22 @@ impl Devd2 {
                 let tlen = port_name.len().min(32);
                 trigger[..tlen].copy_from_slice(&port_name[..tlen]);
 
+                // Build path: /trigger_port/binary (e.g. /uart:0/consoled)
+                let mut path = [0u8; 48];
+                let plen = {
+                    let mut w = WireWriter::new(&mut path);
+                    w.put_bytes(port_name);
+                    w.put_bytes(b"/");
+                    w.put_bytes(binary);
+                    w.finish()
+                };
+
                 *slot = Some(Service {
                     pid,
                     name,
                     name_len: nlen as u8,
+                    path,
+                    path_len: plen as u8,
                     state: ServiceState::Starting,
                     trigger_port: trigger,
                     trigger_port_len: tlen as u8,
@@ -369,6 +388,29 @@ impl Devd2 {
             }
 
             libos::ulog::flush();
+        }
+    }
+
+    // =========================================================================
+    // Service State
+    // =========================================================================
+
+    /// Update service state from a bus event (e.g. state=Ready from a driver).
+    fn update_service_state(&mut self, sender: &[u8], state: &[u8]) {
+        let new_state = match state {
+            b"Ready" => ServiceState::Ready,
+            b"Running" => ServiceState::Running,
+            _ => return,
+        };
+
+        for slot in self.services.iter_mut() {
+            if let Some(ref mut svc) = slot {
+                if svc.path_bytes() == sender {
+                    svc.state = new_state;
+                    uinfo!("devd2", "service_state"; name = svc.name_str(), state = svc.state.as_str());
+                    return;
+                }
+            }
         }
     }
 
@@ -460,10 +502,7 @@ impl Devd2 {
         match header.msg_type {
             bus_msg_type::EVENT => {
                 if key == b"state" {
-                    udebug!("devd2", "state_event";
-                        from = core::str::from_utf8(addr).unwrap_or("?"),
-                        state = core::str::from_utf8(value).unwrap_or("?")
-                    );
+                    self.update_service_state(addr, value);
                 }
             }
             bus_msg_type::GET => {
@@ -553,11 +592,42 @@ impl Devd2 {
         }
     }
 
+    /// Resolve a service name to its bus path. If already a path (starts with /),
+    /// return as-is. Otherwise, find the first service with matching binary name.
+    fn resolve_service_addr(&self, service: &[u8]) -> Option<([u8; 48], u8)> {
+        if service.starts_with(b"/") {
+            // Already a path — use directly
+            let mut path = [0u8; 48];
+            let len = service.len().min(48);
+            path[..len].copy_from_slice(&service[..len]);
+            return Some((path, len as u8));
+        }
+        for slot in &self.services {
+            if let Some(svc) = slot {
+                if &svc.name[..svc.name_len as usize] == service {
+                    return Some((svc.path, svc.path_len));
+                }
+            }
+        }
+        None
+    }
+
     fn handle_targeted_get(&mut self, service: &[u8], key: &[u8], admin_idx: usize) {
+        let addr = match self.resolve_service_addr(service) {
+            Some((path, len)) => (path, len),
+            None => {
+                let mut buf = [0u8; 64];
+                let pos = { let mut w = WireWriter::new(&mut buf); write_error(&mut w, b"unknown service"); w.finish() };
+                self.send_admin_reply_buf(admin_idx, &buf[..pos]);
+                return;
+            }
+        };
+        let addr = &addr.0[..addr.1 as usize];
+
         let mut buf = [0u8; 512];
         let pos = {
             let mut w = WireWriter::new(&mut buf);
-            match self.bus.query(service, key, 500_000_000) {
+            match self.bus.query(addr, key, 500_000_000) {
                 Ok(qr) if !qr.is_error => { w.put_bytes(qr.value()); }
                 Ok(qr) => write_error(&mut w, qr.value()),
                 Err(_) => write_error(&mut w, b"timeout"),
@@ -572,17 +642,17 @@ impl Devd2 {
         let pos = {
             let mut w = WireWriter::new(&mut buf);
 
-            // Snapshot service names to avoid borrowing self during bus queries
-            let svc_snapshot = self.snapshot_service_names();
+            // Snapshot service paths to avoid borrowing self during bus queries
+            let svc_snapshot = self.snapshot_service_paths();
 
-            for (name, len) in &svc_snapshot {
+            for (path, len) in &svc_snapshot {
                 if *len == 0 { break; }
-                let name = &name[..*len as usize];
-                match self.bus.query(name, key, 200_000_000) {
+                let path = &path[..*len as usize];
+                match self.bus.query(path, key, 200_000_000) {
                     Ok(qr) if !qr.is_error && !qr.value().is_empty() => {
                         let val = qr.value();
                         w.put_bytes(b"[");
-                        w.put_bytes(name);
+                        w.put_bytes(path);
                         w.put_bytes(b"]\n");
                         w.put_bytes(val);
                         if !val.ends_with(b"\n") {
@@ -598,11 +668,24 @@ impl Devd2 {
     }
 
     fn handle_config_set(&mut self, cmd: &ConfigCmd<'_>, admin_idx: usize) {
+        let addr_resolved;
+        let addr: &[u8] = if cmd.service.is_empty() {
+            b"*"
+        } else {
+            match self.resolve_service_addr(cmd.service) {
+                Some((path, len)) => { addr_resolved = (path, len); &addr_resolved.0[..addr_resolved.1 as usize] }
+                None => {
+                    let mut buf = [0u8; 64];
+                    let pos = { let mut w = WireWriter::new(&mut buf); write_error(&mut w, b"unknown service"); w.finish() };
+                    self.send_admin_reply_buf(admin_idx, &buf[..pos]);
+                    return;
+                }
+            }
+        };
+
         let mut buf = [0u8; 256];
         let pos = {
             let mut w = WireWriter::new(&mut buf);
-            let addr = if cmd.service.is_empty() { b"*" as &[u8] } else { cmd.service };
-
             match self.bus.send_set(addr, cmd.key, cmd.value) {
                 Ok(seq) => match self.bus.wait_reply(seq, 500_000_000) {
                     Ok(qr) if !qr.is_error => {
@@ -627,23 +710,23 @@ impl Devd2 {
         }
     }
 
-    /// Snapshot service names into a stack array for iteration without borrowing self.
-    fn snapshot_service_names(&self) -> [([u8; 16], u8); MAX_SERVICES] {
-        let mut out = [([0u8; 16], 0u8); MAX_SERVICES];
+    /// Snapshot service paths into a stack array for iteration without borrowing self.
+    fn snapshot_service_paths(&self) -> [([u8; 48], u8); MAX_SERVICES] {
+        let mut out = [([0u8; 48], 0u8); MAX_SERVICES];
         for (i, slot) in self.services.iter().enumerate() {
             if let Some(svc) = slot {
-                out[i] = (svc.name, svc.name_len);
+                out[i] = (svc.path, svc.path_len);
             }
         }
         out
     }
 
-    /// Format "name state pid\n" for each service into buf. Returns bytes written.
+    /// Format "path state pid\n" for each service into buf. Returns bytes written.
     fn format_service_list(&self, buf: &mut [u8]) -> usize {
         let mut w = WireWriter::new(buf);
         for slot in &self.services {
             if let Some(svc) = slot {
-                w.put_bytes(svc.name_str().as_bytes());
+                w.put_bytes(svc.path_bytes());
                 w.put_bytes(b" ");
                 w.put_bytes(svc.state.as_str().as_bytes());
                 w.put_bytes(b" ");
@@ -763,7 +846,17 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 
 /// Build "bin/<binary>" path, create mailbox, exec. Returns pid on success.
 fn exec_driver(binary: &[u8], port_name: &[u8], caps: u64, priority: u8) -> Result<u32, u32> {
-    let mb_buf = build_mailbox(port_name, priority);
+    // Build bus path: /port_name/binary (e.g. /uart:0/consoled)
+    let mut bus_path = [0u8; 48];
+    let bus_path_len = {
+        let mut w = WireWriter::new(&mut bus_path);
+        w.put_bytes(port_name);
+        w.put_bytes(b"/");
+        w.put_bytes(binary);
+        w.finish()
+    };
+
+    let mb_buf = build_mailbox(port_name, &bus_path[..bus_path_len], priority);
 
     let mut path_buf = [0u8; 32];
     let path_len = {
@@ -780,25 +873,27 @@ fn exec_driver(binary: &[u8], port_name: &[u8], caps: u64, priority: u8) -> Resu
     }
 }
 
-/// Build a mailbox buffer with port name for a spawned child.
-fn build_mailbox(port_name: &[u8], priority: u8) -> [u8; 256] {
+/// Build a mailbox buffer with port name and bus path for a spawned child.
+fn build_mailbox(port_name: &[u8], bus_path: &[u8], priority: u8) -> [u8; 256] {
     let mut buf = [0u8; 256];
 
     // Header at [0..64)
     let mut hdr = MailboxHeader::empty();
     hdr.priority = priority;
     hdr.flags = abi::mailbox_flags::PARENT_WRITTEN;
-    hdr.kv_count = 1;
+    hdr.kv_count = 2;
 
     let hdr_bytes = unsafe {
         core::slice::from_raw_parts(&hdr as *const MailboxHeader as *const u8, 64)
     };
     buf[..64].copy_from_slice(hdr_bytes);
 
-    // KV: "port.name" = port_name at [64..)
+    // KVs at [64..)
     let mut w = WireWriter::new(&mut buf[64..]);
     w.put_len_u8_bytes(b"port.name");
     w.put_len_u8_bytes(port_name);
+    w.put_len_u8_bytes(b"bus.path");
+    w.put_len_u8_bytes(bus_path);
 
     buf
 }

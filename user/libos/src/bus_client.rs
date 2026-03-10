@@ -81,10 +81,12 @@ impl BusClient {
     // =========================================================================
 
     /// Emit an event (fire and forget). busd routes to all subscribers.
-    pub fn emit(&mut self, key: &[u8], value: &[u8]) -> Result<(), SysError> {
+    /// `from` identifies the sender (e.g. driver name).
+    pub fn emit(&mut self, from: &[u8], key: &[u8], value: &[u8]) -> Result<(), SysError> {
         let mut buf = [0u8; MSG_BUF_SIZE];
         let seq = self.alloc_seq();
         let len = BusMsgBuilder::new(&mut buf, bus_msg_type::EVENT, seq)
+            .addr(from)
             .key(key)
             .value(value)
             .finish();

@@ -327,16 +327,6 @@ impl PhysicalMemoryManager {
             }
         }
 
-        // Debug: log failure for large allocations
-        if count >= 256 {
-            kwarn!("pmm", "alloc_failed";
-                requested = count as u64,
-                scanned = scanned as u64,
-                max_consecutive = max_consecutive as u64,
-                free = self.free_pages as u64,
-                first_free = self.first_free_page as u64
-            );
-        }
         None
     }
 
@@ -387,7 +377,7 @@ impl PhysicalMemoryManager {
         if self.frame(page_idx).state == PageState::Used {
             let old_ref = self.frame(page_idx).ref_count;
             if old_ref == 0 {
-                crate::kwarn!("pmm", "double_free"; addr = phys_addr as u64, page = page_idx as u64);
+                // Double-free detected — caller should log after releasing PMM lock
                 return;
             }
             let new_ref = old_ref - 1;
@@ -478,7 +468,16 @@ pub fn alloc_page() -> Option<usize> {
 /// Allocate contiguous pages
 pub fn alloc_pages(count: usize) -> Option<usize> {
     let mut guard = PMM.lock();
-    guard.alloc_pages(count)
+    let result = guard.alloc_pages(count);
+    if result.is_none() && count >= 256 {
+        let free = guard.free_pages;
+        drop(guard);
+        kwarn!("pmm", "alloc_pages_failed";
+            requested = count as u64,
+            free = free as u64
+        );
+    }
+    result
 }
 
 /// Free a single page

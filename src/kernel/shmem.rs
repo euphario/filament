@@ -566,6 +566,7 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
         // SECURITY FIX: Check for double-map FIRST via MappingTable
         // This prevents double-map attacks
         if guard.mappings.has_mapping(shmem_id, pid) {
+            drop(guard);
             kwarn!("shmem", "map_already_mapped";
                 caller = pid as u64,
                 shmem = shmem_id as u64);
@@ -593,6 +594,7 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
         let (phys, sz, is_dying, owner, allowed, is_public) = match found_info {
             Some(info) => info,
             None => {
+                drop(guard);
                 kwarn!("shmem", "map_not_found"; caller = pid as u64, shmem = shmem_id as u64);
                 return Err(-2); // ENOENT
             }
@@ -600,6 +602,7 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
 
         // Reject mapping if region is dying (owner exiting)
         if is_dying {
+            drop(guard);
             kwarn!("shmem", "map_dying";
                 caller = pid as u64,
                 shmem = shmem_id as u64);
@@ -609,6 +612,7 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
         // Check if allowed (owner, public, or in allowed list)
         let is_allowed = pid == owner || is_public || allowed.iter().any(|&p| p == pid);
         if !is_allowed {
+            drop(guard);
             kwarn!("shmem", "map_denied";
                 caller = pid as u64,
                 shmem = shmem_id as u64,
@@ -710,9 +714,11 @@ pub fn allow(owner_pid: Pid, shmem_id: u32, peer_pid: Pid) -> Result<(), i64> {
 
                 // Only owner can grant access
                 if region.owner_pid != owner_pid {
+                    let actual = region.owner_pid;
+                    drop(guard);
                     kwarn!("shmem", "allow_denied_not_owner";
                         caller = owner_pid as u64,
-                        actual_owner = region.owner_pid as u64);
+                        actual_owner = actual as u64);
                     return Err(-1); // EPERM
                 }
 
@@ -743,6 +749,7 @@ pub fn set_public(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
                 }
 
                 region.is_public = true;
+                drop(guard);
                 kdebug!("shmem", "set_public"; id = shmem_id as u64, owner = owner_pid as u64);
                 return Ok(());
             }
@@ -1038,6 +1045,7 @@ pub fn destroy(owner_pid: Pid, shmem_id: u32) -> Result<(), i64> {
                     // mapping_count of 1 means only the owner has it mapped (safe to destroy)
                     // mapping_count > 1 means other processes still have active mappings
                     if active_mappings > 1 {
+                        drop(guard);
                         kwarn!("shmem", "destroy_refused_busy";
                             id = shmem_id as u64,
                             mappings = active_mappings as u64);

@@ -315,6 +315,10 @@ struct RuntimeCtx {
     last_timeout_ms: u32,
     /// Connection to busd (bus daemon) for message routing.
     bus_client: Option<crate::bus_client::BusClient>,
+    /// Bus path — unique identity assigned by devd (e.g. "/uart:0/consoled").
+    bus_path: [u8; 48],
+    /// Bus path length (0 = no path assigned).
+    bus_path_len: usize,
 }
 
 impl RuntimeCtx {
@@ -346,6 +350,8 @@ impl RuntimeCtx {
             managed_timers: [const { None }; MAX_MANAGED_TIMERS],
             last_timeout_ms: u32::MAX,
             bus_client: None,
+            bus_path: [0u8; 48],
+            bus_path_len: 0,
         }
     }
 
@@ -526,6 +532,24 @@ impl RuntimeCtx {
         self.children[child_idx] = None;
         if self.child_count > 0 { self.child_count -= 1; }
     }
+
+    /// Bus path identity (e.g. "/uart:0/consoled"). Falls back to name if no path set.
+    fn identity(&self) -> &[u8] {
+        if self.bus_path_len > 0 {
+            &self.bus_path[..self.bus_path_len]
+        } else {
+            self.name()
+        }
+    }
+
+    /// Copy identity to stack buffer — avoids borrow conflicts with bus_client.
+    fn identity_buf(&self) -> ([u8; 48], usize) {
+        let id = self.identity();
+        let mut buf = [0u8; 48];
+        let len = id.len().min(48);
+        buf[..len].copy_from_slice(&id[..len]);
+        (buf, len)
+    }
 }
 
 impl BusCtx for RuntimeCtx {
@@ -575,8 +599,9 @@ impl BusCtx for RuntimeCtx {
     }
 
     fn bus_emit(&mut self, key: &[u8], value: &[u8]) -> Result<(), BusError> {
+        let id = self.identity_buf();
         if let Some(ref mut bc) = self.bus_client {
-            bc.emit(key, value).map_err(|_| BusError::Internal)
+            bc.emit(&id.0[..id.1], key, value).map_err(|_| BusError::Internal)
         } else {
             Ok(()) // busd not connected — silently ignore during migration
         }
@@ -857,6 +882,7 @@ impl BusCtx for RuntimeCtx {
         };
 
         // Register port via busd
+        let id = self.identity_buf();
         if let Some(ref mut bc) = self.bus_client {
             let mut val = [0u8; 128];
             let nlen = info_to_send.name_len as usize;
@@ -865,7 +891,7 @@ impl BusCtx for RuntimeCtx {
             val[2] = info_to_send.name_len;
             val[3..3 + nlen].copy_from_slice(&info_to_send.name[..nlen]);
             let total = 3 + nlen;
-            let _ = bc.emit(b"port.registered", &val[..total]);
+            let _ = bc.emit(&id.0[..id.1], b"port.registered", &val[..total]);
         }
 
         // Log port registration from the framework — drivers don't need to
@@ -897,13 +923,14 @@ impl BusCtx for RuntimeCtx {
             state = state.as_str()
         );
 
+        let id = self.identity_buf();
         if let Some(ref mut bc) = self.bus_client {
             let mut val = [0u8; 64];
             let nlen = name.len().min(60);
             val[0] = state as u8;
             val[1] = nlen as u8;
             val[2..2 + nlen].copy_from_slice(&name[..nlen]);
-            let _ = bc.emit(b"port.state", &val[..2 + nlen]);
+            let _ = bc.emit(&id.0[..id.1], b"port.state", &val[..2 + nlen]);
         }
         Ok(())
     }
@@ -1042,9 +1069,15 @@ impl<D: Driver> DriverRuntime<D> {
             syscall::exit(code);
         }
 
-        // Report Ready to busd
+        // Report Ready to busd (init done, accepting config queries)
+        let id = self.ctx.identity_buf();
         if let Some(ref mut bc) = self.ctx.bus_client {
-            let _ = bc.emit(b"state", b"Ready");
+            let _ = bc.emit(&id.0[..id.1], b"state", b"Ready");
+        }
+
+        // Report Running (fully operational, entering event loop)
+        if let Some(ref mut bc) = self.ctx.bus_client {
+            let _ = bc.emit(&id.0[..id.1], b"state", b"Running");
         }
 
         // Flush structured logs from reset before entering event loop
@@ -2079,12 +2112,40 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
 
     let mut runtime = DriverRuntime::new(driver, mux, name);
 
+    // Extract bus.path from mailbox if available
+    let mut bus_path = [0u8; 48];
+    let mut bus_path_len = 0usize;
+    if has_mailbox {
+        let mb = mailbox.as_ref().unwrap();
+        let mut keys = [[0u8; 32]; 4];
+        let mut key_lens = [0u8; 4];
+        let mut values = [[0u8; 64]; 4];
+        let mut value_lens = [0u8; 4];
+        let kv_count = mb.read_kvs(&mut keys, &mut key_lens, &mut values, &mut value_lens);
+        for i in 0..kv_count {
+            let klen = key_lens[i] as usize;
+            let vlen = value_lens[i] as usize;
+            if &keys[i][..klen] == b"bus.path" {
+                let n = vlen.min(48);
+                bus_path[..n].copy_from_slice(&values[i][..n]);
+                bus_path_len = n;
+                break;
+            }
+        }
+    }
+
+    // Store bus path in runtime context
+    if bus_path_len > 0 {
+        runtime.ctx.bus_path[..bus_path_len].copy_from_slice(&bus_path[..bus_path_len]);
+        runtime.ctx.bus_path_len = bus_path_len;
+    }
+
     // Connect to busd (bus daemon) for message routing.
     match crate::bus_client::BusClient::connect() {
         Ok(mut bc) => {
-            // Register with busd: name, empty path, no class, no event subscription
-            let _ = bc.register(name, b"", 0, false);
-            crate::unotice!("bus", "busd_connected");
+            let path = &bus_path[..bus_path_len];
+            let _ = bc.register(name, path, 0, false);
+            crate::unotice!("bus", "busd_connected"; path = core::str::from_utf8(path).unwrap_or("?"));
             runtime.ctx.bus_client = Some(bc);
         }
         Err(_) => {

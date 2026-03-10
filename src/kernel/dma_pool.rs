@@ -160,28 +160,37 @@ pub fn alloc_high(size: usize) -> Result<u64, i64> {
     let mut pool = DMA_POOL_HIGH.lock();
 
     if !pool.initialized {
+        drop(pool);
         kerror!("dma_pool", "alloc_high_not_init");
         return Err(-2);
     }
 
     // OVERFLOW CHECK: Verify addition doesn't overflow
-    let new_offset = pool.next_offset.checked_add(aligned_size).ok_or_else(|| {
-        kerror!("dma_pool", "alloc_high_offset_overflow");
-        -22i64 // EINVAL
-    })?;
+    let new_offset = match pool.next_offset.checked_add(aligned_size) {
+        Some(v) => v,
+        None => {
+            drop(pool);
+            kerror!("dma_pool", "alloc_high_offset_overflow");
+            return Err(-22);
+        }
+    };
 
     if new_offset > DMA_POOL_HIGH_SIZE {
-        kerror!("dma_pool", "alloc_high_oom"; requested = aligned_size as u64, available = (DMA_POOL_HIGH_SIZE - pool.next_offset) as u64);
+        let available = DMA_POOL_HIGH_SIZE - pool.next_offset;
+        drop(pool);
+        kerror!("dma_pool", "alloc_high_oom"; requested = aligned_size as u64, available = available as u64);
         return Err(-3);
     }
 
     let phys_addr = DMA_POOL_HIGH_BASE + pool.next_offset as u64;
     pool.next_offset = new_offset;
+    let usage = pool.next_offset;
+    drop(pool);
 
     kdebug!("dma_pool", "alloc_high_ok";
         size = aligned_size as u64,
         addr = klog::hex64(phys_addr),
-        usage = pool.next_offset as u64,
+        usage = usage as u64,
         total = DMA_POOL_HIGH_SIZE as u64
     );
 
@@ -208,29 +217,38 @@ pub fn alloc(size: usize) -> Result<u64, i64> {
     let mut pool = DMA_POOL.lock();
 
     if !pool.initialized {
+        drop(pool);
         kerror!("dma_pool", "alloc_not_init");
         return Err(-2); // ENODEV
     }
 
     // OVERFLOW CHECK: Verify addition doesn't overflow
-    let new_offset = pool.next_offset.checked_add(aligned_size).ok_or_else(|| {
-        kerror!("dma_pool", "alloc_offset_overflow");
-        -22i64 // EINVAL
-    })?;
+    let new_offset = match pool.next_offset.checked_add(aligned_size) {
+        Some(v) => v,
+        None => {
+            drop(pool);
+            kerror!("dma_pool", "alloc_offset_overflow");
+            return Err(-22);
+        }
+    };
 
     // Check if we have enough space
     if new_offset > DMA_POOL_SIZE {
-        kerror!("dma_pool", "alloc_oom"; requested = aligned_size as u64, available = (DMA_POOL_SIZE - pool.next_offset) as u64);
+        let available = DMA_POOL_SIZE - pool.next_offset;
+        drop(pool);
+        kerror!("dma_pool", "alloc_oom"; requested = aligned_size as u64, available = available as u64);
         return Err(-3); // ENOMEM
     }
 
     let phys_addr = DMA_POOL_BASE + pool.next_offset as u64;
     pool.next_offset = new_offset;
+    let usage = pool.next_offset;
+    drop(pool);
 
     kdebug!("dma_pool", "alloc_ok";
         size = aligned_size as u64,
         addr = klog::hex64(phys_addr),
-        usage = pool.next_offset as u64,
+        usage = usage as u64,
         total = DMA_POOL_SIZE as u64
     );
 
