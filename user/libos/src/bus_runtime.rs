@@ -4,7 +4,6 @@
 //! Uses a Mux-based event loop — blocks until something happens, no polling.
 //!
 //! Communication with the bus daemon (busd) for config get/set and lifecycle.
-//! Children are managed via supervision queues for parent-child relay.
 //!
 //! ## Event sources
 //!
@@ -41,9 +40,6 @@ const TAG_BLOCK_PORT_BASE: u32 = 0xFFFF_FE00;
 
 /// Tag base for kernel bus channels.
 const TAG_KERNEL_BUS_BASE: u32 = 0xFFFF_FD00;
-
-/// Tag base for child supervision queue handles.
-const TAG_CHILD_SUPERQ_BASE: u32 = 0xFFFF_FC00;
 
 /// Tag for busd channel (bus daemon message routing).
 const TAG_BUSD: u32 = 0xFFFF_FA00;
@@ -119,16 +115,9 @@ struct ChildSpawnCtx {
 }
 
 /// A child spawned by this driver via exec_with_mailbox.
-///
-/// Communication (both directions via SuperQ):
-/// - Child→parent: FORWARD notes via SuperQ up ring
-/// - Parent→child: FORWARD notes via SuperQ down ring
-/// - Child death: EXIT note via SuperQ + CHILD_EXIT signal
 struct ChildEntry {
     /// Shared mailbox page (keeps shmem handle alive; birth context already read).
     mailbox: Mailbox,
-    /// Supervision queue for bidirectional parent↔child messaging.
-    superq: Option<crate::supervision::SupervisionHandle>,
     /// Child PID.
     pid: u32,
     /// Cached spawn context for path annotation and config forwarding.
@@ -152,10 +141,6 @@ const MAX_PENDING_CONFIG: usize = 4;
 enum ConfigQueryOrigin {
     /// Query came from busd or internal dispatch (respond via respond_info).
     Busd { seq_id: u32 },
-    /// Query came from parent via supervision channel (respond via child channel).
-    /// (This variant is used when bus_runtime itself is a child and received
-    /// a forwarded config query from its parent.)
-    Parent { seq_id: u32 },
 }
 
 /// A config query being forwarded to children, awaiting convergence.
@@ -196,7 +181,7 @@ impl PendingConfigQuery {
 }
 
 // ============================================================================
-// Route Action (message routing through supervision tree)
+// Route Action (message routing through driver tree)
 // ============================================================================
 
 /// Routing decision for an inbound ADDRESSED message.
@@ -221,7 +206,6 @@ enum RouteAction<'a> {
 mod kbus_proto {
     pub const STATE_SNAPSHOT: u8 = 0;
     pub const DEVICE_LIST: u8 = 3;
-    // STATE_CHANGED uses supervision protocol (abi::supervision::STATE_CHANGED = 3)
 }
 
 /// Maximum enumerated devices per bus
@@ -537,15 +521,8 @@ impl RuntimeCtx {
         }
     }
 
-    /// Clean up a child entry: unwatch SuperQ from Mux and drop.
+    /// Clean up a child entry and drop.
     fn drop_child_entry(&mut self, child_idx: usize) {
-        if let Some(entry) = &self.children[child_idx] {
-            if let Some(ref superq) = entry.superq {
-                let h = superq.handle();
-                let _ = self.mux.remove(h);
-                self.handles.remove(h);
-            }
-        }
         self.children[child_idx] = None;
         if self.child_count > 0 { self.child_count -= 1; }
     }
@@ -909,9 +886,6 @@ impl BusCtx for RuntimeCtx {
         state: abi::PortState,
     ) -> Result<(), BusError> {
         // Port going Safe: remove children spawned for this port.
-        // The EXIT note hasn't arrived yet (microtask delay), so the stale
-        // child entry would cause the next ADDRESSED SpawnChild to be
-        // forwarded to the dead child's SuperQ instead of handled locally.
         if state == abi::PortState::Safe {
             self.remove_children_for_port(name);
         }
@@ -1145,10 +1119,6 @@ impl<D: Driver> DriverRuntime<D> {
 
             if tag == TAG_BUSD {
                 self.handle_busd_message();
-            } else if tag >= TAG_CHILD_SUPERQ_BASE && tag < TAG_KERNEL_BUS_BASE {
-                // Child SuperQ readable — child sent a message via supervision queue
-                let child_idx = (tag - TAG_CHILD_SUPERQ_BASE) as usize;
-                self.handle_child_superq_event(child_idx);
             } else if tag >= TAG_KERNEL_BUS_BASE && tag < TAG_BLOCK_PORT_BASE {
                 // Kernel bus state notification
                 let bus_idx = (tag - TAG_KERNEL_BUS_BASE) as usize;
@@ -1186,7 +1156,7 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
-    /// Handle a kernel bus channel event (state snapshot or supervision message).
+    /// Handle a kernel bus channel event (state snapshot).
     fn handle_kernel_bus_event(&mut self, bus_idx: usize) {
         let mut buf = [0u8; 32];
 
@@ -1209,12 +1179,6 @@ impl<D: Driver> DriverRuntime<D> {
                             entry.info = new_info;
                         }
                     }
-                }
-                abi::supervision::STATE_CHANGED if n >= 4 => {
-                    // Supervision protocol: [STATE_CHANGED, old, new, reason]
-                    // We're the owner — kernel is telling us about state changes
-                    // (normally we wouldn't see these since we ARE the owner,
-                    //  but they can arrive on Reset/Safe transitions)
                 }
                 other => {
                     // Forward unknown message types to driver
@@ -1291,25 +1255,10 @@ impl<D: Driver> DriverRuntime<D> {
             offset += vlen;
         }
 
-        // Send to children via mailbox — either one targeted child or all
-        let mut sent_mask: u8 = 0;
-        if let Some(target) = self.routing.target_child() {
-            // Routed: send only to the targeted child
-            if self.ctx.children[target].is_some() {
-                self.send_to_child_superq(target, &qbuf[..offset]);
-                sent_mask |= 1 << target;
-            }
-        } else {
-            for i in 0..MAX_CHILDREN {
-                if let Some(entry) = &self.ctx.children[i] {
-                    // Skip children that haven't spoken the bus protocol
-                    // (e.g., shell) — they won't respond with EOL.
-                    if !entry.bus_active { continue; }
-                    self.send_to_child_superq(i, &qbuf[..offset]);
-                    sent_mask |= 1 << i;
-                }
-            }
-        }
+        // No child transport available — config forwarding is not yet
+        // wired via busd channels. sent_mask stays 0 → returns false.
+        let sent_mask: u8 = 0;
+        let _ = offset; // suppress unused warning
 
         if sent_mask == 0 {
             return false;
@@ -1348,7 +1297,6 @@ impl<D: Driver> DriverRuntime<D> {
 
         let seq_id = match pcq.origin {
             ConfigQueryOrigin::Busd { seq_id } => seq_id,
-            ConfigQueryOrigin::Parent { seq_id } => seq_id,
         };
 
         if pcq.response_len > 0 {
@@ -1375,7 +1323,6 @@ impl<D: Driver> DriverRuntime<D> {
                     || (pcq.msg_type == query_msg::CONFIG_SET && info_bytes == b"ERR unknown key\n");
                 let oseq = match pcq.origin {
                     ConfigQueryOrigin::Busd { seq_id } => seq_id,
-                    ConfigQueryOrigin::Parent { seq_id } => seq_id,
                 };
                 (eol, pcq.relay, oseq)
             }
@@ -1476,7 +1423,7 @@ impl<D: Driver> DriverRuntime<D> {
     }
 
     // ========================================================================
-    // Routing Layer (ADDRESSED messages through supervision tree)
+    // Routing Layer (ADDRESSED messages through driver tree)
     // ========================================================================
 
     /// Make a routing decision for an inbound message.
@@ -1667,39 +1614,6 @@ impl<D: Driver> DriverRuntime<D> {
         }
     }
 
-    /// Send a command to a child via its SuperQ (parent→child direction).
-    ///
-    /// Writes a FORWARD note containing the raw payload into the child's
-    /// supervision queue down ring. The kernel wakes the child's subscriber.
-    fn send_to_child_superq(&mut self, child_idx: usize, payload: &[u8]) {
-        if let Some(entry) = &self.ctx.children[child_idx] {
-            if let Some(ref superq) = entry.superq {
-                let _ = superq.send_forward(payload, 0);
-            }
-        }
-    }
-
-    /// Forward a routed message to a specific child via SuperQ.
-    fn forward_to_child_routed(&mut self, child_idx: usize, raw: &[u8], child_route: &[u8]) {
-        let mut buf = [0u8; 576];
-        let len = Self::build_routed_message(raw, child_route, &mut buf);
-        if len > 0 {
-            self.send_to_child_superq(child_idx, &buf[..len]);
-        }
-    }
-
-    /// Forward a routed message to all children via SuperQ.
-    fn forward_to_all_children(&mut self, raw: &[u8], child_route: &[u8]) {
-        let mut buf = [0u8; 576];
-        let len = Self::build_routed_message(raw, child_route, &mut buf);
-        if len > 0 {
-            for i in 0..MAX_CHILDREN {
-                if self.ctx.children[i].is_some() {
-                    self.send_to_child_superq(i, &buf[..len]);
-                }
-            }
-        }
-    }
 
     /// Strip ADDRESSED route from raw bytes for local handling.
     ///
@@ -1808,7 +1722,6 @@ impl<D: Driver> DriverRuntime<D> {
 
         self.ctx.children[slot] = Some(ChildEntry {
             mailbox,
-            superq: None,
             pid,
             ctx: spawn_ctx,
             binary_name: bname,
@@ -1817,42 +1730,6 @@ impl<D: Driver> DriverRuntime<D> {
         });
         self.ctx.child_count += 1;
 
-        true
-    }
-
-    /// Store a child entry with a SuperQ handle for reliable child→parent messaging.
-    /// Registers the SuperQ handle in the Mux with TAG_CHILD_SUPERQ_BASE + slot.
-    #[allow(dead_code)]
-    fn store_child_entry_with_superq(
-        &mut self,
-        mailbox: Mailbox,
-        superq: crate::supervision::SupervisionHandle,
-        pid: u32,
-        port_name: &[u8],
-        context: Option<&SpawnChildContext>,
-        binary_name: &[u8],
-    ) -> bool {
-        // Reuse existing logic — store_child_entry sets superq=None
-        if !self.store_child_entry(mailbox, pid, port_name, context, binary_name) {
-            // store failed — need to drop superq cleanly
-            core::mem::forget(superq); // don't close, slot not stored
-            return false;
-        }
-        // Find the slot we just stored (last child with this pid)
-        let slot = match self.find_child_by_pid(pid) {
-            Some(s) => s,
-            None => return true, // shouldn't happen
-        };
-        // Register SuperQ handle in Mux
-        let sq_handle = superq.handle();
-        let tag = TAG_CHILD_SUPERQ_BASE + slot as u32;
-        if self.ctx.mux.add(sq_handle, MuxFilter::Readable).is_ok() {
-            self.ctx.handles.add(sq_handle, tag);
-        }
-        // Store superq in entry
-        if let Some(entry) = &mut self.ctx.children[slot] {
-            entry.superq = Some(superq);
-        }
         true
     }
 
@@ -1981,123 +1858,6 @@ impl<D: Driver> DriverRuntime<D> {
             _ => {}
         }
     }
-
-    /// Handle child SuperQ readable event — child sent a note.
-    ///
-    /// Reads all pending notes from the child's SuperQ and dispatches
-    /// FORWARD notes based on the query protocol msg_type in the payload.
-    /// EXIT notes trigger child cleanup via handle_child_exit().
-    fn handle_child_superq_event(&mut self, child_idx: usize) {
-        // Drain all available notes from this child's SuperQ.
-        // Use try_recv() instead of recv_forward() so we see EXIT notes
-        // (recv_forward silently drops non-FORWARD notes).
-        loop {
-            let superq = match &self.ctx.children[child_idx] {
-                Some(entry) => match &entry.superq {
-                    Some(sq) => sq,
-                    None => return,
-                },
-                None => return,
-            };
-
-            let note = match superq.try_recv() {
-                Ok(Some(n)) => n,
-                Ok(None) => break,
-                Err(_) => {
-                    // PeerClosed — child exited, SuperQ is HalfClosed with empty ring.
-                    // Treat like EXIT note: clean up child entry.
-                    let pid = self.ctx.children[child_idx]
-                        .as_ref().map(|e| e.pid).unwrap_or(0);
-                    self.handle_child_exit(pid);
-                    return;
-                }
-            };
-
-            // EXIT note: child died — clean up entry and stop draining
-            if note.note_type == abi::supervision_note::EXIT {
-                let pid = self.ctx.children[child_idx]
-                    .as_ref().map(|e| e.pid).unwrap_or(0);
-                self.handle_child_exit(pid);
-                return;
-            }
-
-            // Only process FORWARD notes (skip unknown types)
-            if note.note_type != abi::supervision_note::FORWARD {
-                continue;
-            }
-
-            // Reassemble FORWARD payload
-            let mut payload_buf = [0u8; 576];
-            let chunk_len = (note.len as usize).min(120).min(payload_buf.len());
-            payload_buf[..chunk_len].copy_from_slice(&note.payload[..chunk_len]);
-            let mut pos = chunk_len;
-
-            // Read continuation fragments (HAS_MORE flag)
-            if note.flags & 1 != 0 {
-                loop {
-                    let cont = match superq.recv() {
-                        Ok(n) => n,
-                        Err(e) => {
-                            crate::uwarn!("bus", "superq_frag_recv_err"; err = e.as_str());
-                            break;
-                        }
-                    };
-                    let clen = (cont.len as usize).min(120);
-                    let n = clen.min(payload_buf.len().saturating_sub(pos));
-                    if n > 0 {
-                        payload_buf[pos..pos + n].copy_from_slice(&cont.payload[..n]);
-                        pos += n;
-                    }
-                    if cont.flags & 1 == 0 { break; }
-                }
-            }
-            let len = pos;
-
-            if len < QueryHeader::SIZE {
-                continue;
-            }
-
-            // Mark child as active
-            if let Some(entry) = &mut self.ctx.children[child_idx] {
-                entry.bus_active = true;
-            }
-
-            // Dispatch based on query protocol msg_type
-            let header = match QueryHeader::from_bytes(&payload_buf[..len]) {
-                Some(h) => h,
-                None => continue,
-            };
-
-            match header.msg_type {
-                // Config/info result from child — handle config convergence
-                query_msg::SERVICE_INFO_RESULT => {
-                    if header.flags & query_flags::EOL != 0 {
-                        // CONFIG_EOL: mark this child as done in pending config queries
-                        let child_bit = 1u8 << child_idx;
-                        let mut converged_slot = None;
-                        for slot in 0..MAX_PENDING_CONFIG {
-                            if let Some(pcq) = self.ctx.pending_config[slot].as_mut() {
-                                if pcq.sent_mask & child_bit != 0 {
-                                    pcq.eol_mask |= child_bit;
-                                    if pcq.is_converged() {
-                                        converged_slot = Some(slot);
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(slot) = converged_slot {
-                            self.complete_config_query(slot);
-                        }
-                    } else if let Some((result, info_bytes)) = ServiceInfoResult::from_bytes(&payload_buf[..len]) {
-                        let _ = self.handle_config_response(child_idx, header.seq_id, info_bytes, result.header.flags);
-                    }
-                }
-                // Other message types — no upstream relay
-                _ => {}
-            }
-        }
-    }
-
 
     /// Find a child entry index by PID.
     fn find_child_by_pid(&self, pid: u32) -> Option<usize> {
@@ -2390,7 +2150,7 @@ fn parse_spawn_context_from_mailbox(mb: &Mailbox) -> Option<SpawnContext> {
 
 /// Append config response data to buf at `pos`, annotating with source path.
 ///
-/// Builds full paths through the supervision tree:
+/// Builds full paths through the driver tree:
 /// - Existing `[path]` headers in `data` are rewritten to `[prefix/path]`
 /// - Raw key=value lines before any header get a new `[prefix]` header prepended
 /// - If `prefix` is empty, data is copied as-is

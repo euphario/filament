@@ -21,7 +21,6 @@ pub mod query;
 pub mod mmio;
 pub mod dma;
 pub mod config;
-pub mod supervision;
 
 pub mod vfs_proto;
 pub mod vfs_client;
@@ -50,4 +49,3 @@ pub use mmio::{MmioRegion, DmaPool, delay_ms, delay_us, poll_until, poll_interva
 pub use dma::{DmaBuf, DmaDirection, CoherentBuf, StreamingBuf};
 pub use vfs_proto::{VfsDirEntry, VfsStat, fs_op, open_flags, file_type, vfs_error};
 pub use vfs_client::{VfsClient, VfsError};
-pub use supervision::SupervisionHandle;

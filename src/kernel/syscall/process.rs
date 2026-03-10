@@ -174,18 +174,14 @@ pub(super) fn sys_exec_with_mailbox(path_ptr: u64, path_len: usize, capabilities
         path, parent_id, kernel_caps, &mailbox_buf[..mailbox_len]
     ) {
         Ok(result) => {
-            // Pack three values into 64 bits:
+            // Pack two values into 64 bits:
             //   bits  0-15: child_pid (u16, max 256 task slots)
             //   bits 16-31: shmem_handle packed (gen:8 << 8 | index:8)
-            //   bits 32-47: superq_handle packed (gen:8 << 8 | index:8)
             // Handle raw format: (gen << 24) | index
             // Packed format: (gen << 8) | (index & 0xFF) — fits in u16
             let shmem_packed = ((result.parent_handle_raw >> 16) & 0xFF00)
                 | (result.parent_handle_raw & 0xFF);
-            let superq_packed = ((result.parent_superq_handle_raw >> 16) & 0xFF00)
-                | (result.parent_superq_handle_raw & 0xFF);
-            ((superq_packed as i64) << 32)
-                | ((shmem_packed as i64) << 16)
+            ((shmem_packed as i64) << 16)
                 | (result.child_id as i64 & 0xFFFF)
         }
         Err(crate::kernel::elf::ElfError::NotExecutable) => KernelError::NotFound.to_errno(),

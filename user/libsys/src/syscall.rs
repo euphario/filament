@@ -147,22 +147,19 @@ pub fn exec(path: &str) -> i64 {
 /// Spawn a child with a shared mailbox page.
 ///
 /// `mailbox_data` is copied into a 4KB shmem page mapped at Handle::MAILBOX in the child.
-/// Returns `Ok((child_pid, parent_mailbox_handle, parent_superq_handle))` on success.
+/// Returns `Ok((child_pid, parent_mailbox_handle))` on success.
 /// The mailbox handle points to the same 4KB shmem page, allowing post-spawn writes.
-/// The supervision handle is the parent end of the SupervisionQueue for reliable note delivery.
-pub fn exec_with_mailbox(path: &str, caps: u64, mailbox: &[u8]) -> Result<(u32, Handle, Handle), i64> {
+pub fn exec_with_mailbox(path: &str, caps: u64, mailbox: &[u8]) -> Result<(u32, Handle), i64> {
     let result = syscall5(sys::EXEC_WITH_MAILBOX, path.as_ptr() as u64, path.len() as u64, caps, mailbox.as_ptr() as u64, mailbox.len() as u64);
     if result < 0 {
         Err(result)
     } else {
-        // Unpack: bits 0-15 = child_pid, bits 16-31 = shmem packed, bits 32-47 = superq packed
+        // Unpack: bits 0-15 = child_pid, bits 16-31 = shmem packed
         // Packed handle format: (gen:8 << 8) | (index:8) → expand to Handle raw: (gen << 24) | index
         let child_pid = (result & 0xFFFF) as u32;
         let shmem_packed = ((result >> 16) & 0xFFFF) as u32;
-        let superq_packed = ((result >> 32) & 0xFFFF) as u32;
         let shmem_raw = ((shmem_packed & 0xFF00) << 16) | (shmem_packed & 0xFF);
-        let superq_raw = ((superq_packed & 0xFF00) << 16) | (superq_packed & 0xFF);
-        Ok((child_pid, Handle::from_raw(shmem_raw), Handle::from_raw(superq_raw)))
+        Ok((child_pid, Handle::from_raw(shmem_raw)))
     }
 }
 

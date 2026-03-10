@@ -114,10 +114,6 @@ pub enum ObjectType {
     Bus = 17,
     /// System metrics (process table, system stats, port info)
     Metrics = 18,
-    /// Supervision queue (parent end — reads from up, writes to down)
-    SupervisionParent = 19,
-    /// Supervision queue (child end — reads from down, writes to up)
-    SupervisionChild = 20,
     /// Hardware IRQ handle (readable, pollable via Mux)
     Irq = 21,
 }
@@ -144,8 +140,6 @@ impl ObjectType {
             16 => Some(ObjectType::Ring),
             17 => Some(ObjectType::Bus),
             18 => Some(ObjectType::Metrics),
-            19 => Some(ObjectType::SupervisionParent),
-            20 => Some(ObjectType::SupervisionChild),
             21 => Some(ObjectType::Irq),
             _ => None,
         }
@@ -167,10 +161,6 @@ impl ObjectType {
         !matches!(self, ObjectType::Stdin | ObjectType::Klog | ObjectType::DmaPool | ObjectType::Mmio | ObjectType::Process | ObjectType::BusList | ObjectType::Msi | ObjectType::Metrics)
     }
 
-    /// Is this a supervision queue endpoint?
-    pub fn is_supervision(&self) -> bool {
-        matches!(self, ObjectType::SupervisionParent | ObjectType::SupervisionChild)
-    }
 }
 
 // ============================================================================
@@ -403,8 +393,6 @@ impl Handle {
     pub const STDOUT: Handle = Handle((1 << 24) | 2);
     /// Pre-allocated stderr handle
     pub const STDERR: Handle = Handle((1 << 24) | 3);
-    /// Supervision channel handle (slot 4, set by exec_with_channel)
-    pub const SUPERVISION: Handle = Handle((1 << 24) | 4);
     /// Mailbox shmem handle (slot 5, set by exec_with_mailbox)
     pub const MAILBOX: Handle = Handle((1 << 24) | 5);
 
@@ -1372,8 +1360,6 @@ pub const MAILBOX_MAGIC: u32 = 0x4D424F58;
 pub mod mailbox_flags {
     pub const PARENT_WRITTEN: u16 = 1 << 0;
     pub const CHILD_WRITTEN: u16 = 1 << 1;
-    /// Child should use tree mode (SuperQ to parent) instead of root mode (connect to devd)
-    pub const TREE_MODE: u16 = 1 << 2;
 }
 
 const _: () = assert!(core::mem::size_of::<MailboxHeader>() == 64);
@@ -1402,81 +1388,6 @@ impl MailboxHeader {
     pub fn is_valid(&self) -> bool {
         self.magic == MAILBOX_MAGIC && self.version >= 1
     }
-}
-
-// ============================================================================
-// Supervision Note (SuperQ wire format)
-// ============================================================================
-
-/// A supervision note: compact, typed, queued message between parent↔child.
-/// 128 bytes — fits 8 notes in 1KB per direction.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SupervisionNote {
-    /// Note type (supervision_note::*)
-    pub note_type: u8,
-    /// Reserved flags
-    pub flags: u8,
-    /// Request-response correlation sequence number
-    pub seq: u16,
-    /// Payload length (0..120)
-    pub len: u16,
-    /// Reserved
-    pub _reserved: u16,
-    /// Type-specific data
-    pub payload: [u8; 120],
-}
-
-const _: () = assert!(core::mem::size_of::<SupervisionNote>() == 128);
-
-impl SupervisionNote {
-    pub const fn empty() -> Self {
-        Self {
-            note_type: 0,
-            flags: 0,
-            seq: 0,
-            len: 0,
-            _reserved: 0,
-            payload: [0; 120],
-        }
-    }
-
-    /// Get the payload as a byte slice (up to len bytes).
-    pub fn payload_bytes(&self) -> &[u8] {
-        let len = (self.len as usize).min(120);
-        &self.payload[..len]
-    }
-}
-
-/// Supervision note types
-pub mod supervision_note {
-    // Child → Parent
-    /// Child reports state change (payload: { state: u8 })
-    pub const STATE_CHANGE: u8 = 1;
-    /// Child registers a port (payload: PortInfo + shmem_id)
-    pub const PORT_REGISTER: u8 = 2;
-    /// Child acknowledges a spawn command (payload: { seq: u16, result: i32, count: u8, pids: [u32; N] })
-    pub const SPAWN_ACK: u8 = 3;
-    /// Child returns config query result (payload: config data bytes)
-    pub const CONFIG_RESULT: u8 = 4;
-    /// End-of-line marker for config responses (payload: { seq: u16 })
-    pub const CONFIG_EOL: u8 = 5;
-    /// Child forwards a raw query message to parent (relayed from grandchild)
-    pub const FORWARD: u8 = 6;
-
-    // Parent → Child
-    /// Parent asks child to spawn a grandchild
-    pub const SPAWN_CHILD: u8 = 16;
-    /// Parent queries child config
-    pub const CONFIG_GET: u8 = 17;
-    /// Parent sets child config
-    pub const CONFIG_SET: u8 = 18;
-    /// Graceful shutdown request
-    pub const SHUTDOWN: u8 = 19;
-
-    // Kernel → Parent (auto-generated)
-    /// Child process exited (payload: { pid: u32, exit_code: i32 })
-    pub const EXIT: u8 = 32;
 }
 
 // ============================================================================

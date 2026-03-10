@@ -626,14 +626,12 @@ pub fn spawn_from_path_inherit(
 ///
 /// Creates a 4KB shmem page, copies mailbox_data into it, and installs
 /// the shmem handle at slot 5 (Handle::MAILBOX) in the child's handle table.
-/// Spawn result for exec_with_mailbox: child ID, slot, parent's shmem handle, and SuperQ handle.
+/// Spawn result for exec_with_mailbox: child ID, slot, and parent's shmem handle.
 pub struct MailboxSpawnResult {
     pub child_id: task::TaskId,
     pub slot: usize,
     /// Raw handle value for parent's shmem in parent's object table (0 if alloc failed)
     pub parent_handle_raw: u32,
-    /// Raw handle value for parent's SuperQ endpoint in parent's object table (0 if alloc failed)
-    pub parent_superq_handle_raw: u32,
 }
 
 pub fn spawn_from_path_with_caps_and_mailbox(
@@ -727,30 +725,7 @@ pub fn spawn_from_path_with_caps_and_mailbox(
         }
     }
 
-    // Create SupervisionQueue and install handles
-    let mut parent_superq_handle_raw = 0u32;
-    if let Some(supervision_id) = crate::kernel::ipc::supervision::create(parent_id, child_id) {
-        // Install child end at slot 4 (SUPERVISION)
-        let child_obj = Object::SupervisionChild(
-            crate::kernel::object::SupervisionChildObject::new(supervision_id)
-        );
-        let _ = object_service().with_table_mut(child_id, |table| {
-            table.alloc_at(4, ObjectType::SupervisionChild, child_obj)
-        });
-
-        // Install parent end in parent's table (dynamic slot)
-        let parent_obj = Object::SupervisionParent(
-            crate::kernel::object::SupervisionParentObject::new(supervision_id)
-        );
-        let parent_result = object_service().with_table_mut(parent_id, |table| {
-            table.alloc(ObjectType::SupervisionParent, parent_obj)
-        });
-        if let Ok(Some(handle)) = parent_result {
-            parent_superq_handle_raw = handle.raw();
-        }
-    }
-
-    Ok(MailboxSpawnResult { child_id, slot, parent_handle_raw, parent_superq_handle_raw })
+    Ok(MailboxSpawnResult { child_id, slot, parent_handle_raw })
 }
 
 /// Find an executable in ramfs

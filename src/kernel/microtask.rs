@@ -469,15 +469,8 @@ fn execute(task: MicroTask) {
 }
 
 /// Notify parent that a child exited via ObjectService ProcessObject wake.
-/// Also injects an EXIT note into the SupervisionQueue so the parent
-/// receives a reliable queued notification.
 fn exec_notify_parent_exit(parent_id: TaskId, child_pid: TaskId, code: i32) {
     use crate::kernel::task::lifecycle::{ExitInfo, complete_exit_notification};
-    use crate::kernel::ipc::{waker, traits::WakeReason};
-
-    // Inject EXIT note into SupervisionQueue (if child has one)
-    let wake_list = crate::kernel::ipc::supervision::inject_exit(child_pid, code);
-    waker::wake(&wake_list, WakeReason::Readable);
 
     complete_exit_notification(ExitInfo { parent_id, child_pid, code });
 }

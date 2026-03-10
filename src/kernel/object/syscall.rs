@@ -88,8 +88,6 @@ pub fn open(type_id: u32, params_ptr: u64, params_len: usize) -> i64 {
         ObjectType::Bus => open_bus_create(params_ptr, params_len),
         ObjectType::Metrics => open_metrics(),
         ObjectType::Irq => open_irq(params_ptr, params_len),
-        // Supervision handles are created by exec_with_mailbox, not by open()
-        ObjectType::SupervisionParent | ObjectType::SupervisionChild => KernelError::NotSupported.to_errno(),
     }
 }
 
@@ -216,8 +214,6 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
             Object::Ring(r) => read_ring(r, buf_ptr, buf_len, task_id),
             Object::DmaPool(d) => read_dma_pool(d, buf_ptr, buf_len),
             Object::Metrics => unreachable!(), // Handled above
-            Object::SupervisionParent(sp) => read_supervision_parent(sp, buf_ptr, buf_len),
-            Object::SupervisionChild(sc) => read_supervision_child(sc, buf_ptr, buf_len),
             Object::Irq(irq) => read_irq(irq, buf_ptr, buf_len, task_id),
             _ => KernelError::NotSupported.to_errno(),
         }
@@ -307,7 +303,6 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
         None,
         ShmemNotify(u32, u32), // (shmem_id, caller_pid)
         ChannelWake(ChannelWriteResult),
-        SupervisionWake(waker::WakeList),
         RingWake(waker::WakeList),
         TimerDeadline(u64),
     }
@@ -373,14 +368,6 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                 (errno, if wake_list.is_empty() { PendingAction::None } else { PendingAction::RingWake(wake_list) })
             }
             Object::BusCreator(bc) => (write_bus_creator(bc, buf_ptr, buf_len), PendingAction::None),
-            Object::SupervisionParent(sp) => {
-                let r = write_supervision_parent(sp, buf_ptr, buf_len);
-                (r.0, if r.1.is_empty() { PendingAction::None } else { PendingAction::SupervisionWake(r.1) })
-            }
-            Object::SupervisionChild(sc) => {
-                let r = write_supervision_child(sc, buf_ptr, buf_len);
-                (r.0, if r.1.is_empty() { PendingAction::None } else { PendingAction::SupervisionWake(r.1) })
-            }
             Object::Irq(irq) => (write_irq(irq, buf_ptr, buf_len, task_id), PendingAction::None),
             _ => (KernelError::NotSupported.to_errno(), PendingAction::None),
         }
@@ -415,9 +402,6 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                     if let Some((buf, len, channel_id)) = r.bus_data {
                         crate::kernel::bus::process_bus_message(channel_id, &buf[..len]);
                     }
-                }
-                PendingAction::SupervisionWake(wake_list) => {
-                    waker::wake(&wake_list, ipc::WakeReason::Readable);
                 }
                 PendingAction::RingWake(wake_list) => {
                     waker::wake(&wake_list, ipc::WakeReason::Readable);
@@ -593,8 +577,6 @@ pub fn close(handle_raw: u32) -> i64 {
         Object::DmaPool(d) => { close_dma_pool(d, task_id); Counter::None }
         Object::Mmio(m) => { close_mmio(m, task_id); Counter::None }
         Object::Ring(r) => { close_ring(r, task_id); Counter::None }
-        Object::SupervisionParent(sp) => { close_supervision_parent(sp); Counter::None }
-        Object::SupervisionChild(sc) => { close_supervision_child(sc); Counter::None }
         Object::Irq(irq) => { close_irq(irq); Counter::None }
         _ => Counter::None,
     };
@@ -1850,8 +1832,6 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     }
                     Object::Process(p) => { p.wait_queue_mut().subscribe(super::Waiter::from_subscriber(subscriber, watch.filter())); }
                     Object::Shmem(s) => { s.set_mux_subscriber(Some(subscriber)); }
-                    Object::SupervisionParent(sp) => { sp.subscribe(subscriber); }
-                    Object::SupervisionChild(sc) => { sc.subscribe(subscriber); }
                     _ => {}
                 }
             }
@@ -2337,12 +2317,6 @@ fn poll_watched_object(obj: &Object, filter: u8, channel_id: u32) -> bool {
         }
         Object::Ring(r) => {
             r.poll(filter).is_ready()
-        }
-        Object::SupervisionParent(sp) => {
-            sp.poll(filter).is_ready()
-        }
-        Object::SupervisionChild(sc) => {
-            sc.poll(filter).is_ready()
         }
         Object::Irq(irq) => {
             (filter & f::READABLE) != 0 && irq.poll(f::READABLE).is_ready()
@@ -3109,125 +3083,3 @@ fn close_ring(r: super::RingObject, owner: u32) {
     }
 }
 
-// ============================================================================
-// Supervision Queue handlers
-// ============================================================================
-
-/// Read a note from the parent end (up ring: child→parent). Non-blocking.
-fn read_supervision_parent(sp: &mut super::SupervisionParentObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    use crate::kernel::ipc::supervision;
-
-    let note_size = core::mem::size_of::<abi::SupervisionNote>();
-    if buf_len < note_size {
-        return KernelError::InvalidArg.to_errno();
-    }
-
-    match supervision::recv_up(sp.supervision_id()) {
-        Ok(note) => {
-            let note_bytes = unsafe {
-                core::slice::from_raw_parts(&note as *const abi::SupervisionNote as *const u8, note_size)
-            };
-            match uaccess::copy_to_user(buf_ptr, note_bytes) {
-                Ok(_) => note_size as i64,
-                Err(_) => KernelError::BadAddress.to_errno(),
-            }
-        }
-        Err(true) => {
-            // Ring empty AND child exited (HalfClosed/Closed) — report peer closed
-            KernelError::PeerClosed.to_errno()
-        }
-        Err(false) => {
-            // Ring empty but child still alive — caller should use Mux to wait
-            KernelError::WouldBlock.to_errno()
-        }
-    }
-}
-
-/// Read a note from the child end (down ring: parent→child).
-fn read_supervision_child(sc: &mut super::SupervisionChildObject, buf_ptr: u64, buf_len: usize) -> i64 {
-    use crate::kernel::ipc::supervision;
-
-    let note_size = core::mem::size_of::<abi::SupervisionNote>();
-    if buf_len < note_size {
-        return KernelError::InvalidArg.to_errno();
-    }
-
-    match supervision::recv_down(sc.supervision_id()) {
-        Ok(note) => {
-            let note_bytes = unsafe {
-                core::slice::from_raw_parts(&note as *const abi::SupervisionNote as *const u8, note_size)
-            };
-            match uaccess::copy_to_user(buf_ptr, note_bytes) {
-                Ok(_) => note_size as i64,
-                Err(_) => KernelError::BadAddress.to_errno(),
-            }
-        }
-        Err(true) => {
-            KernelError::PeerClosed.to_errno()
-        }
-        Err(false) => {
-            KernelError::WouldBlock.to_errno()
-        }
-    }
-}
-
-/// Write a note from the parent end (down ring: parent→child).
-/// Returns (errno, WakeList) for deferred waking.
-fn write_supervision_parent(sp: &mut super::SupervisionParentObject, buf_ptr: u64, buf_len: usize) -> (i64, waker::WakeList) {
-    use crate::kernel::ipc::supervision;
-
-    let note_size = core::mem::size_of::<abi::SupervisionNote>();
-    if buf_len < note_size {
-        return (KernelError::InvalidArg.to_errno(), waker::WakeList::new());
-    }
-
-    // Copy note from userspace
-    let mut note = abi::SupervisionNote::empty();
-    let note_bytes = unsafe {
-        core::slice::from_raw_parts_mut(&mut note as *mut abi::SupervisionNote as *mut u8, note_size)
-    };
-    if uaccess::copy_from_user(note_bytes, buf_ptr).is_err() {
-        return (KernelError::BadAddress.to_errno(), waker::WakeList::new());
-    }
-
-    match supervision::send_down(sp.supervision_id(), note) {
-        Ok(wake_list) => (note_size as i64, wake_list),
-        Err(()) => (KernelError::NoSpace.to_errno(), waker::WakeList::new()),
-    }
-}
-
-/// Write a note from the child end (up ring: child→parent).
-/// Returns (errno, WakeList) for deferred waking.
-fn write_supervision_child(sc: &mut super::SupervisionChildObject, buf_ptr: u64, buf_len: usize) -> (i64, waker::WakeList) {
-    use crate::kernel::ipc::supervision;
-
-    let note_size = core::mem::size_of::<abi::SupervisionNote>();
-    if buf_len < note_size {
-        return (KernelError::InvalidArg.to_errno(), waker::WakeList::new());
-    }
-
-    let mut note = abi::SupervisionNote::empty();
-    let note_bytes = unsafe {
-        core::slice::from_raw_parts_mut(&mut note as *mut abi::SupervisionNote as *mut u8, note_size)
-    };
-    if uaccess::copy_from_user(note_bytes, buf_ptr).is_err() {
-        return (KernelError::BadAddress.to_errno(), waker::WakeList::new());
-    }
-
-    match supervision::send_up(sc.supervision_id(), note) {
-        Ok(wake_list) => (note_size as i64, wake_list),
-        Err(()) => (KernelError::NoSpace.to_errno(), waker::WakeList::new()),
-    }
-}
-
-/// Close the parent end of a supervision queue.
-fn close_supervision_parent(sp: super::SupervisionParentObject) {
-    let wake_list = crate::kernel::ipc::supervision::close_parent(sp.supervision_id());
-    waker::wake(&wake_list, ipc::WakeReason::Closed);
-}
-
-/// Close the child end of a supervision queue.
-fn close_supervision_child(sc: super::SupervisionChildObject) {
-    let wake_list = crate::kernel::ipc::supervision::close_child(sc.supervision_id());
-    waker::wake(&wake_list, ipc::WakeReason::Closed);
-}

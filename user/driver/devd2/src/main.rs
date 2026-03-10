@@ -277,7 +277,6 @@ impl Devd2 {
         _port_info: &PortInfo,
     ) {
         // Build mailbox with port info so child knows what to claim.
-        // No TREE_MODE flag — child connects to busd directly, not via SuperQ.
         let mb_buf = build_mailbox(port_name, priority);
 
         // Format binary path: "bin/<binary>"
@@ -288,7 +287,7 @@ impl Devd2 {
         let path = core::str::from_utf8(&path_buf[..4 + blen]).unwrap_or("bin/???");
 
         match syscall::exec_with_mailbox(path, caps, &mb_buf) {
-            Ok((pid, _shmem_handle, _superq_handle)) => {
+            Ok((pid, _shmem_handle)) => {
                 uinfo!("devd2", "spawned"; binary = binary, pid = pid, port = core::str::from_utf8(port_name).unwrap_or("?"));
                 self.add_service(pid, binary.as_bytes(), port_name, caps, priority);
             }
@@ -441,7 +440,7 @@ impl Devd2 {
             let path = core::str::from_utf8(&path_buf[..4 + blen]).unwrap_or("bin/???");
 
             match syscall::exec_with_mailbox(path, caps, &mb_buf) {
-                Ok((pid, _, _)) => {
+                Ok((pid, _)) => {
                     uinfo!("devd2", "restarted"; binary = binary, pid = pid);
                     if let Some(ref mut svc) = self.services[i] {
                         svc.pid = pid;
@@ -649,15 +648,13 @@ impl Devd2 {
 // =============================================================================
 
 /// Build a mailbox buffer with port name for a spawned child.
-/// No TREE_MODE flag — child reads spawn context from mailbox but
-/// connects to busd directly (no SuperQ relay).
 fn build_mailbox(port_name: &[u8], priority: u8) -> [u8; 256] {
     let mut buf = [0u8; 256];
 
     // Header at [0..64)
     let mut hdr = MailboxHeader::empty();
     hdr.priority = priority;
-    hdr.flags = abi::mailbox_flags::PARENT_WRITTEN; // no TREE_MODE
+    hdr.flags = abi::mailbox_flags::PARENT_WRITTEN;
 
     // KV: "port.name" = port_name at [64..)
     let key = b"port.name";

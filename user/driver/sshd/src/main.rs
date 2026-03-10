@@ -33,7 +33,7 @@ use libsys::syscall;
 use libsys::syscall::Handle;
 use libsys::ipc::{Mux, MuxFilter};
 use libf::sync::SharedPipe;
-use libos::supervision::SupervisionHandle;
+use libsys::ipc::Process;
 use libos::{uinfo, udebug, uerror};
 
 // =============================================================================
@@ -123,7 +123,7 @@ struct SshSession {
     // Shell child process
     shell_ring: Option<SharedPipe>,
     shell_pid: Option<u32>,
-    superq: Option<SupervisionHandle>,
+    shell_process: Option<Process>,
 
     // Residual buffer: data pulled from pipe but not yet sent (window exhausted).
     tx_residual: [u8; 4096],
@@ -175,7 +175,7 @@ impl SshSession {
             pty_rows: 24,
             shell_ring: None,
             shell_pid: None,
-            superq: None,
+            shell_process: None,
             tx_residual: [0u8; 4096],
             tx_residual_off: 0,
             tx_residual_len: 0,
@@ -1015,11 +1015,11 @@ impl SshSession {
         // IPC | MEM | SPAWN | KILL | SIGNAL
         let caps: u64 = 0x0C07;
         match syscall::exec_with_mailbox("shell", caps, &mailbox) {
-            Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
+            Ok((child_pid, _parent_mb_handle)) => {
                 ring.allow(child_pid);
                 uinfo!("sshd", "shell_spawned"; pid = child_pid);
                 libos::ulog::flush();
-                self.superq = Some(SupervisionHandle::from_handle(parent_superq_handle));
+                self.shell_process = Process::watch(child_pid).ok();
                 self.shell_pid = Some(child_pid);
                 self.shell_ring = Some(ring);
                 true
@@ -1047,7 +1047,7 @@ impl SshSession {
         udebug!("sshd", "test_probe"; sent = test_sent, window = self.remote_window, pool = self.stream.pool_remaining());
         libos::ulog::flush();
 
-        // Create a Mux to watch pipe shmem, TCP DataPort, and SuperQ.
+        // Create a Mux to watch pipe shmem, TCP DataPort, and child process.
         let mux = match Mux::new() {
             Ok(m) => m,
             Err(_) => {
@@ -1058,17 +1058,17 @@ impl SshSession {
 
         let tcp_handle = self.stream.poll_handle();
         let pipe_handle = self.shell_ring.as_ref().map(|r| r.handle()).unwrap_or(Handle::INVALID);
-        let superq_handle = self.superq.as_ref().map(|s| s.handle()).unwrap_or(Handle::INVALID);
+        let proc_handle = self.shell_process.as_ref().map(|p| p.handle()).unwrap_or(Handle::INVALID);
 
         let _ = mux.add(tcp_handle, MuxFilter::Readable);
         if pipe_handle != Handle::INVALID {
             let _ = mux.add(pipe_handle, MuxFilter::Readable);
         }
-        if superq_handle != Handle::INVALID {
-            let _ = mux.add(superq_handle, MuxFilter::Readable);
+        if proc_handle != Handle::INVALID {
+            let _ = mux.add(proc_handle, MuxFilter::Readable);
         }
 
-        udebug!("sshd", "mux_handles"; tcp = tcp_handle.0, pipe = pipe_handle.0, superq = superq_handle.0);
+        udebug!("sshd", "mux_handles"; tcp = tcp_handle.0, pipe = pipe_handle.0, proc_ = proc_handle.0);
         libos::ulog::flush();
 
         let _ = mux.set_timeout(100);
@@ -1131,29 +1131,25 @@ impl SshSession {
                 return true;
             }
 
-            // 6. Check for child exit via SuperQ (non-blocking)
-            if let Some(superq) = &self.superq {
-                if let Ok(Some(_note)) = superq.try_recv() {
-                    let _ = self.drain_ring_tx();
-                    uinfo!("sshd", "shell_exited_superq";);
-                    libos::ulog::flush();
-                    self.send_channel_data(b"\r\n[Shell exited]\r\n");
-                    let mut resp = [0u8; 8];
-                    resp[0] = ssh::msg::CHANNEL_CLOSE;
-                    ssh::write_u32(&mut resp[1..], self.remote_channel_id);
-                    self.send_packet(&resp[..5]);
-                    self.state = SshState::Closing;
-                    return true;
-                }
-            }
-
-            // 7. Wait for activity on any watched handle (100ms timeout)
+            // 6. Wait for activity on any watched handle (100ms timeout)
             match mux.wait() {
                 Ok(event) => {
                     if event.handle == pipe_handle {
                         pipe_wake_count += 1;
                     } else if event.handle == tcp_handle {
                         tcp_wake_count += 1;
+                    } else if event.handle == proc_handle {
+                        // Child process exited
+                        let _ = self.drain_ring_tx();
+                        uinfo!("sshd", "shell_exited";);
+                        libos::ulog::flush();
+                        self.send_channel_data(b"\r\n[Shell exited]\r\n");
+                        let mut resp = [0u8; 8];
+                        resp[0] = ssh::msg::CHANNEL_CLOSE;
+                        ssh::write_u32(&mut resp[1..], self.remote_channel_id);
+                        self.send_packet(&resp[..5]);
+                        self.state = SshState::Closing;
+                        return true;
                     } else if event.is_signal() {
                         // signal, not counted
                     }

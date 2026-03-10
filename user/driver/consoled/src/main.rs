@@ -22,7 +22,6 @@ use libsys::syscall::{self, Handle, ObjectType};
 use libsys::ipc::{Timer, ObjHandle};
 use libf::sync::SharedPipe;
 use libf::time::Duration;
-use libos::supervision::SupervisionHandle;
 use libos::bus::{
     BusMsg, BusError, BusCtx, Driver, Disposition,
     PortInfo, PortClass, PortState, port_subclass,
@@ -36,7 +35,6 @@ use libos::{uinfo, unotice, uerror};
 
 const TAG_STDIN: u32 = 1;
 const TAG_SHMEM: u32 = 3;
-const TAG_SUPERQ: u32 = 6;
 
 // =============================================================================
 // ANSI helpers
@@ -129,8 +127,6 @@ mod ansi {
 pub struct ConsoledDriver {
     /// Bidirectional pipe for shell I/O
     shell_ring: Option<SharedPipe>,
-    /// Supervision handle for watching child shell
-    superq: Option<SupervisionHandle>,
     stdin_handle: ObjHandle,
     cols: u16,
     rows: u16,
@@ -146,7 +142,6 @@ impl ConsoledDriver {
     pub const fn new() -> Self {
         Self {
             shell_ring: None,
-            superq: None,
             stdin_handle: Handle::INVALID,
             cols: 80,
             rows: 24,
@@ -184,7 +179,7 @@ impl ConsoledDriver {
         // IPC | MEM | SPAWN | KILL | SIGNAL
         let caps: u64 = 0x0C07;
         match syscall::exec_with_mailbox("shell", caps, &mailbox) {
-            Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
+            Ok((child_pid, _parent_mb_handle)) => {
                 // Grant child access to the ring shmem
                 ring.allow(child_pid);
 
@@ -193,12 +188,7 @@ impl ConsoledDriver {
                 // Watch ring shmem for shell TX data
                 let _ = ctx.watch_handle(ring.handle(), TAG_SHMEM);
 
-                // Watch SuperQ for child exit
-                let superq = SupervisionHandle::from_handle(parent_superq_handle);
-                let _ = ctx.watch_handle(parent_superq_handle, TAG_SUPERQ);
-
                 self.shell_ring = Some(ring);
-                self.superq = Some(superq);
                 self.shell_pid = Some(child_pid);
             }
             Err(e) => {
@@ -208,15 +198,10 @@ impl ConsoledDriver {
     }
 
     /// Handle child exit — respawn shell.
-    /// Idempotent: safe to call from both SuperQ event and CHILD_EXIT signal.
+    /// Called from CHILD_EXIT signal handler.
     fn handle_child_exit(&mut self, ctx: &mut dyn BusCtx) {
         if self.shell_pid.is_none() {
             return; // Already handled
-        }
-
-        if let Some(superq) = &self.superq {
-            // Drain EXIT note
-            let _ = superq.try_recv();
         }
 
         unotice!("consoled", "shell_exited";);
@@ -225,11 +210,7 @@ impl ConsoledDriver {
         if let Some(ring) = &self.shell_ring {
             let _ = ctx.unwatch_handle(ring.handle());
         }
-        if let Some(superq) = &self.superq {
-            let _ = ctx.unwatch_handle(superq.handle());
-        }
         self.shell_ring = None;
-        self.superq = None;
         self.shell_pid = None;
 
         // Respawn after brief delay
@@ -652,7 +633,6 @@ impl Driver for ConsoledDriver {
         match tag {
             TAG_STDIN => self.handle_stdin_readable(ctx),
             TAG_SHMEM => self.handle_shmem_readable(ctx),
-            TAG_SUPERQ => self.handle_child_exit(ctx),
             _ => {}
         }
     }
