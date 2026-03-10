@@ -181,7 +181,8 @@ impl ConsoledDriver {
         mailbox[68..70].copy_from_slice(&self.cols.to_le_bytes());
         mailbox[70..72].copy_from_slice(&self.rows.to_le_bytes());
 
-        let caps = libos::devd::caps::USER_ADMIN;
+        // IPC | MEM | SPAWN | KILL | SIGNAL
+        let caps: u64 = 0x0C07;
         match syscall::exec_with_mailbox("shell", caps, &mailbox) {
             Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
                 // Grant child access to the ring shmem

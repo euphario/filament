@@ -496,6 +496,49 @@ pub(super) fn sys_ramfs_list(buf_ptr: u64, buf_len: usize) -> i64 {
     count as i64
 }
 
+/// Read a ramfs file by name
+/// Args: name_ptr (filename), name_len (filename length), buf_ptr (output buffer), buf_len (buffer size)
+/// Returns: bytes read on success, negative error on failure
+pub(super) fn sys_ramfs_read(name_ptr: u64, name_len: usize, buf_ptr: u64, buf_len: usize) -> i64 {
+    if name_len == 0 || name_len > 100 {
+        return KernelError::InvalidArg.to_errno();
+    }
+    if buf_len == 0 {
+        return KernelError::InvalidArg.to_errno();
+    }
+
+    if let Err(e) = uaccess::validate_user_read(name_ptr, name_len) {
+        return uaccess_to_errno(e);
+    }
+    if let Err(e) = uaccess::validate_user_write(buf_ptr, buf_len) {
+        return uaccess_to_errno(e);
+    }
+
+    // Copy filename from userspace
+    let mut name_buf = [0u8; 100];
+    if let Err(e) = uaccess::copy_from_user(&mut name_buf[..name_len], name_ptr) {
+        return uaccess_to_errno(e);
+    }
+
+    let name_str = match core::str::from_utf8(&name_buf[..name_len]) {
+        Ok(s) => s,
+        Err(_) => return KernelError::InvalidArg.to_errno(),
+    };
+
+    let ctx = create_syscall_context();
+    let data = match ctx.misc().read_ramfs(name_str) {
+        Some(d) => d,
+        None => return KernelError::NotFound.to_errno(),
+    };
+
+    let copy_len = data.len().min(buf_len);
+    if let Err(e) = uaccess::copy_to_user(buf_ptr, &data[..copy_len]) {
+        return uaccess_to_errno(e);
+    }
+
+    copy_len as i64
+}
+
 /// Get system-wide information (memory, tasks, uptime)
 /// Args: buf_ptr (pointer to SysInfo struct, 24 bytes)
 pub(super) fn sys_sysinfo(buf_ptr: u64) -> i64 {

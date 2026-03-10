@@ -558,6 +558,18 @@ pub fn ramfs_list(buf: &mut [RamfsListEntry]) -> i64 {
     )
 }
 
+/// Read a ramfs file by name. Returns bytes read on success, negative on error.
+pub fn ramfs_read(name: &[u8], buf: &mut [u8]) -> i64 {
+    syscall5(
+        sys::RAMFS_READ,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+    )
+}
+
 // ============================================================================
 // Channels
 // ============================================================================

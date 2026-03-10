@@ -122,6 +122,10 @@ impl MiscOps for KernelMiscOps {
         Ok(())
     }
 
+    fn read_ramfs(&self, name: &str) -> Option<&[u8]> {
+        crate::ramfs::read_file(name)
+    }
+
     fn list_ramfs(&self, buf: &mut [abi::RamfsListEntry], max: usize) -> usize {
         let ramfs = crate::ramfs::ramfs();
         let count = ramfs.len().min(max);

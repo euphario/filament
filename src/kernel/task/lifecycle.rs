@@ -382,7 +382,7 @@ fn handle_probed_exit(_sched: &mut Scheduler) {
     PROBED_EXITED.store(true, core::sync::atomic::Ordering::SeqCst);
 }
 
-/// Complete probed exit: spawn devd
+/// Complete probed exit: spawn busd then devd
 /// Must be called OUTSIDE the scheduler lock.
 pub fn complete_probed_exit() {
     use crate::kernel::elf;
@@ -392,8 +392,11 @@ pub fn complete_probed_exit() {
         return;
     }
 
-    kdebug!("lifecycle", "probed_exit"; action = "spawning_devd");
-    match elf::spawn_from_path("bin/devd", 0, crate::kernel::caps::Capabilities::from_bits(0)) {
+    // Spawn busd first — it registers the bus: port that devd connects to
+    spawn_busd();
+
+    kinfo!("lifecycle", "spawning_devd2");
+    match elf::spawn_from_path("bin/devd2", 0, Capabilities::from_bits(0)) {
         Ok((_task_id, slot)) => {
             super::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
@@ -402,14 +405,38 @@ pub fn complete_probed_exit() {
                     task.is_init = true;
                 }
             });
-            knotice!("lifecycle", "devd_spawned"; slot = slot as u64);
+            kinfo!("lifecycle", "devd_spawned"; slot = slot as u64);
         }
         Err(_e) => {
-            // Fatal: can't spawn devd
             crate::print_str_uart("FATAL: probed_exit: cannot spawn devd\r\n");
             loop {
                 unsafe { core::arch::asm!("wfe"); }
             }
+        }
+    }
+}
+
+/// Spawn the bus daemon (busd) — message switch for all IPC routing.
+/// busd registers the `bus:` port. Must be spawned before devd.
+pub fn spawn_busd() {
+    use crate::kernel::elf;
+    use crate::kernel::caps::Capabilities;
+
+    kinfo!("lifecycle", "spawning_busd");
+    match elf::spawn_from_path("bin/busd", 0, Capabilities::from_bits(0)) {
+        Ok((_task_id, slot)) => {
+            super::with_scheduler(|sched| {
+                if let Some(task) = sched.task_mut(slot) {
+                    // busd needs IPC + port registration
+                    task.set_capabilities(Capabilities::ALL);
+                    task.set_priority(super::Priority::Critical);
+                }
+            });
+            kinfo!("lifecycle", "busd_spawned"; slot = slot as u64);
+        }
+        Err(_e) => {
+            crate::print_str_uart("WARN: failed to spawn busd\r\n");
+            // Non-fatal for now — devd can still work without busd during migration
         }
     }
 }

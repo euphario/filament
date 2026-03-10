@@ -1012,7 +1012,8 @@ impl SshSession {
         mailbox[70..72].copy_from_slice(&self.pty_rows.to_le_bytes());
         mailbox[72] = 0x01; // flags: bit 0 = SSH transport (enable diagnostics)
 
-        let caps = libos::devd::caps::USER_ADMIN;
+        // IPC | MEM | SPAWN | KILL | SIGNAL
+        let caps: u64 = 0x0C07;
         match syscall::exec_with_mailbox("shell", caps, &mailbox) {
             Ok((child_pid, _parent_mb_handle, parent_superq_handle)) => {
                 ring.allow(child_pid);

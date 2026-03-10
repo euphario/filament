@@ -30,6 +30,11 @@ pub trait MiscOps: Send + Sync {
     /// Returns the number of entries written.
     fn list_ramfs(&self, buf: &mut [abi::RamfsListEntry], max: usize) -> usize;
 
+    /// Read a ramfs file by name
+    ///
+    /// Returns the file data slice, or None if not found.
+    fn read_ramfs(&self, name: &str) -> Option<&[u8]>;
+
     /// Sleep until the given deadline (absolute nanoseconds since boot).
     ///
     /// Atomically blocks the current task with a timer deadline and reschedules.
@@ -87,6 +92,10 @@ impl MiscOps for MockMiscOps {
 
     fn list_ramfs(&self, _buf: &mut [abi::RamfsListEntry], _max: usize) -> usize {
         self.list_ramfs_count
+    }
+
+    fn read_ramfs(&self, _name: &str) -> Option<&[u8]> {
+        None
     }
 
     fn sleep_until(&self, _deadline: u64) -> Result<(), crate::kernel::error::KernelError> {

@@ -272,8 +272,9 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
 
     // Core programs (built for all platforms)
     let mut all_programs: Vec<(&str, &str)> = vec![
+        ("busd", "driver/busd"),
         ("probed", "driver/probed"),
-        ("devd", "driver/devd"),
+        ("devd2", "driver/devd2"),
         ("consoled", "driver/consoled"),
         ("shell", "shell"),
         ("partd", "driver/partd"),
@@ -344,8 +345,6 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
     for (name, path) in &programs {
         let features = if *name == "probed" {
             Some(platform_feature)
-        } else if stress && *name == "devd" {
-            Some("stress-test")
         } else {
             None
         };
@@ -537,6 +536,9 @@ fn create_initrd(root: &Path, include_firmware: bool, programs: &[String]) -> Re
         println!("  (firmware loaded from USB)");
     }
 
+    // Generate devd config
+    generate_devd_config(&staging_dir)?;
+
     // Create TAR archive
     println!();
     println!("  Creating TAR archive...");
@@ -570,6 +572,75 @@ fn create_initrd(root: &Path, include_firmware: bool, programs: &[String]) -> Re
     // Cleanup
     fs::remove_dir_all(&staging_dir)?;
 
+    Ok(())
+}
+
+// =============================================================================
+// devd config generation
+// =============================================================================
+
+struct ConfigRule {
+    port_class: u8,
+    binary: &'static str,
+    caps: u16,
+    priority: u8,
+}
+
+// PortClass discriminants (must match user/abi/src/lib.rs)
+const PORT_UART: u8 = 12;
+const PORT_KLOG: u8 = 13;
+const PORT_ETHERNET: u8 = 14;
+const PORT_CPU: u8 = 15;
+const PORT_PWM: u8 = 16;
+const PORT_USB: u8 = 4;
+const PORT_PCIE: u8 = 5;
+
+// Priority values (must match user/abi/src/lib.rs priority module)
+const PRI_HIGH: u8 = 2;
+const PRI_ABOVE_NORM: u8 = 3;
+const PRI_NORMAL: u8 = 4;
+
+/// Default driver capabilities (IPC | MEM | SPAWN | SCHEME | IRQ | MMIO | DMA | RAW_DEVICE | GRANT)
+const DRIVER_CAPS: u16 = 0x067F;
+
+const DEVD_RULES: &[ConfigRule] = &[
+    ConfigRule { port_class: PORT_UART,     binary: "consoled", caps: DRIVER_CAPS, priority: PRI_ABOVE_NORM },
+    ConfigRule { port_class: PORT_KLOG,     binary: "klogd",    caps: DRIVER_CAPS, priority: PRI_NORMAL },
+    ConfigRule { port_class: PORT_CPU,      binary: "cpud",     caps: DRIVER_CAPS, priority: PRI_NORMAL },
+    ConfigRule { port_class: PORT_PCIE,     binary: "pcied",    caps: DRIVER_CAPS, priority: PRI_HIGH },
+    ConfigRule { port_class: PORT_USB,      binary: "usbd",     caps: DRIVER_CAPS, priority: PRI_NORMAL },
+    ConfigRule { port_class: PORT_ETHERNET, binary: "ethd",     caps: DRIVER_CAPS, priority: PRI_NORMAL },
+    ConfigRule { port_class: PORT_PWM,      binary: "pwmd",     caps: DRIVER_CAPS, priority: PRI_NORMAL },
+];
+
+/// Generate binary devd config file in the staging directory
+///
+/// Format: 4-byte header + 32-byte entries
+///   Header: magic(u16 LE) + version(u8) + count(u8)
+///   Entry:  port_class(u8) + binary_len(u8) + binary([u8;16]) + caps(u16 LE) + priority(u8) + reserved([u8;11])
+fn generate_devd_config(staging_dir: &Path) -> Result<()> {
+    fs::create_dir_all(staging_dir.join("etc"))?;
+
+    let mut buf = Vec::new();
+    // Header
+    buf.extend_from_slice(&0xDE02u16.to_le_bytes());
+    buf.push(1); // version
+    buf.push(DEVD_RULES.len() as u8);
+
+    // Entries (32 bytes each)
+    for rule in DEVD_RULES {
+        let mut entry = [0u8; 32];
+        entry[0] = rule.port_class;
+        let blen = rule.binary.len().min(16);
+        entry[1] = blen as u8;
+        entry[2..2 + blen].copy_from_slice(&rule.binary.as_bytes()[..blen]);
+        entry[18..20].copy_from_slice(&rule.caps.to_le_bytes());
+        entry[20] = rule.priority;
+        buf.extend_from_slice(&entry);
+    }
+
+    fs::write(staging_dir.join("etc/devd.conf"), &buf)?;
+    println!("  etc/devd.conf ({} rules, {} bytes)", DEVD_RULES.len(), buf.len());
     Ok(())
 }
 
@@ -1272,7 +1343,7 @@ fn cmd_clean(root: &Path) -> Result<()> {
     }
 
     // Clean user programs
-    for dir in ["user/driver/devd", "user/driver/consoled", "user/shell"] {
+    for dir in ["user/driver/devd2", "user/driver/consoled", "user/shell"] {
         let path = root.join(dir);
         if path.exists() {
             let _ = Command::new("cargo")

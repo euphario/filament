@@ -3,7 +3,7 @@
 //! **THIS IS THE ONLY WAY TO WRITE DRIVERS.**
 //!
 //! All userspace drivers MUST use this framework. No driver may directly use
-//! Mux, Channel, Port, DevdClient, CommandRing, or raw syscalls for its event
+//! Mux, Channel, Port, CommandRing, or raw syscalls for its event
 //! loop or IPC. If a driver needs something the framework doesn't provide
 //! (a new data transport, a new callback, a new BusCtx method), the framework
 //! is what gets updated — not bypassed.
@@ -26,7 +26,7 @@
 //!                │ implemented by
 //! ┌──────────────▼───────────────────────────────┐
 //! │  DriverRuntime (concrete)                     │
-//! │  Mux + DevdClient + DataPorts + children     │
+//! │  Mux + BusClient + DataPorts + children       │
 //! └──────────────────────────────────────────────┘
 //! ```
 
@@ -674,6 +674,10 @@ pub trait BusCtx {
 
     /// Send an unsolicited event up with fresh payload.
     fn emit_event(&mut self, msg_type: u32, payload: &[u8]) -> Result<(), BusError>;
+
+    /// Emit a bus event via busd (fire and forget).
+    /// Events are routed by busd to all event subscribers (e.g. devd).
+    fn bus_emit(&mut self, key: &[u8], value: &[u8]) -> Result<(), BusError>;
 
     // === Data ports ===
 

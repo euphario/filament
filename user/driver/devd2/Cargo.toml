@@ -1,0 +1,17 @@
+[package]
+name = "devd2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libsys = { path = "../../libsys" }
+libos = { path = "../../libos" }
+libf = { path = "../../libf" }
+abi = { path = "../../abi" }
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = false

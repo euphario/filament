@@ -146,7 +146,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "devd"
+name = "devd2"
 version = "0.1.0"
 dependencies = [
  "abi",

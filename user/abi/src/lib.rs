@@ -58,6 +58,7 @@ pub mod syscall {
     pub const EXCEPTION_RESUME: u64 = 89;
     pub const SET_RESOURCE_LIMITS: u64 = 90;
     pub const KERNEL_PANIC: u64 = 91;
+    pub const RAMFS_READ: u64 = 92;
 
     // Unified interface (100-104) - THE 5 SYSCALLS
     pub const OPEN: u64 = 100;
@@ -1688,6 +1689,10 @@ impl PortClass {
         }
     }
 
+    pub fn from_u8(v: u8) -> Self {
+        Self::from_u16(v as u16).unwrap_or(PortClass::Unknown)
+    }
+
     pub fn from_u16(v: u16) -> Option<Self> {
         match v {
             0 => Some(PortClass::Unknown),
@@ -2145,5 +2150,205 @@ impl PortInfo {
     /// Get USB metadata (caller must verify port_class == Usb)
     pub unsafe fn usb_metadata(&self) -> &UsbMetadata {
         &self.metadata.usb
+    }
+}
+
+// ============================================================================
+// Bus Message Protocol (busd)
+// ============================================================================
+
+/// Message types for the bus protocol
+pub mod bus_msg_type {
+    /// Query a config key (or enumerate all with empty key)
+    pub const GET: u8 = 1;
+    /// Set a config key value
+    pub const SET: u8 = 2;
+    /// Response to GET or SET
+    pub const REPLY: u8 = 3;
+    /// Driver → devd notification (state change, port event, stats)
+    pub const EVENT: u8 = 4;
+    /// devd → driver lifecycle command (configure, stop, restart)
+    pub const LIFECYCLE: u8 = 5;
+    /// Client identity registration on connect
+    pub const REGISTER: u8 = 6;
+}
+
+/// Flags for bus messages
+pub mod bus_msg_flags {
+    /// Last response in a sequence (end-of-line)
+    pub const EOL: u8 = 0x01;
+    /// Response contains an error
+    pub const ERROR: u8 = 0x02;
+    /// More responses follow (partial result)
+    pub const PARTIAL: u8 = 0x04;
+}
+
+/// Bus message header — 8 bytes, followed by addr + key + value payload.
+///
+/// Fits in a Channel message (576B max). Total message:
+///   header(8) + addr(addr_len) + key(key_len) + value(value_len)
+///   Max payload: 568 bytes for addr + key + value combined.
+///
+/// seq_id is end-to-end — never rewritten by intermediaries.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BusMsgHeader {
+    /// Message type (see `bus_msg_type`)
+    pub msg_type: u8,
+    /// Flags (see `bus_msg_flags`)
+    pub flags: u8,
+    /// Sequence ID — preserved end-to-end for request/reply matching
+    pub seq_id: u16,
+    /// Length of destination address (0 = local/reply/broadcast)
+    pub addr_len: u8,
+    /// Length of key string
+    pub key_len: u8,
+    /// Length of value payload
+    pub value_len: u16,
+}
+
+impl BusMsgHeader {
+    pub const SIZE: usize = 8;
+    /// Max payload after header in a 576-byte Channel message
+    pub const MAX_PAYLOAD: usize = 568;
+
+    pub const fn new(msg_type: u8, seq_id: u16) -> Self {
+        Self {
+            msg_type,
+            flags: 0,
+            seq_id,
+            addr_len: 0,
+            key_len: 0,
+            value_len: 0,
+        }
+    }
+
+    /// Total wire size of this message (header + all fields)
+    pub fn wire_len(&self) -> usize {
+        Self::SIZE + self.addr_len as usize + self.key_len as usize + self.value_len as usize
+    }
+
+    /// Serialize header into first 8 bytes of buf
+    pub fn write_to(&self, buf: &mut [u8]) {
+        if buf.len() < Self::SIZE {
+            return;
+        }
+        buf[0] = self.msg_type;
+        buf[1] = self.flags;
+        buf[2] = (self.seq_id & 0xFF) as u8;
+        buf[3] = (self.seq_id >> 8) as u8;
+        buf[4] = self.addr_len;
+        buf[5] = self.key_len;
+        buf[6] = (self.value_len & 0xFF) as u8;
+        buf[7] = (self.value_len >> 8) as u8;
+    }
+
+    /// Deserialize header from first 8 bytes of buf
+    pub fn read_from(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Self {
+            msg_type: buf[0],
+            flags: buf[1],
+            seq_id: buf[2] as u16 | (buf[3] as u16) << 8,
+            addr_len: buf[4],
+            key_len: buf[5],
+            value_len: buf[6] as u16 | (buf[7] as u16) << 8,
+        })
+    }
+}
+
+/// A complete bus message with header and payload slices.
+///
+/// This is a zero-copy view into a message buffer.
+/// Use `BusMsgBuilder` to construct messages into a buffer.
+pub struct BusMsg<'a> {
+    pub header: BusMsgHeader,
+    pub addr: &'a [u8],
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+}
+
+impl<'a> BusMsg<'a> {
+    /// Parse a bus message from a raw buffer
+    pub fn parse(buf: &'a [u8]) -> Option<Self> {
+        let header = BusMsgHeader::read_from(buf)?;
+        let rest = &buf[BusMsgHeader::SIZE..];
+        let addr_end = header.addr_len as usize;
+        let key_end = addr_end + header.key_len as usize;
+        let value_end = key_end + header.value_len as usize;
+        if rest.len() < value_end {
+            return None;
+        }
+        Some(Self {
+            header,
+            addr: &rest[..addr_end],
+            key: &rest[addr_end..key_end],
+            value: &rest[key_end..value_end],
+        })
+    }
+}
+
+/// Builder for constructing bus messages into a fixed buffer.
+pub struct BusMsgBuilder<'a> {
+    buf: &'a mut [u8],
+    header: BusMsgHeader,
+    pos: usize,
+}
+
+impl<'a> BusMsgBuilder<'a> {
+    /// Start building a message into `buf`
+    pub fn new(buf: &'a mut [u8], msg_type: u8, seq_id: u16) -> Self {
+        Self {
+            buf,
+            header: BusMsgHeader::new(msg_type, seq_id),
+            pos: BusMsgHeader::SIZE,
+        }
+    }
+
+    /// Set destination address
+    pub fn addr(mut self, addr: &[u8]) -> Self {
+        let len = addr.len().min(255);
+        if self.pos + len <= self.buf.len() {
+            self.buf[self.pos..self.pos + len].copy_from_slice(&addr[..len]);
+            self.header.addr_len = len as u8;
+            self.pos += len;
+        }
+        self
+    }
+
+    /// Set key
+    pub fn key(mut self, key: &[u8]) -> Self {
+        let len = key.len().min(255);
+        if self.pos + len <= self.buf.len() {
+            self.buf[self.pos..self.pos + len].copy_from_slice(&key[..len]);
+            self.header.key_len = len as u8;
+            self.pos += len;
+        }
+        self
+    }
+
+    /// Set value
+    pub fn value(mut self, value: &[u8]) -> Self {
+        let len = value.len().min(BusMsgHeader::MAX_PAYLOAD);
+        if self.pos + len <= self.buf.len() {
+            self.buf[self.pos..self.pos + len].copy_from_slice(&value[..len]);
+            self.header.value_len = len as u16;
+            self.pos += len;
+        }
+        self
+    }
+
+    /// Set flags
+    pub fn flags(mut self, flags: u8) -> Self {
+        self.header.flags = flags;
+        self
+    }
+
+    /// Finalize: write header and return total message length
+    pub fn finish(self) -> usize {
+        self.header.write_to(self.buf);
+        self.pos
     }
 }

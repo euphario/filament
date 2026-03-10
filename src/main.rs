@@ -1133,10 +1133,13 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
             }
         }
 
-        // Step 2: Respawn devd
+        // Step 2: Respawn busd + devd
         // (Buses already reset to Safe by process_cleanup above)
+        print_str_uart("  Respawning busd...\r\n");
+        kernel::task::lifecycle::spawn_busd();
+
         print_str_uart("  Respawning devd...\r\n");
-        match elf::spawn_from_path("bin/devd", 0, kernel::caps::Capabilities::from_bits(0)) {
+        match elf::spawn_from_path("bin/devd2", 0, kernel::caps::Capabilities::from_bits(0)) {
             Ok((new_pid, slot)) => {
                 print_str_uart("  devd restarted as PID ");
                 print_hex_uart(new_pid as u64);
@@ -1517,9 +1520,12 @@ pub extern "C" fn recover_devd() {
     print_str_uart("  Resetting buses to Safe...\r\n");
     kernel::bus::reset_all_buses();
 
-    // Step 3: Respawn devd - same as boot
+    // Step 3: Respawn busd + devd - same as boot
+    print_str_uart("  Respawning busd...\r\n");
+    kernel::task::lifecycle::spawn_busd();
+
     print_str_uart("  Respawning devd...\r\n");
-    match elf::spawn_from_path("bin/devd", 0, kernel::caps::Capabilities::from_bits(0)) {
+    match elf::spawn_from_path("bin/devd2", 0, kernel::caps::Capabilities::from_bits(0)) {
         Ok((new_pid, slot)) => {
             print_str_uart("  devd spawned as PID ");
             print_hex_uart(new_pid as u64);
