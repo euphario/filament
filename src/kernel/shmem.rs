@@ -127,6 +127,10 @@ pub struct SharedMem {
     pending_for: [Pid; MAX_ALLOWED_PIDS],
     /// Public access flag - when true, any process can map this region
     pub is_public: bool,
+    /// Broadcast pending — tracks who sent the notification so only the OTHER side consumes it.
+    /// Set to the notifier's PID when notify() fires on a public shmem with no waiters.
+    /// A wait() caller can only consume this if they are NOT the sender.
+    pending_broadcast_from: Pid,
 }
 
 impl SharedMem {
@@ -150,6 +154,7 @@ impl SharedMem {
             state: RegionState::Active,
             pending_for: [NO_PID; MAX_ALLOWED_PIDS],
             is_public: false,
+            pending_broadcast_from: NO_PID,
         }
     }
 
@@ -794,10 +799,14 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
 
                     // Check if notification is pending for THIS pid (race condition fix)
                     // If notify() was called before we subscribed, return immediately
+                    if region.pending_broadcast_from != NO_PID && region.pending_broadcast_from != pid {
+                        region.pending_broadcast_from = NO_PID;
+                        return Ok(());
+                    }
                     for slot in &mut region.pending_for {
                         if *slot == pid {
-                            *slot = NO_PID; // Clear the pending flag for this pid
-                            return Ok(()); // Data is ready, don't block
+                            *slot = NO_PID;
+                            return Ok(());
                         }
                     }
 
@@ -915,26 +924,26 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
                     // Check if there were any actual waiters
                     had_any_waiters = drained.iter().any(|&p| p != NO_PID);
 
-                    // If no waiters, mark all OTHER allowed PIDs as pending (race condition fix)
-                    // This way when they call wait(), they'll get the notification.
-                    // We exclude the caller since they're the one notifying.
+                    // If no waiters, set pending flags so future wait() returns immediately.
                     if !had_any_waiters {
+                        // Public shmem: record sender so only the OTHER side consumes it
+                        if region.is_public {
+                            region.pending_broadcast_from = pid;
+                        }
                         // Mark owner as pending (if not the caller)
                         if region.owner_pid != NO_PID && region.owner_pid != pid {
-                            // Find empty slot in pending_for
                             for slot in &mut region.pending_for {
                                 if *slot == NO_PID {
                                     *slot = region.owner_pid;
                                     break;
                                 } else if *slot == region.owner_pid {
-                                    break; // Already pending
+                                    break;
                                 }
                             }
                         }
                         // Mark allowed pids as pending (if not the caller)
                         for &allowed_pid in &region.allowed_pids {
                             if allowed_pid != NO_PID && allowed_pid != pid {
-                                // Find empty slot in pending_for (or check if already there)
                                 let mut already_pending = false;
                                 for slot in region.pending_for.iter() {
                                     if *slot == allowed_pid {

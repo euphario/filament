@@ -38,12 +38,14 @@ use libos::bus::{
     PortInfo, PortClass, port_subclass,
 };
 use libos::bus_runtime::driver_main;
-use libos::ring::{IoSqe, io_status};
+use libos::ring::{IoSqe, io_status, POOL_SLOT_SIZE};
 use libos::vfs_proto::{fs_op, open_flags, file_type, vfs_error, VfsDirEntry, VfsStat};
 use libos::{uinfo, unotice, udebug, uerror};
 
 const FAT_CACHE_ENTRIES: usize = 8192;
 const MAX_OPEN_FILES: usize = 16;
+/// Scratch buffer for batch reads — sized to one pool slot (2048 bytes).
+const FAT_READ_BUF_SIZE: usize = 2048;
 
 // =============================================================================
 // Open file tracking
@@ -115,6 +117,9 @@ struct FatfsDriver {
     // Port name derived from partition
     port_name: [u8; 32],
     port_name_len: usize,
+
+    // Scratch buffer for batch FAT sector reads
+    fat_read_buf: [u8; FAT_READ_BUF_SIZE],
 }
 
 impl FatfsDriver {
@@ -143,56 +148,21 @@ impl FatfsDriver {
             open_files: [OpenFile::empty(); MAX_OPEN_FILES],
             port_name: [0; 32],
             port_name_len: 0,
+            fat_read_buf: [0u8; FAT_READ_BUF_SIZE],
         }
     }
 
     // =========================================================================
-    // Block I/O helper (same pattern as partd)
+    // Block I/O helpers
     // =========================================================================
 
+    /// Read a single sector.
     fn read_block(&self, lba: u64, buf: &mut [u8], ctx: &mut dyn BusCtx) -> bool {
         let port_id = match self.consumer_port {
             Some(id) => id,
             None => return false,
         };
-
-        let port = match ctx.block_port(port_id) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        let len = buf.len() as u32;
-        let offset = match port.alloc(len) {
-            Some(o) => o,
-            None => return false,
-        };
-
-        let tag = match port.submit_read(lba, offset, len) {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-
-        port.notify();
-
-        // Wait for completion (kernel-backed wait, yields to scheduler)
-        for _ in 0..100 {
-            if let Some(cqe) = port.poll_completion() {
-                if cqe.tag == tag {
-                    if cqe.status == io_status::OK as u16 {
-                        if let Some(pool_slice) = port.pool_slice(offset, len) {
-                            buf.copy_from_slice(pool_slice);
-                            port.free(offset);
-                            return true;
-                        }
-                    }
-                    port.free(offset);
-                    return false;
-                }
-            }
-            port.wait(10);
-        }
-        port.free(offset);
-        false
+        read_sectors(port_id, lba, buf, ctx)
     }
 
     fn write_block(&self, lba: u64, data: &[u8], ctx: &mut dyn BusCtx) -> bool {
@@ -200,39 +170,7 @@ impl FatfsDriver {
             Some(id) => id,
             None => return false,
         };
-
-        let port = match ctx.block_port(port_id) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        let len = data.len() as u32;
-        let offset = match port.alloc(len) {
-            Some(o) => o,
-            None => return false,
-        };
-
-        // Copy data into pool, then submit write
-        port.pool_write(offset, data);
-
-        let tag = match port.submit_write(lba, offset, len) {
-            Ok(t) => t,
-            Err(_) => { port.free(offset); return false; }
-        };
-
-        port.notify();
-
-        for _ in 0..100 {
-            if let Some(cqe) = port.poll_completion() {
-                if cqe.tag == tag {
-                    port.free(offset);
-                    return cqe.status == io_status::OK as u16;
-                }
-            }
-            port.wait(10);
-        }
-        port.free(offset);
-        false
+        write_sectors(port_id, lba, data, ctx)
     }
 
     // =========================================================================
@@ -326,61 +264,79 @@ impl FatfsDriver {
 
     /// Load a window of FAT entries starting at `base_cluster` into the cache.
     /// For FAT16: 2 bytes per entry. For FAT32: 4 bytes per entry (masked to 28 bits).
+    ///
+    /// Reads all needed FAT sectors in a single batch I/O operation.
     fn cache_fat_window(&mut self, base_cluster: u32, ctx: &mut dyn BusCtx) -> bool {
         let entry_size: u32 = if self.is_fat32 { 4 } else { 2 };
         let bps = self.bytes_per_sector as u32;
-        let entries_per_sector = bps / entry_size;
 
-        // Calculate total entries in the FAT
+        // How many entries exist in the FAT from base_cluster onward?
         let fat_bytes = self.fat_size_sectors * bps;
         let total_fat_entries = fat_bytes / entry_size;
+        if base_cluster >= total_fat_entries {
+            return false;
+        }
         let entries_to_cache = (total_fat_entries - base_cluster).min(FAT_CACHE_ENTRIES as u32) as usize;
 
-        // Calculate which FAT sector contains base_cluster
+        // Which FAT sector range do we need?
         let byte_offset = base_cluster * entry_size;
         let first_fat_sector = byte_offset / bps;
         let offset_in_first_sector = (byte_offset % bps) as usize;
 
-        let mut sector_buf = [0u8; 512];
+        let bytes_needed = offset_in_first_sector as u32 + entries_to_cache as u32 * entry_size;
+        let sectors_needed = (bytes_needed + bps - 1) / bps;
+        let sectors_to_read = sectors_needed.min(self.fat_size_sectors - first_fat_sector);
+
+        // Read in chunks that fit one pool slot (POOL_SLOT_SIZE = 2048).
+        // Each chunk reads up to `sectors_per_chunk` contiguous sectors.
+        let port_id = match self.consumer_port {
+            Some(id) => id,
+            None => return false,
+        };
+
+        let chunk_bytes = POOL_SLOT_SIZE as usize;
+        let sectors_per_chunk = chunk_bytes / bps as usize;
         let mut cached = 0;
+        let mut sector = 0u32;
+        let mut first_chunk = true;
 
-        let sectors_needed = ((entries_to_cache as u32 * entry_size + bps - 1) / bps) + 1;
-        for s in 0..sectors_needed {
-            if cached >= entries_to_cache {
-                break;
-            }
-            let sector_idx = first_fat_sector + s;
-            if sector_idx >= self.fat_size_sectors {
-                break;
-            }
+        while sector < sectors_to_read && cached < entries_to_cache {
+            let remaining_sectors = sectors_to_read - sector;
+            let n = (remaining_sectors as usize).min(sectors_per_chunk);
+            let read_bytes = n * bps as usize;
+            let lba = self.fat_start_lba as u64 + (first_fat_sector + sector) as u64;
 
-            let lba = self.fat_start_lba as u64 + sector_idx as u64;
-            if !self.read_block(lba, &mut sector_buf[..bps as usize], ctx) {
-                uerror!("fatfsd", "fat_read_failed"; sector = sector_idx);
+            if !read_sectors(port_id, lba, &mut self.fat_read_buf[..read_bytes], ctx) {
+                uerror!("fatfsd", "fat_read_failed"; sector = first_fat_sector + sector, count = n as u32);
                 return false;
             }
 
-            let start = if s == 0 { offset_in_first_sector } else { 0 };
+            // Parse entries from this chunk
+            let start = if first_chunk { offset_in_first_sector } else { 0 };
+            first_chunk = false;
+            let es = entry_size as usize;
             let mut off = start;
-            while off + entry_size as usize <= bps as usize && cached < entries_to_cache {
+            while off + es <= read_bytes && cached < entries_to_cache {
                 if self.is_fat32 {
                     let val = u32::from_le_bytes([
-                        sector_buf[off], sector_buf[off + 1],
-                        sector_buf[off + 2], sector_buf[off + 3],
+                        self.fat_read_buf[off], self.fat_read_buf[off + 1],
+                        self.fat_read_buf[off + 2], self.fat_read_buf[off + 3],
                     ]);
                     self.fat_cache[cached] = val & 0x0FFF_FFFF;
                 } else {
-                    let val = u16::from_le_bytes([sector_buf[off], sector_buf[off + 1]]);
+                    let val = u16::from_le_bytes([self.fat_read_buf[off], self.fat_read_buf[off + 1]]);
                     self.fat_cache[cached] = val as u32;
                 }
                 cached += 1;
-                off += entry_size as usize;
+                off += es;
             }
+
+            sector += n as u32;
         }
 
         self.fat_cache_base = base_cluster;
         self.fat_cache_valid = true;
-        udebug!("fatfsd", "fat_cached"; base = base_cluster, entries = cached as u32);
+        udebug!("fatfsd", "fat_cached"; base = base_cluster, entries = cached as u32, sectors = sectors_to_read);
         true
     }
 
@@ -918,50 +874,59 @@ impl FatfsDriver {
             }
         }
 
-        // Read data cluster by cluster
+        // Read data cluster by cluster, chunked to fit pool slots
         let mut total_read = 0u32;
         let mut cluster_offset = offset_in_cluster;
-        let mut sector_buf = [0u8; 512];
+        let cluster_sz = self.cluster_size() as usize;
+        let bps = self.bytes_per_sector as usize;
+        let chunk_bytes = POOL_SLOT_SIZE as usize;
+        let port_id = match self.consumer_port {
+            Some(id) => id,
+            None => {
+                Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
+                return;
+            }
+        };
 
         while total_read < to_read {
-            let lba = self.cluster_to_lba(cluster);
-            let sectors_in_cluster = self.sectors_per_cluster as u32;
+            let base_lba = self.cluster_to_lba(cluster);
+            let start_in_cluster = cluster_offset as usize;
+            let needed = (to_read - total_read) as usize;
+            let available = cluster_sz - start_in_cluster;
+            let cluster_read = needed.min(available);
 
-            let sector_in_cluster = cluster_offset / self.bytes_per_sector as u32;
-            let offset_in_sector = cluster_offset % self.bytes_per_sector as u32;
+            // Read this cluster's data in pool-slot-sized chunks
+            let mut done = 0usize;
+            while done < cluster_read {
+                let pos = start_in_cluster + done;
+                let first_sector = pos / bps;
+                let byte_start = first_sector * bps;
+                let remain = cluster_read - done;
+                let byte_end = (pos + remain + bps - 1) / bps * bps;
+                let io_len = (byte_end - byte_start).min(chunk_bytes).min(cluster_sz - byte_start);
+                let io_lba = base_lba + first_sector as u64;
 
-            for sec in sector_in_cluster..sectors_in_cluster {
-                if total_read >= to_read {
-                    break;
-                }
-
-                let sec_lba = lba + sec as u64;
-                if !self.read_block(sec_lba, &mut sector_buf[..self.bytes_per_sector as usize], ctx) {
+                if !read_sectors(port_id, io_lba, &mut self.fat_read_buf[..io_len], ctx) {
                     Self::complete_vfs_error(ctx, vfs_id, sqe.tag, vfs_error::IO_ERROR);
                     return;
                 }
 
-                let start = if sec == sector_in_cluster { offset_in_sector as usize } else { 0 };
-                let available = self.bytes_per_sector as usize - start;
-                let needed = (to_read - total_read) as usize;
-                let copy_len = available.min(needed);
-
-                // Copy to VFS pool
+                let src_start = pos - byte_start;
+                let copy_len = remain.min(io_len - src_start);
                 if let Some(port) = ctx.block_port(vfs_id) {
-                    let dst_offset = buf_offset + total_read;
-                    port.pool_write(dst_offset, &sector_buf[start..start + copy_len]);
+                    let dst_offset = buf_offset + total_read + done as u32;
+                    port.pool_write(dst_offset, &self.fat_read_buf[src_start..src_start + copy_len]);
                 }
-
-                total_read += copy_len as u32;
+                done += copy_len;
             }
 
-            cluster_offset = 0; // Only first cluster has an offset
+            total_read += cluster_read as u32;
+            cluster_offset = 0;
 
-            // Next cluster
             if total_read < to_read {
                 match self.next_cluster(cluster, ctx) {
                     Some(c) => cluster = c,
-                    None => break, // End of chain
+                    None => break,
                 }
             }
         }
@@ -2030,6 +1995,96 @@ static mut DRIVER: FatfsDriver = FatfsDriver::new();
 fn main() {
     let driver = unsafe { &mut *(&raw mut DRIVER) };
     driver_main(b"fatfsd", driver);
+}
+
+// =============================================================================
+// Block I/O (freestanding — no &self, avoids borrow conflicts with scratch buffers)
+// =============================================================================
+
+/// Read contiguous sectors into `buf` via a single ring submission.
+fn read_sectors(port_id: PortId, lba: u64, buf: &mut [u8], ctx: &mut dyn BusCtx) -> bool {
+    let port = match ctx.block_port(port_id) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let len = buf.len() as u32;
+    let offset = match port.alloc(len) {
+        Some(o) => o,
+        None => {
+            uerror!("fatfsd", "read_alloc_failed"; lba = lba, len = len);
+            return false;
+        }
+    };
+
+    let tag = match port.submit_read(lba, offset, len) {
+        Ok(t) => t,
+        Err(_) => {
+            uerror!("fatfsd", "read_submit_failed"; lba = lba, len = len);
+            port.free(offset);
+            return false;
+        }
+    };
+
+    port.notify();
+
+    for _ in 0..100 {
+        if let Some(cqe) = port.poll_completion() {
+            if cqe.tag == tag {
+                if cqe.status == io_status::OK as u16 {
+                    if let Some(pool_slice) = port.pool_slice(offset, len) {
+                        buf.copy_from_slice(pool_slice);
+                        port.free(offset);
+                        return true;
+                    }
+                }
+                uerror!("fatfsd", "read_status_failed"; lba = lba, status = cqe.status as u32);
+                port.free(offset);
+                return false;
+            }
+            // Wrong tag — discard stale completion
+            udebug!("fatfsd", "read_stale_cqe"; expected = tag, got = cqe.tag);
+        }
+        port.wait(10);
+    }
+    uerror!("fatfsd", "read_timeout"; lba = lba, tag = tag);
+    port.free(offset);
+    false
+}
+
+/// Write contiguous sectors from `data` via a single ring submission.
+fn write_sectors(port_id: PortId, lba: u64, data: &[u8], ctx: &mut dyn BusCtx) -> bool {
+    let port = match ctx.block_port(port_id) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let len = data.len() as u32;
+    let offset = match port.alloc(len) {
+        Some(o) => o,
+        None => return false,
+    };
+
+    port.pool_write(offset, data);
+
+    let tag = match port.submit_write(lba, offset, len) {
+        Ok(t) => t,
+        Err(_) => { port.free(offset); return false; }
+    };
+
+    port.notify();
+
+    for _ in 0..100 {
+        if let Some(cqe) = port.poll_completion() {
+            if cqe.tag == tag {
+                port.free(offset);
+                return cqe.status == io_status::OK as u16;
+            }
+        }
+        port.wait(10);
+    }
+    port.free(offset);
+    false
 }
 
 // =============================================================================
