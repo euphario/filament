@@ -290,6 +290,7 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         all_programs.push(("netd", "driver/netd"));
         all_programs.push(("ipd", "driver/ipd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
+        all_programs.push(("vfsd", "driver/vfsd"));
         all_programs.push(("sshd", "driver/sshd"));
     } else {
         // MT7988A real hardware programs
@@ -302,6 +303,7 @@ fn build_user(root: &Path, only: &[String], platform: &str, stress: bool) -> Res
         all_programs.push(("switchd", "driver/switchd"));  // MT7531 L2 switch
         all_programs.push(("ipd", "driver/ipd"));
         all_programs.push(("fatfsd", "driver/fatfsd"));
+        all_programs.push(("vfsd", "driver/vfsd"));
         all_programs.push(("pwmd", "driver/pwm"));  // CPU fan PWM control
         all_programs.push(("sshd", "driver/sshd"));
     }
@@ -538,6 +540,7 @@ fn create_initrd(root: &Path, include_firmware: bool, programs: &[String]) -> Re
 
     // Generate devd config
     generate_devd_config(&staging_dir)?;
+    generate_driver_configs(&staging_dir)?;
 
     // Create TAR archive
     println!();
@@ -584,6 +587,8 @@ struct ConfigRule {
     binary: &'static str,
     caps: u16,
     priority: u8,
+    /// Port subclass for finer matching (0xFFFF = match any).
+    subclass: u16,
 }
 
 // PortClass discriminants (must match user/abi/src/lib.rs)
@@ -592,6 +597,8 @@ const PORT_KLOG: u8 = 13;
 const PORT_ETHERNET: u8 = 14;
 const PORT_CPU: u8 = 15;
 const PORT_PWM: u8 = 16;
+const PORT_BLOCK: u8 = 1;
+const PORT_STORAGE: u8 = 2;
 const PORT_USB: u8 = 4;
 const PORT_PCIE: u8 = 5;
 
@@ -603,21 +610,38 @@ const PRI_NORMAL: u8 = 4;
 /// Default driver capabilities (IPC | MEM | SPAWN | SCHEME | IRQ | MMIO | DMA | RAW_DEVICE | GRANT)
 const DRIVER_CAPS: u16 = 0x067F;
 
+/// Subclass sentinel: match any subclass within the port class.
+const SUB_ANY: u16 = 0xFFFF;
+/// port_subclass::BLOCK_RAW — unpartitioned disk → partd
+const SUB_BLOCK_RAW: u16 = 0x00;
+/// port_subclass::BLOCK_FAT16 — FAT16 partition → fatfsd
+const SUB_BLOCK_FAT16: u16 = 0x06;
+/// port_subclass::BLOCK_FAT32 — FAT32 partition → fatfsd
+const SUB_BLOCK_FAT32: u16 = 0x0b;
+/// port_subclass::BLOCK_FAT32_LBA — FAT32 LBA partition → fatfsd
+const SUB_BLOCK_FAT32_LBA: u16 = 0x0c;
+
 const DEVD_RULES: &[ConfigRule] = &[
-    ConfigRule { port_class: PORT_UART,     binary: "consoled", caps: DRIVER_CAPS, priority: PRI_ABOVE_NORM },
-    ConfigRule { port_class: PORT_KLOG,     binary: "klogd",    caps: DRIVER_CAPS, priority: PRI_NORMAL },
-    ConfigRule { port_class: PORT_CPU,      binary: "cpud",     caps: DRIVER_CAPS, priority: PRI_NORMAL },
-    ConfigRule { port_class: PORT_PCIE,     binary: "pcied",    caps: DRIVER_CAPS, priority: PRI_HIGH },
-    ConfigRule { port_class: PORT_USB,      binary: "usbd",     caps: DRIVER_CAPS, priority: PRI_NORMAL },
-    ConfigRule { port_class: PORT_ETHERNET, binary: "ethd",     caps: DRIVER_CAPS, priority: PRI_NORMAL },
-    ConfigRule { port_class: PORT_PWM,      binary: "pwmd",     caps: DRIVER_CAPS, priority: PRI_NORMAL },
+    ConfigRule { port_class: PORT_UART,     binary: "consoled", caps: DRIVER_CAPS, priority: PRI_ABOVE_NORM, subclass: SUB_ANY },
+    ConfigRule { port_class: PORT_KLOG,     binary: "klogd",    caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_ANY },
+    ConfigRule { port_class: PORT_CPU,      binary: "cpud",     caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_ANY },
+    ConfigRule { port_class: PORT_PCIE,     binary: "pcied",    caps: DRIVER_CAPS, priority: PRI_HIGH,       subclass: SUB_ANY },
+    ConfigRule { port_class: PORT_USB,      binary: "usbd",     caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_ANY },
+    ConfigRule { port_class: PORT_STORAGE,  binary: "nvmed",    caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_ANY },
+    ConfigRule { port_class: PORT_ETHERNET, binary: "ethd",     caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_ANY },
+    ConfigRule { port_class: PORT_PWM,      binary: "pwmd",     caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_ANY },
+    // Block class: disambiguated by subclass
+    ConfigRule { port_class: PORT_BLOCK,    binary: "partd",    caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_BLOCK_RAW },
+    ConfigRule { port_class: PORT_BLOCK,    binary: "fatfsd",   caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_BLOCK_FAT16 },
+    ConfigRule { port_class: PORT_BLOCK,    binary: "fatfsd",   caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_BLOCK_FAT32 },
+    ConfigRule { port_class: PORT_BLOCK,    binary: "fatfsd",   caps: DRIVER_CAPS, priority: PRI_NORMAL,     subclass: SUB_BLOCK_FAT32_LBA },
 ];
 
 /// Generate binary devd config file in the staging directory
 ///
 /// Format: 4-byte header + 32-byte entries
 ///   Header: magic(u16 LE) + version(u8) + count(u8)
-///   Entry:  port_class(u8) + binary_len(u8) + binary([u8;16]) + caps(u16 LE) + priority(u8) + reserved([u8;11])
+///   Entry:  port_class(u8) + binary_len(u8) + binary([u8;16]) + caps(u16 LE) + priority(u8) + subclass(u16 LE) + reserved([u8;9])
 fn generate_devd_config(staging_dir: &Path) -> Result<()> {
     fs::create_dir_all(staging_dir.join("etc"))?;
 
@@ -636,11 +660,60 @@ fn generate_devd_config(staging_dir: &Path) -> Result<()> {
         entry[2..2 + blen].copy_from_slice(&rule.binary.as_bytes()[..blen]);
         entry[18..20].copy_from_slice(&rule.caps.to_le_bytes());
         entry[20] = rule.priority;
+        // Subclass at [21..23] (u16 LE), 0xFFFF = match any
+        entry[21..23].copy_from_slice(&rule.subclass.to_le_bytes());
         buf.extend_from_slice(&entry);
     }
 
     fs::write(staging_dir.join("etc/devd.conf"), &buf)?;
     println!("  etc/devd.conf ({} rules, {} bytes)", DEVD_RULES.len(), buf.len());
+    Ok(())
+}
+
+/// Per-driver config entry: match key + KVs sent as config SETs before config.done.
+/// Match key is a binary name (e.g. "fatfsd") or trigger port path (e.g. "/pcie:0/nvme:0/block:0/fat:0").
+struct DriverConfigEntry {
+    name: &'static str,
+    kvs: &'static [(&'static str, &'static str)],
+}
+
+const DRIVER_CONFIGS: &[DriverConfigEntry] = &[
+    DriverConfigEntry {
+        name: "/pcie:0/nvme:0/block:0/fat:0",
+        kvs: &[("mount.path", "/mnt/nvme")],
+    },
+    DriverConfigEntry {
+        name: "/pcie:0/xhci:0/msc:0/fat:0",
+        kvs: &[("mount.path", "/mnt/usb")],
+    },
+];
+
+/// Generate binary driver config file.
+///
+/// Format: 4-byte header + variable-length entries
+///   Header: magic(u16 LE) + version(u8) + count(u8)
+///   Entry:  name_len(u8) + name(N) + kv_count(u8) + (key_len(u8) + key + val_len(u8) + val)*
+fn generate_driver_configs(staging_dir: &Path) -> Result<()> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&0xCF02u16.to_le_bytes()); // DRIVER_CONFIG_MAGIC
+    buf.push(1); // version
+    buf.push(DRIVER_CONFIGS.len() as u8);
+
+    for cfg in DRIVER_CONFIGS {
+        let name = cfg.name.as_bytes();
+        buf.push(name.len() as u8);
+        buf.extend_from_slice(name);
+        buf.push(cfg.kvs.len() as u8);
+        for &(key, val) in cfg.kvs {
+            buf.push(key.len() as u8);
+            buf.extend_from_slice(key.as_bytes());
+            buf.push(val.len() as u8);
+            buf.extend_from_slice(val.as_bytes());
+        }
+    }
+
+    fs::write(staging_dir.join("etc/drivers.conf"), &buf)?;
+    println!("  etc/drivers.conf ({} entries, {} bytes)", DRIVER_CONFIGS.len(), buf.len());
     Ok(())
 }
 

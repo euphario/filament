@@ -234,7 +234,7 @@ impl Driver for PcieDriver {
                 let count = bus_devs.len().min(MAX_PCI_DEVICES);
                 self.devices[..count].copy_from_slice(&bus_devs[..count]);
                 self.count = count;
-                unotice!("pcied", "pci_devices"; count = count as u32);  // meaningful: device count
+                unotice!("pcied", "pci_devices"; count = count as u32);
             } else {
                 unotice!("pcied", "no_devices";);
             }

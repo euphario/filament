@@ -17,6 +17,7 @@ use libos::{uinfo, unotice, uwarn, uerror, udebug};
 
 const MAX_CLIENTS: usize = 64;
 const MAX_PENDING_REPLIES: usize = 64;
+const MAX_STORED_EVENTS: usize = 32;
 const MSG_BUF_SIZE: usize = 576;
 
 // =============================================================================
@@ -61,24 +62,36 @@ struct PendingReply {
 // Bus Daemon
 // =============================================================================
 
+/// Stored event for replay to late subscribers.
+struct StoredEvent {
+    buf: [u8; MSG_BUF_SIZE],
+    len: u16,
+}
+
 struct BusDaemon {
     port: Option<Port>,
     mux: Option<Mux>,
     clients: [Option<Route>; MAX_CLIENTS],
     pending: [Option<PendingReply>; MAX_PENDING_REPLIES],
     client_count: usize,
+    /// Ring of stored events (port.registered, state) for late-subscriber replay.
+    stored_events: [Option<StoredEvent>; MAX_STORED_EVENTS],
+    stored_event_count: usize,
 }
 
 impl BusDaemon {
     const fn new() -> Self {
         const NONE_ROUTE: Option<Route> = None;
         const NONE_PENDING: Option<PendingReply> = None;
+        const NONE_EVENT: Option<StoredEvent> = None;
         Self {
             port: None,
             mux: None,
             clients: [NONE_ROUTE; MAX_CLIENTS],
             pending: [NONE_PENDING; MAX_PENDING_REPLIES],
             client_count: 0,
+            stored_events: [NONE_EVENT; MAX_STORED_EVENTS],
+            stored_event_count: 0,
         }
     }
 
@@ -283,6 +296,18 @@ impl BusDaemon {
         udebug!("busd", "registered";
             name = core::str::from_utf8(route.name_bytes()).unwrap_or("?"),
             path = core::str::from_utf8(route.path_bytes()).unwrap_or("?"));
+
+        // Replay stored events to late subscribers so they see ports
+        // registered before they connected.
+        if subscribe {
+            for i in 0..self.stored_event_count {
+                if let Some(ref event) = self.stored_events[i] {
+                    if let Some(ref route) = self.clients[idx] {
+                        let _ = route.channel.send(&event.buf[..event.len as usize]);
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -349,6 +374,9 @@ impl BusDaemon {
     // =========================================================================
 
     fn route_event(&mut self, sender_idx: usize, buf: &[u8]) {
+        // Store event for late-subscriber replay
+        self.store_event(buf);
+
         for (i, client) in self.clients.iter().enumerate() {
             if i == sender_idx {
                 continue;
@@ -360,6 +388,20 @@ impl BusDaemon {
             }
         }
     }
+
+    fn store_event(&mut self, buf: &[u8]) {
+        if self.stored_event_count >= MAX_STORED_EVENTS || buf.len() > MSG_BUF_SIZE {
+            return;
+        }
+        let mut stored = [0u8; MSG_BUF_SIZE];
+        stored[..buf.len()].copy_from_slice(buf);
+        self.stored_events[self.stored_event_count] = Some(StoredEvent {
+            buf: stored,
+            len: buf.len() as u16,
+        });
+        self.stored_event_count += 1;
+    }
+
 
     // =========================================================================
     // Address Resolution

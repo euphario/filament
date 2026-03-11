@@ -35,6 +35,7 @@ const MAX_ADMIN_CLIENTS: usize = 4;
 const CONFIG_MAGIC: u16 = 0xDE02;
 
 const MAX_RULES: usize = 16;
+const MAX_SERVICE_RULES: usize = 8;
 const MAX_DRIVER_CONFIGS: usize = 16;
 const MAX_CONFIG_KVS: usize = 8;
 
@@ -48,6 +49,25 @@ struct LoadedRule {
     binary_len: u8,
     caps: u64,
     priority: u8,
+    /// Port subclass for finer matching (0xFFFF = match any subclass).
+    subclass: u16,
+}
+
+/// Service rule: spawn a service when a dependency driver reaches Running.
+/// Unlike driver rules (triggered by port registration), service rules trigger
+/// on a binary name reaching Running state.
+#[derive(Clone, Copy)]
+struct ServiceRule {
+    /// Binary name of the dependency (e.g. "fatfsd", "ipd")
+    dep_binary: [u8; 16],
+    dep_binary_len: u8,
+    /// Binary to spawn when dependency is Running
+    binary: [u8; 16],
+    binary_len: u8,
+    caps: u64,
+    priority: u8,
+    /// Only spawn once (set to true after first spawn)
+    spawned: bool,
 }
 
 // =============================================================================
@@ -64,7 +84,9 @@ struct ConfigKV {
 
 #[derive(Clone, Copy)]
 struct DriverConfig {
-    name: [u8; 16],
+    /// Match key: binary name (e.g. "fatfsd") or trigger port path (e.g. "/pcie:0/nvme:0/block:0/fat:0").
+    /// Port paths start with '/' and match against the service's trigger_port.
+    name: [u8; 48],
     name_len: u8,
     kvs: [ConfigKV; MAX_CONFIG_KVS],
     kv_count: u8,
@@ -132,6 +154,18 @@ struct AdminClient {
 }
 
 // =============================================================================
+// Pending Port (registered but not yet Ready)
+// =============================================================================
+
+const MAX_PENDING_PORTS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct PendingPort {
+    info: PortInfo,
+    shmem_id: u32,
+}
+
+// =============================================================================
 // Devd2
 // =============================================================================
 
@@ -144,8 +178,11 @@ struct Devd2 {
     admin_clients: [Option<AdminClient>; MAX_ADMIN_CLIENTS],
     rules: [Option<LoadedRule>; MAX_RULES],
     rule_count: usize,
+    service_rules: [Option<ServiceRule>; MAX_SERVICE_RULES],
+    service_rule_count: usize,
     configs: [Option<DriverConfig>; MAX_DRIVER_CONFIGS],
     config_count: usize,
+    pending_ports: [Option<PendingPort>; MAX_PENDING_PORTS],
 }
 
 impl Devd2 {
@@ -159,8 +196,11 @@ impl Devd2 {
             admin_clients: [const { None }; MAX_ADMIN_CLIENTS],
             rules: [const { None }; MAX_RULES],
             rule_count: 0,
+            service_rules: [const { None }; MAX_SERVICE_RULES],
+            service_rule_count: 0,
             configs: [const { None }; MAX_DRIVER_CONFIGS],
             config_count: 0,
+            pending_ports: [const { None }; MAX_PENDING_PORTS],
         }
     }
 
@@ -171,6 +211,7 @@ impl Devd2 {
     fn boot(&mut self) {
         // Load config from initrd (falls back to defaults)
         self.load_config();
+        self.load_service_rules();
         self.load_driver_configs();
 
         // Register devd-query: port for shell admin commands
@@ -223,8 +264,12 @@ impl Devd2 {
             let caps = u16::from_le_bytes([buf[off + 18], buf[off + 19]]) as u64;
             let priority = buf[off + 20];
 
+            // Subclass at [21..23] (u16 LE), 0xFFFF = match any
+            let subclass = u16::from_le_bytes([buf[off + 21], buf[off + 22]]);
+
             self.rules[self.rule_count] = Some(LoadedRule {
                 class, binary, binary_len: blen as u8, caps, priority,
+                subclass,
             });
             self.rule_count += 1;
         }
@@ -233,25 +278,58 @@ impl Devd2 {
     }
 
     fn load_default_rules(&mut self) {
-        let defaults: &[(PortClass, &[u8], u8)] = &[
-            (PortClass::Uart,     b"consoled", abi::priority::ABOVE_NORM),
-            (PortClass::Klog,     b"klogd",    abi::priority::NORMAL),
-            (PortClass::Cpu,      b"cpud",     abi::priority::NORMAL),
-            (PortClass::Pcie,     b"pcied",    abi::priority::HIGH),
-            (PortClass::Usb,      b"usbd",     abi::priority::NORMAL),
-            (PortClass::Ethernet, b"ethd",     abi::priority::NORMAL),
-            (PortClass::Pwm,      b"pwmd",     abi::priority::NORMAL),
+        // (class, binary, priority, subclass)
+        // subclass 0xFFFF = match any subclass within the class
+        const ANY: u16 = 0xFFFF;
+        let defaults: &[(PortClass, &[u8], u8, u16)] = &[
+            (PortClass::Uart,              b"consoled", abi::priority::ABOVE_NORM, ANY),
+            (PortClass::Klog,              b"klogd",    abi::priority::NORMAL,     ANY),
+            (PortClass::Cpu,               b"cpud",     abi::priority::NORMAL,     ANY),
+            (PortClass::Pcie,              b"pcied",    abi::priority::HIGH,       ANY),
+            (PortClass::Usb,               b"usbd",     abi::priority::NORMAL,     ANY),
+            (PortClass::StorageController, b"nvmed",    abi::priority::NORMAL,     ANY),
+            (PortClass::Ethernet,          b"ethd",     abi::priority::NORMAL,     ANY),
+            (PortClass::Pwm,               b"pwmd",     abi::priority::NORMAL,     ANY),
+            // Block class: disambiguated by subclass
+            (PortClass::Block,             b"partd",    abi::priority::NORMAL,     abi::port_subclass::BLOCK_RAW),
+            (PortClass::Block,             b"fatfsd",   abi::priority::NORMAL,     abi::port_subclass::BLOCK_FAT16),
+            (PortClass::Block,             b"fatfsd",   abi::priority::NORMAL,     abi::port_subclass::BLOCK_FAT32),
+            (PortClass::Block,             b"fatfsd",   abi::priority::NORMAL,     abi::port_subclass::BLOCK_FAT32_LBA),
         ];
-        for &(class, name, priority) in defaults {
+        for &(class, name, priority, subclass) in defaults {
             let mut binary = [0u8; 16];
             let blen = name.len().min(16);
             binary[..blen].copy_from_slice(&name[..blen]);
             self.rules[self.rule_count] = Some(LoadedRule {
                 class, binary, binary_len: blen as u8, caps: DRIVER_CAPS, priority,
+                subclass,
             });
             self.rule_count += 1;
         }
         uinfo!("devd2", "default_rules_loaded"; rules = self.rule_count as u32);
+    }
+
+    fn load_service_rules(&mut self) {
+        // (dependency_binary, service_binary, priority)
+        // When dependency reaches Running, spawn the service.
+        let defaults: &[(&[u8], &[u8], u8)] = &[
+            (b"fatfsd",  b"vfsd",  abi::priority::NORMAL),
+        ];
+        for &(dep, svc, priority) in defaults {
+            let mut dep_binary = [0u8; 16];
+            let dlen = dep.len().min(16);
+            dep_binary[..dlen].copy_from_slice(&dep[..dlen]);
+            let mut binary = [0u8; 16];
+            let blen = svc.len().min(16);
+            binary[..blen].copy_from_slice(&svc[..blen]);
+            self.service_rules[self.service_rule_count] = Some(ServiceRule {
+                dep_binary, dep_binary_len: dlen as u8,
+                binary, binary_len: blen as u8,
+                caps: DRIVER_CAPS, priority,
+                spawned: false,
+            });
+            self.service_rule_count += 1;
+        }
     }
 
     fn load_driver_configs(&mut self) {
@@ -276,11 +354,11 @@ impl Devd2 {
         for _ in 0..count.min(MAX_DRIVER_CONFIGS) {
             if pos >= n { break; }
 
-            // Driver name
+            // Driver name or trigger port path
             let name_len = buf[pos] as usize;
             pos += 1;
-            if pos + name_len > n || name_len > 16 { break; }
-            let mut name = [0u8; 16];
+            if pos + name_len > n || name_len > 48 { break; }
+            let mut name = [0u8; 48];
             name[..name_len].copy_from_slice(&buf[pos..pos + name_len]);
             pos += name_len;
 
@@ -354,26 +432,27 @@ impl Devd2 {
             udebug!("devd2", "bus_found"; name = path_str, class = port_info.port_class.as_str());
 
             // Match against boot rules
-            self.match_and_spawn(port_info);
+            self.match_and_spawn(port_info, 0);
         }
     }
 
-    fn match_and_spawn(&mut self, port_info: &PortInfo) {
+    fn match_and_spawn(&mut self, port_info: &PortInfo, shmem_id: u32) {
         // Copy matched rule data to avoid borrow conflict with spawn_driver(&mut self)
         let matched = (0..self.rule_count).find_map(|i| {
             self.rules[i].as_ref().and_then(|rule| {
-                if rule.class == port_info.port_class {
-                    Some((rule.binary, rule.binary_len, rule.caps, rule.priority))
-                } else {
-                    None
+                if rule.class != port_info.port_class { return None; }
+                // If rule has a subclass filter, port subclass must match
+                if rule.subclass != 0xFFFF && rule.subclass != port_info.port_subclass {
+                    return None;
                 }
+                Some((rule.binary, rule.binary_len, rule.caps, rule.priority))
             })
         });
 
         if let Some((binary_buf, binary_len, caps, priority)) = matched {
             let binary = core::str::from_utf8(&binary_buf[..binary_len as usize]).unwrap_or("?");
             let port_name = &port_info.name[..port_info.name_len as usize];
-            self.spawn_driver(binary, port_name, caps, priority, port_info);
+            self.spawn_driver(binary, port_name, caps, priority, port_info, shmem_id);
         }
     }
 
@@ -387,9 +466,11 @@ impl Devd2 {
         port_name: &[u8],
         caps: u64,
         priority: u8,
-        _port_info: &PortInfo,
+        port_info: &PortInfo,
+        shmem_id: u32,
     ) {
-        match exec_driver(binary.as_bytes(), port_name, caps, priority) {
+        let metadata = unsafe { &port_info.metadata.raw };
+        match exec_driver(binary.as_bytes(), port_name, caps, priority, metadata, shmem_id) {
             Ok(pid) => {
                 uinfo!("devd2", "spawned"; binary = binary, pid = pid, port = core::str::from_utf8(port_name).unwrap_or("?"));
                 self.add_service(pid, binary.as_bytes(), port_name, caps, priority);
@@ -400,6 +481,50 @@ impl Devd2 {
         }
     }
 
+
+    /// Spawn a service daemon (not a driver — no port, no bus framework).
+    fn spawn_service(&mut self, binary: &str, caps: u64, priority: u8) {
+        let mut path_buf = [0u8; 32];
+        let path_len = {
+            let mut w = WireWriter::new(&mut path_buf);
+            w.put_bytes(b"bin/");
+            w.put_bytes(binary.as_bytes());
+            w.finish()
+        };
+        let path = core::str::from_utf8(&path_buf[..path_len]).unwrap_or("bin/???");
+
+        // Minimal mailbox: just bus path and priority
+        let svc_path_str = binary.as_bytes();
+        let mut bus_path = [0u8; 48];
+        let bus_path_len = {
+            let mut w = WireWriter::new(&mut bus_path);
+            w.put_bytes(b"/");
+            w.put_bytes(svc_path_str);
+            w.finish()
+        };
+        let mut mb_buf = [0u8; 256];
+        let mut hdr = MailboxHeader::empty();
+        hdr.priority = priority;
+        hdr.flags = abi::mailbox_flags::PARENT_WRITTEN;
+        hdr.kv_count = 1;
+        let hdr_bytes = unsafe {
+            core::slice::from_raw_parts(&hdr as *const MailboxHeader as *const u8, 64)
+        };
+        mb_buf[..64].copy_from_slice(hdr_bytes);
+        let mut w = WireWriter::new(&mut mb_buf[64..]);
+        w.put_len_u8_bytes(b"bus.path");
+        w.put_len_u8_bytes(&bus_path[..bus_path_len]);
+
+        match syscall::exec_with_mailbox(path, caps, &mb_buf) {
+            Ok((pid, _)) => {
+                uinfo!("devd2", "spawned_service"; binary = binary, pid = pid);
+                self.add_service(pid, binary.as_bytes(), binary.as_bytes(), caps, priority);
+            }
+            Err(errno) => {
+                uerror!("devd2", "service_spawn_failed"; binary = binary, errno = errno as u32);
+            }
+        }
+    }
 
     fn add_service(&mut self, pid: u32, binary: &[u8], port_name: &[u8], caps: u64, priority: u8) {
         for slot in self.services.iter_mut() {
@@ -412,10 +537,13 @@ impl Devd2 {
                 let tlen = port_name.len().min(32);
                 trigger[..tlen].copy_from_slice(&port_name[..tlen]);
 
-                // Build path: /trigger_port/binary (e.g. /uart:0/consoled)
+                // Build path: /trigger_port/binary (e.g. /block:0/partd)
                 let mut path = [0u8; 48];
                 let plen = {
                     let mut w = WireWriter::new(&mut path);
+                    if port_name.first() != Some(&b'/') {
+                        w.put_bytes(b"/");
+                    }
                     w.put_bytes(port_name);
                     w.put_bytes(b"/");
                     w.put_bytes(binary);
@@ -530,10 +658,11 @@ impl Devd2 {
                     svc_path_len = svc.path_len;
                     found = true;
                     // Ready = NOTICE (expected step), Running/Failed = INFO (final state transition)
+                    let path_str = core::str::from_utf8(svc.path_bytes()).unwrap_or("?");
                     if new_state == ServiceState::Ready {
-                        unotice!("devd2", "service_state"; name = svc.name_str(), state = svc.state.as_str());
+                        unotice!("devd2", "service_state"; path = path_str, state = svc.state.as_str());
                     } else {
-                        uinfo!("devd2", "service_state"; name = svc.name_str(), state = svc.state.as_str());
+                        uinfo!("devd2", "service_state"; path = path_str, state = svc.state.as_str());
                     }
                     break;
                 }
@@ -549,16 +678,58 @@ impl Devd2 {
                 &svc_path[..svc_path_len as usize],
             );
         }
+
+        // On Running: check service rules for dependent services to spawn
+        if new_state == ServiceState::Running {
+            let name = &svc_name[..svc_name_len as usize];
+            self.check_service_rules(name);
+        }
+    }
+
+    /// Check service rules — spawn services whose dependency just reached Running.
+    fn check_service_rules(&mut self, dep_name: &[u8]) {
+        for i in 0..self.service_rule_count {
+            let rule = match &self.service_rules[i] {
+                Some(r) if !r.spawned => r,
+                _ => continue,
+            };
+            if &rule.dep_binary[..rule.dep_binary_len as usize] != dep_name {
+                continue;
+            }
+            let binary = rule.binary;
+            let binary_len = rule.binary_len;
+            let caps = rule.caps;
+            let priority = rule.priority;
+            // Mark spawned before spawn to avoid re-entry
+            if let Some(ref mut r) = self.service_rules[i] {
+                r.spawned = true;
+            }
+            let bin_str = core::str::from_utf8(&binary[..binary_len as usize]).unwrap_or("?");
+            self.spawn_service(bin_str, caps, priority);
+        }
     }
 
     /// Send config KVs to a driver that just became Ready, then config.done.
+    ///
+    /// Matches config entries by binary name OR trigger port path.
+    /// Port paths (starting with '/') match against the service's trigger port.
     fn send_driver_config(&mut self, name: &[u8], path: &[u8]) {
-        // Find matching config entry by driver name
+        // Extract trigger port from bus path: "/trigger/binary" → "/trigger"
+        let trigger = {
+            let p = if path.len() > 0 && path[0] == b'/' { &path[1..] } else { path };
+            match p.iter().rposition(|&b| b == b'/') {
+                Some(pos) => &path[..pos + 1], // include leading '/'
+                None => path,
+            }
+        };
+
         for i in 0..self.config_count {
             if let Some(ref cfg) = self.configs[i] {
-                if &cfg.name[..cfg.name_len as usize] != name {
-                    continue;
-                }
+                let cfg_name = &cfg.name[..cfg.name_len as usize];
+                // Match by binary name or trigger port path
+                let matches = cfg_name == name
+                    || (cfg_name.first() == Some(&b'/') && cfg_name == trigger);
+                if !matches { continue; }
 
                 // Send each KV as a SET
                 for ki in 0..cfg.kv_count as usize {
@@ -569,12 +740,79 @@ impl Devd2 {
                 }
 
                 uinfo!("devd2", "config_sent"; name = core::str::from_utf8(name).unwrap_or("?"), kvs = cfg.kv_count as u32);
-                break;
+                // Don't break — multiple configs can match (by name AND by path)
             }
         }
 
         // Always send config.done — even if no config was found
         let _ = self.bus.send_set(path, b"config.done", b"");
+    }
+
+    /// Handle port.registered event — store port info, wait for port.state=Ready to spawn.
+    /// Format: [class(1), subclass(1), name_len(1), name(N), metadata(24), shmem_id(4)]
+    fn handle_port_registered(&mut self, _sender: &[u8], value: &[u8]) {
+        if value.len() < 3 { return; }
+        let class = PortClass::from_u8(value[0]);
+        let subclass = value[1] as u16;
+        let name_len = value[2] as usize;
+        if value.len() < 3 + name_len { return; }
+
+        let mut info = PortInfo::new(&value[3..3 + name_len], class);
+        info.port_subclass = subclass;
+
+        let meta_start = 3 + name_len;
+        let mut shmem_id: u32 = 0;
+        if value.len() >= meta_start + 24 {
+            let mut raw = [0u8; 24];
+            raw.copy_from_slice(&value[meta_start..meta_start + 24]);
+            info.metadata = abi::PortMetadata { raw };
+
+            if value.len() >= meta_start + 28 {
+                shmem_id = u32::from_le_bytes([
+                    value[meta_start + 24], value[meta_start + 25],
+                    value[meta_start + 26], value[meta_start + 27],
+                ]);
+            }
+        }
+
+        // Store for later — spawn happens when port.state transitions to Ready
+        for slot in self.pending_ports.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(PendingPort { info, shmem_id });
+                return;
+            }
+        }
+        uwarn!("devd2", "pending_ports_full";);
+    }
+
+    /// Handle port.state event — spawn driver when port becomes Ready.
+    /// Format: [state(1), name_len(1), name(N)]
+    fn handle_port_state(&mut self, _sender: &[u8], value: &[u8]) {
+        if value.len() < 2 { return; }
+        let state = value[0];
+        let name_len = value[1] as usize;
+        if value.len() < 2 + name_len { return; }
+        let name = &value[2..2 + name_len];
+
+        // Only spawn on Ready transitions (port_event_state::READY = 1)
+        if state != 1 { return; }
+
+        // Find matching pending port by name
+        let mut found = None;
+        for (i, slot) in self.pending_ports.iter().enumerate() {
+            if let Some(pp) = slot {
+                let pp_name = &pp.info.name[..pp.info.name_len as usize];
+                if pp_name == name {
+                    found = Some((i, pp.info, pp.shmem_id));
+                    break;
+                }
+            }
+        }
+
+        if let Some((idx, info, shmem_id)) = found {
+            self.pending_ports[idx] = None;
+            self.match_and_spawn(&info, shmem_id);
+        }
     }
 
     // =========================================================================
@@ -628,7 +866,7 @@ impl Devd2 {
             let binary = &name_buf[..name_len as usize];
             let port_name = &port_buf[..port_len as usize];
 
-            match exec_driver(binary, port_name, caps, priority) {
+            match exec_driver(binary, port_name, caps, priority, &[0u8; 24], 0) {
                 Ok(pid) => {
                     uinfo!("devd2", "restarted";
                         binary = core::str::from_utf8(binary).unwrap_or("?"), pid = pid);
@@ -685,6 +923,10 @@ impl Devd2 {
             bus_msg_type::EVENT => {
                 if key == b"state" {
                     self.update_service_state(addr, value);
+                } else if key == b"port.registered" {
+                    self.handle_port_registered(addr, value);
+                } else if key == b"port.state" {
+                    self.handle_port_state(addr, value);
                 }
             }
             bus_msg_type::GET => {
@@ -795,25 +1037,77 @@ impl Devd2 {
     }
 
     fn handle_targeted_get(&mut self, service: &[u8], key: &[u8], admin_idx: usize) {
-        let addr = match self.resolve_service_addr(service) {
-            Some((path, len)) => (path, len),
-            None => {
-                let mut buf = [0u8; 64];
-                let pos = { let mut w = WireWriter::new(&mut buf); write_error(&mut w, b"unknown service"); w.finish() };
-                self.send_admin_reply_buf(admin_idx, &buf[..pos]);
-                return;
-            }
-        };
-        let addr = &addr.0[..addr.1 as usize];
+        // Path-based query (starts with '/') — single target
+        if service.starts_with(b"/") {
+            let mut buf = [0u8; 512];
+            let pos = {
+                let mut w = WireWriter::new(&mut buf);
+                match self.bus.query(service, key, 500_000_000) {
+                    Ok(qr) if !qr.is_error => { w.put_bytes(qr.value()); }
+                    Ok(qr) => write_error(&mut w, qr.value()),
+                    Err(_) => write_error(&mut w, b"timeout"),
+                };
+                w.finish()
+            };
+            self.send_admin_reply_buf(admin_idx, &buf[..pos]);
+            return;
+        }
 
-        let mut buf = [0u8; 512];
+        // Name-based query — find all matching services
+        let snapshot = self.snapshot_service_paths();
+        let mut matches = [([0u8; 48], 0u8); MAX_SERVICES];
+        let mut match_count = 0;
+        for (i, slot) in self.services.iter().enumerate() {
+            if let Some(svc) = slot {
+                if &svc.name[..svc.name_len as usize] == service {
+                    matches[match_count] = (svc.path, svc.path_len);
+                    match_count += 1;
+                }
+            }
+        }
+
+        if match_count == 0 {
+            let mut buf = [0u8; 64];
+            let pos = { let mut w = WireWriter::new(&mut buf); write_error(&mut w, b"unknown service"); w.finish() };
+            self.send_admin_reply_buf(admin_idx, &buf[..pos]);
+            return;
+        }
+
+        // Single match — simple response (no path header)
+        if match_count == 1 {
+            let path = &matches[0].0[..matches[0].1 as usize];
+            let mut buf = [0u8; 512];
+            let pos = {
+                let mut w = WireWriter::new(&mut buf);
+                match self.bus.query(path, key, 500_000_000) {
+                    Ok(qr) if !qr.is_error => { w.put_bytes(qr.value()); }
+                    Ok(qr) => write_error(&mut w, qr.value()),
+                    Err(_) => write_error(&mut w, b"timeout"),
+                };
+                w.finish()
+            };
+            self.send_admin_reply_buf(admin_idx, &buf[..pos]);
+            return;
+        }
+
+        // Multiple matches — aggregate with path headers
+        let mut buf = [0u8; 1024];
         let pos = {
             let mut w = WireWriter::new(&mut buf);
-            match self.bus.query(addr, key, 500_000_000) {
-                Ok(qr) if !qr.is_error => { w.put_bytes(qr.value()); }
-                Ok(qr) => write_error(&mut w, qr.value()),
-                Err(_) => write_error(&mut w, b"timeout"),
-            };
+            for i in 0..match_count {
+                let path = &matches[i].0[..matches[i].1 as usize];
+                match self.bus.query(path, key, 200_000_000) {
+                    Ok(qr) if !qr.is_error && !qr.value().is_empty() => {
+                        let val = qr.value();
+                        w.put_bytes(b"[");
+                        w.put_bytes(path);
+                        w.put_bytes(b"]\n");
+                        w.put_bytes(val);
+                        if !val.ends_with(b"\n") { w.put_bytes(b"\n"); }
+                    }
+                    _ => {}
+                }
+            }
             w.finish()
         };
         self.send_admin_reply_buf(admin_idx, &buf[..pos]);
@@ -1027,18 +1321,21 @@ fn eq_ci(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Build "bin/<binary>" path, create mailbox, exec. Returns pid on success.
-fn exec_driver(binary: &[u8], port_name: &[u8], caps: u64, priority: u8) -> Result<u32, u32> {
-    // Build bus path: /port_name/binary (e.g. /uart:0/consoled)
+fn exec_driver(binary: &[u8], port_name: &[u8], caps: u64, priority: u8, metadata: &[u8; 24], shmem_id: u32) -> Result<u32, u32> {
+    // Build bus path: /port_name/binary (e.g. /block:0/partd)
     let mut bus_path = [0u8; 48];
     let bus_path_len = {
         let mut w = WireWriter::new(&mut bus_path);
+        if port_name.first() != Some(&b'/') {
+            w.put_bytes(b"/");
+        }
         w.put_bytes(port_name);
         w.put_bytes(b"/");
         w.put_bytes(binary);
         w.finish()
     };
 
-    let mb_buf = build_mailbox(port_name, &bus_path[..bus_path_len], priority);
+    let mb_buf = build_mailbox(port_name, &bus_path[..bus_path_len], priority, metadata, shmem_id);
 
     let mut path_buf = [0u8; 32];
     let path_len = {
@@ -1055,15 +1352,19 @@ fn exec_driver(binary: &[u8], port_name: &[u8], caps: u64, priority: u8) -> Resu
     }
 }
 
-/// Build a mailbox buffer with port name and bus path for a spawned child.
-fn build_mailbox(port_name: &[u8], bus_path: &[u8], priority: u8) -> [u8; 256] {
+/// Build a mailbox buffer with port name, bus path, and metadata for a spawned child.
+fn build_mailbox(port_name: &[u8], bus_path: &[u8], priority: u8, metadata: &[u8; 24], shmem_id: u32) -> [u8; 256] {
     let mut buf = [0u8; 256];
+
+    // Check if metadata is non-empty (any non-zero byte)
+    let has_meta = metadata.iter().any(|&b| b != 0);
+    let has_shmem = shmem_id != 0;
 
     // Header at [0..64)
     let mut hdr = MailboxHeader::empty();
     hdr.priority = priority;
     hdr.flags = abi::mailbox_flags::PARENT_WRITTEN;
-    hdr.kv_count = 2;
+    hdr.kv_count = 2 + has_meta as u8 + has_shmem as u8;
 
     let hdr_bytes = unsafe {
         core::slice::from_raw_parts(&hdr as *const MailboxHeader as *const u8, 64)
@@ -1076,6 +1377,14 @@ fn build_mailbox(port_name: &[u8], bus_path: &[u8], priority: u8) -> [u8; 256] {
     w.put_len_u8_bytes(port_name);
     w.put_len_u8_bytes(b"bus.path");
     w.put_len_u8_bytes(bus_path);
+    if has_meta {
+        w.put_len_u8_bytes(b"port.metadata");
+        w.put_len_u8_bytes(metadata);
+    }
+    if has_shmem {
+        w.put_len_u8_bytes(b"port.shmem_id");
+        w.put_len_u8_bytes(&shmem_id.to_le_bytes());
+    }
 
     buf
 }

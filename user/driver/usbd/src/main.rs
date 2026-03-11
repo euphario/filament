@@ -822,7 +822,7 @@ impl UsbDriver {
                 }
             }
         }
-        unotice!("usbd", "enum_done"; devices = found);  // meaningful: total device count
+        uinfo!("usbd", "usb_devices"; count = found);
     }
 
     // =========================================================================
@@ -2333,7 +2333,7 @@ impl Driver for UsbDriver {
         }
 
         if !self.partition_info.is_valid() {
-            unotice!("usbd", "ready_no_disks";);  // meaningful: operational outcome
+            uinfo!("usbd", "ready_no_disks";);
             return Ok(());
         }
 
@@ -2356,7 +2356,8 @@ impl Driver for UsbDriver {
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
 
-        unotice!("usbd", "ready"; disks = 1u32);  // meaningful: operational outcome
+        let size_mb = (self.partition_info.block_count as u64 * self.partition_info.block_size as u64) / (1024 * 1024);
+        uinfo!("usbd", "disk_ready"; blocks = self.partition_info.block_count as u64, block_size = self.partition_info.block_size as u64, size_mb = size_mb);
 
         Ok(())
     }

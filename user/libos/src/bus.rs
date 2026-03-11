@@ -793,14 +793,14 @@ pub trait BusCtx {
         shmem_id: u32,
     ) -> Result<(), BusError>;
 
-    /// Transition a port's state via devd.
+    /// Transition a port's lifecycle state.
     ///
-    /// Drivers use this to signal port availability changes (e.g. Claimed → Safe
-    /// when a child disconnects). devd fires spawn rules on state transitions.
+    /// Drivers use this to signal port availability changes. devd fires spawn
+    /// rules on Ready transitions. Use `port_event_state::READY` / `DISCONNECT`.
     fn set_port_state(
         &mut self,
         name: &[u8],
-        state: abi::PortState,
+        state: u8,
     ) -> Result<(), BusError>;
 
     /// Get spawn context from devd (cached after first call).

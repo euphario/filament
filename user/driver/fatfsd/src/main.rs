@@ -1761,7 +1761,7 @@ impl FatfsDriver {
     /// Core initialization: connect to partition, read FAT16, create VFS port.
     ///
     /// Called from reset() via spawn context discovery.
-    fn do_init(&mut self, shmem_id: u32, source_name: &[u8], mount_path: Option<&[u8]>, ctx: &mut dyn BusCtx) -> bool {
+    fn do_init(&mut self, shmem_id: u32, source_name: &[u8], ctx: &mut dyn BusCtx) -> bool {
         // Connect to partition DataPort
         match ctx.connect_block_port(shmem_id) {
             Ok(port_id) => {
@@ -1805,33 +1805,10 @@ impl FatfsDriver {
                             let vfs_shmem_id = port.shmem_id();
                             self.vfs_port = Some(port_id);
 
-                            // Derive mount name from mount_path context (preferred)
-                            // or fall back to old heuristic: "part0:" → "mnt/part0:"
-                            let mut pname = [0u8; 32];
-                            let pname_len = if let Some(path) = mount_path {
-                                let copy_len = path.len().min(31);
-                                pname[..copy_len].copy_from_slice(&path[..copy_len]);
-                                let mut pos = copy_len;
-                                // Ensure name ends with ':'
-                                if pos > 0 && pname[pos - 1] != b':' && pos < 32 {
-                                    pname[pos] = b':';
-                                    pos += 1;
-                                }
-                                pos
-                            } else {
-                                let prefix = b"mnt/";
-                                let mut pos = prefix.len();
-                                pname[..pos].copy_from_slice(prefix);
-                                let copy_len = source_name.len().min(32 - pos);
-                                pname[pos..pos + copy_len].copy_from_slice(&source_name[..copy_len]);
-                                pos += copy_len;
-                                // Ensure name ends with ':'
-                                if pos > 0 && pname[pos - 1] != b':' && pos < 32 {
-                                    pname[pos] = b':';
-                                    pos += 1;
-                                }
-                                pos
-                            };
+                            // Simple local port name — bus_runtime prepends the
+                            // full parent path (e.g. block:0/fat:0/mnt:0).
+                            let pname = b"mnt:0";
+                            let pname_len = pname.len();
 
                             self.port_name[..pname_len].copy_from_slice(&pname[..pname_len]);
                             self.port_name_len = pname_len;
@@ -1843,25 +1820,22 @@ impl FatfsDriver {
                                 uerror!("fatfsd", "port_register_failed"; shmem_id = vfs_shmem_id);
                             }
 
-                            // Register mount with devd so clients can resolve paths
-                            // Strip trailing ':' from port name for mount prefix,
-                            // and prepend '/' for a proper path prefix
-                            let clean_name = if pname_len > 0 && pname[pname_len - 1] == b':' {
-                                &pname[..pname_len - 1]
-                            } else {
-                                &pname[..pname_len]
-                            };
+                            // Register mount — prefix from spawn context port name
+                            // e.g. source_name="block:0/fat:0" → "/mnt/block:0/fat:0/"
                             let mut mount_prefix = [0u8; 65];
-                            mount_prefix[0] = b'/';
-                            let clen = clean_name.len().min(64);
-                            mount_prefix[1..1 + clen].copy_from_slice(&clean_name[..clen]);
-                            let prefix_len = 1 + clen;
-                            // Ensure trailing slash
-                            let prefix_len = if prefix_len < 65 && mount_prefix[prefix_len - 1] != b'/' {
-                                mount_prefix[prefix_len] = b'/';
-                                prefix_len + 1
-                            } else {
-                                prefix_len
+                            let prefix_len = {
+                                let mut pos = 0;
+                                mount_prefix[pos] = b'/'; pos += 1;
+                                let m = b"mnt/";
+                                mount_prefix[pos..pos + m.len()].copy_from_slice(m);
+                                pos += m.len();
+                                let clen = source_name.len().min(65 - pos - 1);
+                                mount_prefix[pos..pos + clen].copy_from_slice(&source_name[..clen]);
+                                pos += clen;
+                                if pos < 65 && mount_prefix[pos - 1] != b'/' {
+                                    mount_prefix[pos] = b'/'; pos += 1;
+                                }
+                                pos
                             };
                             if let Err(_) = ctx.register_mount(&mount_prefix[..prefix_len], vfs_shmem_id) {
                                 uerror!("fatfsd", "mount_register_failed";);
@@ -1931,27 +1905,13 @@ impl Driver for FatfsDriver {
         let name_len = port_name.len().min(64);
         name_buf[..name_len].copy_from_slice(&port_name[..name_len]);
 
-        // Check for mount.path from context KV (set by rule template expansion)
-        let mut mount_path_buf = [0u8; 64];
-        let mount_path_len = if let Some(path) = spawn_ctx.get(b"mount.path") {
-            let l = path.len().min(64);
-            mount_path_buf[..l].copy_from_slice(&path[..l]);
-            l
-        } else { 0 };
-
         // Discover partition shmem_id via devd (uses port_id from spawn context)
         let shmem_id = ctx.discover_port().map_err(|_| {
             uerror!("fatfsd", "discover_partition_failed";);
             BusError::Internal
         })?;
 
-        let mount_path = if mount_path_len > 0 {
-            Some(&mount_path_buf[..mount_path_len])
-        } else {
-            None
-        };
-
-        if !self.do_init(shmem_id, &name_buf[..name_len], mount_path, ctx) {
+        if !self.do_init(shmem_id, &name_buf[..name_len], ctx) {
             uerror!("fatfsd", "init_failed";);
             return Err(BusError::Internal);
         }
@@ -1975,6 +1935,18 @@ impl Driver for FatfsDriver {
     fn data_ready(&mut self, port: PortId, ctx: &mut dyn BusCtx) {
         if self.vfs_port == Some(port) {
             self.process_vfs_requests(ctx);
+        }
+    }
+
+    fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize {
+        match key {
+            b"mount.path" => {
+                let len = value.len().min(self.port_name.len());
+                self.port_name[..len].copy_from_slice(&value[..len]);
+                self.port_name_len = len;
+                copy_to_buf(buf, 0, b"OK")
+            }
+            _ => 0,
         }
     }
 
@@ -2025,7 +1997,7 @@ const FAT_CONFIG_KEYS: &[ConfigKey] = &[
     ConfigKey::read_only(b"fs.sectors_per_cluster"),
     ConfigKey::read_only(b"fs.fat_copies"),
     ConfigKey::read_only(b"fs.readonly"),
-    ConfigKey::read_only(b"mount.path"),
+    ConfigKey::read_write(b"mount.path"),
     ConfigKey::read_only(b"stats.open_files"),
 ];
 

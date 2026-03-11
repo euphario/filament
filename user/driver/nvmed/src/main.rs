@@ -549,7 +549,8 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
         return Err(BusError::Internal);
     }
 
-    unotice!("nvmed", "controller_ready"; blocks = ctrl.ns_size, block_size = ctrl.block_size);  // meaningful: disk geometry
+    let size_mb = (ctrl.ns_size * ctrl.block_size as u64) / (1024 * 1024);
+    uinfo!("nvmed", "disk_ready"; blocks = ctrl.ns_size, block_size = ctrl.block_size as u64, size_mb = size_mb);
     Ok(ctrl)
 }
 
@@ -773,7 +774,7 @@ impl Driver for NvmeDriver {
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
 
-        uinfo!("nvmed", "ready"; blocks = block_count, block_size = block_size);
+        udebug!("nvmed", "ready"; blocks = block_count, block_size = block_size);
 
         Ok(())
     }

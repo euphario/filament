@@ -319,6 +319,10 @@ struct RuntimeCtx {
     bus_path: [u8; 48],
     /// Bus path length (0 = no path assigned).
     bus_path_len: usize,
+    /// Port names registered during reset (for deferred Ready emission).
+    registered_port_names: [[u8; 32]; MAX_BLOCK_PORTS],
+    registered_port_name_lens: [u8; MAX_BLOCK_PORTS],
+    registered_port_count: usize,
 }
 
 impl RuntimeCtx {
@@ -352,6 +356,9 @@ impl RuntimeCtx {
             bus_client: None,
             bus_path: [0u8; 48],
             bus_path_len: 0,
+            registered_port_names: [[0u8; 32]; MAX_BLOCK_PORTS],
+            registered_port_name_lens: [0u8; MAX_BLOCK_PORTS],
+            registered_port_count: 0,
         }
     }
 
@@ -881,16 +888,55 @@ impl BusCtx for RuntimeCtx {
             info
         };
 
+        // Build full-path port name: prepend parent port name from spawn context.
+        // e.g., if parent was spawned for "block:0" and registers "fat:0" → "block:0/fat:0"
+        let pname = info_to_send.name_bytes();
+        let mut full_name = [0u8; 64];
+        let full_len = {
+            let mut pos = 0usize;
+            if let SpawnCtxCache::Cached(ref ctx) = self.spawn_ctx {
+                let parent = ctx.port_name();
+                if !parent.is_empty() {
+                    let n = parent.len().min(full_name.len());
+                    full_name[..n].copy_from_slice(&parent[..n]);
+                    pos = n;
+                    if pos < full_name.len() {
+                        full_name[pos] = b'/';
+                        pos += 1;
+                    }
+                }
+            }
+            let n = pname.len().min(full_name.len() - pos);
+            full_name[pos..pos + n].copy_from_slice(&pname[..n]);
+            pos + n
+        };
+
+        // Use full-path name in the emitted event
+        let mut info_full = *info_to_send;
+        let n = full_len.min(info_full.name.len());
+        info_full.name = [0u8; abi::PORT_NAME_MAX];
+        info_full.name[..n].copy_from_slice(&full_name[..n]);
+        info_full.name_len = n as u8;
+
         // Register port via busd
         let id = self.identity_buf();
         if let Some(ref mut bc) = self.bus_client {
             let mut val = [0u8; 128];
-            let n = encode_port_info(&info_to_send, &mut val);
+            let n = encode_port_info_with_shmem(&info_full, shmem_id, &mut val);
             let _ = bc.emit(&id.0[..id.1], b"port.registered", &val[..n]);
         }
 
+        // Track full-path port name for deferred Ready emission after reset
+        let idx = self.registered_port_count;
+        if idx < self.registered_port_names.len() {
+            let n = full_len.min(32);
+            self.registered_port_names[idx][..n].copy_from_slice(&full_name[..n]);
+            self.registered_port_name_lens[idx] = n as u8;
+            self.registered_port_count += 1;
+        }
+
         // Log port registration from the framework — drivers don't need to
-        if let Ok(name_str) = core::str::from_utf8(info_to_send.name_bytes()) {
+        if let Ok(name_str) = core::str::from_utf8(&full_name[..full_len]) {
             crate::unotice!("bus", "port_registered";
                 driver = core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?"),
                 port = name_str,
@@ -904,24 +950,24 @@ impl BusCtx for RuntimeCtx {
     fn set_port_state(
         &mut self,
         name: &[u8],
-        state: abi::PortState,
+        state: u8,
     ) -> Result<(), BusError> {
-        // Port going Safe: remove children spawned for this port.
-        if state == abi::PortState::Safe {
-            self.remove_children_for_port(name);
-        }
+        let state_str = match state {
+            port_event_state::READY => "Ready",
+            port_event_state::DISCONNECT => "Disconnect",
+            _ => "?",
+        };
 
-        // Log state transition from the framework — consistent across all drivers
-        crate::uinfo!("bus", "port_transition";
+        crate::udebug!("bus", "port_state";
             driver = core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?"),
             port = core::str::from_utf8(name).unwrap_or("?"),
-            state = state.as_str()
+            state = state_str
         );
 
         let id = self.identity_buf();
         if let Some(ref mut bc) = self.bus_client {
             let mut val = [0u8; 64];
-            let n = encode_port_state(state, name, &mut val);
+            let n = encode_port_state_raw(state, name, &mut val);
             let _ = bc.emit(&id.0[..id.1], b"port.state", &val[..n]);
         }
         Ok(())
@@ -1063,6 +1109,7 @@ impl<D: Driver> DriverRuntime<D> {
 
         // Report Ready to busd (init done, accepting config)
         // devd2 will send config SETs, then config.done → framework emits Running
+        // Port.state=Ready deferred until config.done (driver must be Running first)
         let id = self.ctx.identity_buf();
         if let Some(ref mut bc) = self.ctx.bus_client {
             let _ = bc.emit(&id.0[..id.1], b"state", b"Ready");
@@ -1892,6 +1939,21 @@ impl<D: Driver> DriverRuntime<D> {
                         let _ = bc.send_reply(header.seq_id, b"OK");
                     }
                     self.driver.config_done(&mut self.ctx);
+
+                    // Driver is now Running — emit port.state=Ready for all
+                    // ports registered during reset. This gates child spawns
+                    // on the owning driver being fully operational.
+                    for i in 0..self.ctx.registered_port_count {
+                        let name_len = self.ctx.registered_port_name_lens[i] as usize;
+                        let mut name_buf = [0u8; 32];
+                        name_buf[..name_len].copy_from_slice(
+                            &self.ctx.registered_port_names[i][..name_len],
+                        );
+                        let _ = self.ctx.set_port_state(
+                            &name_buf[..name_len],
+                            port_event_state::READY,
+                        );
+                    }
                 } else {
                     // Normal config_set
                     let mut reply_val = [0u8; 256];
@@ -2411,23 +2473,34 @@ fn send_prefix_matches<D: Driver>(
 // ============================================================================
 
 /// Encode port info for a `port.registered` event.
-/// Format: [class(1), subclass(1), name_len(1), name(N)]
-fn encode_port_info(info: &abi::PortInfo, buf: &mut [u8]) -> usize {
+/// Format: [class(1), subclass(1), name_len(1), name(N), metadata(24)]
+fn encode_port_info_with_shmem(info: &abi::PortInfo, shmem_id: u32, buf: &mut [u8]) -> usize {
     let nlen = info.name_len as usize;
-    if buf.len() < 3 + nlen { return 0; }
+    let total = 3 + nlen + 24 + 4; // +4 for shmem_id
+    if buf.len() < total { return 0; }
     buf[0] = info.port_class as u8;
     buf[1] = info.port_subclass as u8;
     buf[2] = info.name_len;
     buf[3..3 + nlen].copy_from_slice(&info.name[..nlen]);
-    3 + nlen
+    let meta = unsafe { info.metadata.raw };
+    buf[3 + nlen..3 + nlen + 24].copy_from_slice(&meta);
+    buf[3 + nlen + 24..3 + nlen + 28].copy_from_slice(&shmem_id.to_le_bytes());
+    total
+}
+
+/// Port lifecycle states for driver-registered ports.
+/// These are distinct from kernel PortState — they describe the driver port lifecycle.
+pub mod port_event_state {
+    pub const READY: u8 = 1;
+    pub const DISCONNECT: u8 = 2;
 }
 
 /// Encode port state for a `port.state` event.
 /// Format: [state(1), name_len(1), name(N)]
-fn encode_port_state(state: abi::PortState, name: &[u8], buf: &mut [u8]) -> usize {
+fn encode_port_state_raw(state: u8, name: &[u8], buf: &mut [u8]) -> usize {
     let nlen = name.len().min(buf.len().saturating_sub(2));
     if buf.len() < 2 + nlen { return 0; }
-    buf[0] = state as u8;
+    buf[0] = state;
     buf[1] = nlen as u8;
     buf[2..2 + nlen].copy_from_slice(&name[..nlen]);
     2 + nlen
