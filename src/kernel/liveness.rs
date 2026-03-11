@@ -359,9 +359,10 @@ pub fn check_liveness(current_tick: u64) -> usize {
                 }
             }
         }
-        // Set need_resched if any tasks were woken
+        // Set need_resched and IPI if any tasks were woken
         if wake_count > 0 {
             crate::kernel::arch::sync::cpu_flags().set_need_resched();
+            crate::kernel::sched::send_reschedule_ipi();
         }
 
         actions

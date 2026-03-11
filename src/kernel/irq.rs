@@ -183,16 +183,12 @@ pub fn notify(irq_num: u32) -> Option<u32> {
 
     // Wake process outside the IRQ table lock
     if let Some(pid) = wake_pid {
-        super::task::with_scheduler(|sched| {
-            sched.wake_by_pid(pid);
-        });
+        super::sched::wake(pid);
         Some(pid)
     } else if owner_pid != 0 {
         // Owner exists but wasn't blocked — wake via scheduler in case
         // they're sleeping on a Mux that watches this IRQ
-        super::task::with_scheduler(|sched| {
-            sched.wake_by_pid(owner_pid);
-        });
+        super::sched::wake(owner_pid);
         Some(owner_pid)
     } else {
         None

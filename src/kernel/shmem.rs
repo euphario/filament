@@ -814,59 +814,19 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
     }
     // shmem lock released here before touching scheduler
 
-    // Mark task as blocked - syscall layer will handle scheduling
-    // Calculate deadline first, then set state, then notify scheduler
-    let (deadline_to_notify, transition_ok) = super::task::with_scheduler(|sched| {
-        if let Some(task) = sched.current_task_mut() {
-            let pid = task.id;
-            let state_name = task.state().name();
-
-            // Set wake timeout if specified
-            let timeout = if timeout_ms > 0 {
-                // Use unified clock API - convert ms to ns, then to hardware counter deadline
-                let timeout_ns = timeout_ms as u64 * 1_000_000;
-                Some(crate::platform::current::timer::deadline_ns(timeout_ns))
-            } else {
-                None // No timeout
-            };
-
-            // Set state based on whether we have a timeout (via state machine)
-            let ok = match timeout {
-                Some(deadline) => {
-                    match task.set_waiting(
-                        super::task::WaitReason::ShmemNotify { shmem_id },
-                        deadline,
-                    ) {
-                        Ok(()) => true,
-                        Err(_) => {
-                            crate::kerror!("shmem", "wait_transition_failed";
-                                pid = pid as u64,
-                                from_state = state_name,
-                                shmem_id = shmem_id as u64
-                            );
-                            false
-                        }
-                    }
-                }
-                None => {
-                    match task.set_sleeping(super::task::SleepReason::EventLoop) {
-                        Ok(()) => true,
-                        Err(_) => {
-                            crate::kerror!("shmem", "sleep_transition_failed";
-                                pid = pid as u64,
-                                from_state = state_name,
-                                shmem_id = shmem_id as u64
-                            );
-                            false
-                        }
-                    }
-                }
-            };
-            (timeout, ok)
-        } else {
-            (None, false)
-        }
-    });
+    // Block the current task. sleep_current/wait_current handle
+    // mark_context_saved, set_kernel_stack_owner, and notify_blocked
+    // atomically — preventing SMP double-scheduling.
+    let transition_ok = if timeout_ms > 0 {
+        let timeout_ns = timeout_ms as u64 * 1_000_000;
+        let deadline = crate::platform::current::timer::deadline_ns(timeout_ns);
+        super::sched::wait_current(
+            super::task::WaitReason::ShmemNotify { shmem_id },
+            deadline,
+        )
+    } else {
+        super::sched::sleep_current(super::task::SleepReason::EventLoop)
+    };
 
     // If transition failed, remove from waiters and return error immediately
     if !transition_ok {
@@ -881,13 +841,6 @@ pub fn wait(pid: Pid, shmem_id: u32, timeout_ms: u32) -> Result<(), i64> {
             }
         }
         return Err(-11); // EAGAIN - caller should retry
-    }
-
-    // Notify scheduler of deadline for tickless optimization (outside task borrow)
-    if let Some(deadline) = deadline_to_notify {
-        super::task::with_scheduler(|sched| {
-            sched.note_deadline(deadline);
-        });
     }
 
     // RACE WINDOW FIX: Between releasing SHMEM lock (after add_waiter) and
@@ -1026,6 +979,10 @@ pub fn notify(pid: Pid, shmem_id: u32) -> Result<u32, i64> {
         }
         woken
     });
+
+    if woken > 0 {
+        super::sched::send_reschedule_ipi();
+    }
 
     Ok(woken)
 }
@@ -1241,9 +1198,7 @@ pub fn begin_cleanup(pid: Pid) {
     // Notify mappers when owner dies (wake via scheduler)
     for i in 0..mapper_notify_count {
         let (_shmem_id, mapper_pid) = to_notify_mappers[i];
-        super::task::with_scheduler(|sched| {
-            sched.wake_by_pid(mapper_pid);
-        });
+        super::sched::wake(mapper_pid);
     }
 
     // Notify owners when mapper dies (mark ShmemObject + wake)
@@ -1253,9 +1208,7 @@ pub fn begin_cleanup(pid: Pid) {
             // Mark the owner's ShmemObject as notified (for mux wakeup)
             super::object::syscall::mark_shmem_notified_for_task(owner_pid, shmem_id);
 
-            super::task::with_scheduler(|sched| {
-                sched.wake_by_pid(owner_pid);
-            });
+            super::sched::wake(owner_pid);
 
             kdebug!("shmem", "mapper_left_notify"; shmem_id = shmem_id as u64, mapper = pid as u64, owner = owner_pid as u64);
         }

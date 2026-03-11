@@ -2539,15 +2539,15 @@ fn notify_shmem_objects(shmem_id: u32, caller_pid: u32) {
     }
 
     // Wake subscribers outside the table lock
+    let mut any_woken = false;
     for sub_opt in &to_wake {
         if let Some(sub) = sub_opt {
-            task::with_scheduler(|sched| {
-                if let Some(slot) = sched.slot_by_pid(sub.task_id) {
-                    let _ = sched.wake_task(slot);
-                }
-            });
+            if crate::kernel::sched::wake(sub.task_id) {
+                any_woken = true;
+            }
         }
     }
+    let _ = any_woken; // IPI sent inside sched::wake()
 }
 
 /// Mark a specific task's ShmemObject as notified
