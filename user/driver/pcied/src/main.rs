@@ -197,7 +197,7 @@ impl PcieDriver {
 
 impl Driver for PcieDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        unotice!("pcied", "starting";);
+        udebug!("pcied", "starting";);
 
         // Get bus path from spawn context, falling back to default
         let mut bus_path_buf = [0u8; 64];
@@ -219,7 +219,7 @@ impl Driver for PcieDriver {
         // Claim the kernel bus — receives StateSnapshot + DeviceList
         match ctx.claim_kernel_bus(bus_path) {
             Ok((bus_id, info)) => {
-                unotice!("pcied", "bus_claimed"; bus_type = info.bus_type as u32, caps = libos::ulog::hex32(info.capabilities as u32));
+                udebug!("pcied", "bus_claimed"; bus_type = info.bus_type as u32, caps = libos::ulog::hex32(info.capabilities as u32));
                 self.kernel_bus = Some(bus_id);
             }
             Err(_) => {
@@ -234,7 +234,7 @@ impl Driver for PcieDriver {
                 let count = bus_devs.len().min(MAX_PCI_DEVICES);
                 self.devices[..count].copy_from_slice(&bus_devs[..count]);
                 self.count = count;
-                unotice!("pcied", "pci_devices"; count = count as u32);
+                unotice!("pcied", "pci_devices"; count = count as u32);  // meaningful: device count
             } else {
                 unotice!("pcied", "no_devices";);
             }
@@ -299,7 +299,7 @@ impl Driver for PcieDriver {
             let _ = ctx.register_port_with_info(&info, 0);
         }
 
-        unotice!("pcied", "ready"; devices = self.count as u32);
+        udebug!("pcied", "ready"; devices = self.count as u32);
         Ok(())
     }
 

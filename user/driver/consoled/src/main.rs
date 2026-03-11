@@ -27,7 +27,7 @@ use libos::bus::{
     PortInfo, PortClass, PortState, port_subclass,
 };
 use libos::bus_runtime::driver_main;
-use libos::{uinfo, unotice, uerror};
+use libos::{uinfo, unotice, udebug, uerror};
 
 // =============================================================================
 // Handle Tags
@@ -553,13 +553,13 @@ impl ConsoledDriver {
 
 impl Driver for ConsoledDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        unotice!("consoled", "init";);
+        udebug!("consoled", "init";);
 
         // Claim the kernel UART bus
         let uart_path = b"/uart:0";
         match ctx.claim_kernel_bus(uart_path) {
             Ok((_bus_id, _info)) => {
-                unotice!("consoled", "uart_claimed";);
+                udebug!("consoled", "uart_claimed";);
             }
             Err(e) => {
                 uerror!("consoled", "uart_claim_failed"; err = e as u8);
@@ -609,11 +609,17 @@ impl Driver for ConsoledDriver {
             return Err(e);
         }
 
-        // Spawn shell directly as child
-        self.spawn_shell(ctx);
-
-        unotice!("consoled", "ready";);
+        udebug!("consoled", "ready";);
         Ok(())
+    }
+
+    fn config_done(&mut self, ctx: &mut dyn BusCtx) {
+        self.spawn_shell(ctx);
+        if self.shell_pid.is_some() {
+            let _ = ctx.bus_emit(b"state", b"Running");
+        } else {
+            let _ = ctx.bus_emit(b"state", b"Failed");
+        }
     }
 
     fn command(&mut self, _msg: &BusMsg, _ctx: &mut dyn BusCtx) -> Disposition {

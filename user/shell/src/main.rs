@@ -86,7 +86,7 @@ static mut VFS_CLIENT: Option<VfsClient> = None;
 #[unsafe(no_mangle)]
 fn main() {
     libsys::set_panic_flush(libos::ulog::flush);
-    libos::uinfo!("shell", "starting";);
+    libos::udebug!("shell", "starting";);
     libos::ulog::flush();
 
     // Connect to console via mailbox (shmem_id from parent)
@@ -97,17 +97,13 @@ fn main() {
         syscall::exit(1);
     }
 
-    libos::uinfo!("shell", "connected";);
-    libos::ulog::flush();
+    libos::udebug!("shell", "connected";);
 
     // Set up decoration: clear screen, scroll region, separator, status bar
     {
         let con = console::console();
         decoration::setup(con.cols, con.rows);
     }
-
-    libos::uinfo!("shell", "decoration_done";);
-    libos::ulog::flush();
 
     // Welcome banner (prints inside scroll region after setup)
     color::set(color::BOLD);

@@ -11,7 +11,7 @@
 
 use abi::{bus_type, bus_create_flags, BusCreateInfo, ObjectType};
 use libsys::syscall;
-use libos::unotice;
+use libos::udebug;
 
 #[unsafe(no_mangle)]
 fn main() {
@@ -28,7 +28,7 @@ fn main() {
     #[cfg(feature = "platform-mt7988a")]
     register_mt7988_buses();
 
-    unotice!("probed", "bus_discovery_done");
+    udebug!("probed", "bus_discovery_done");
     libos::ulog::flush();
     // exit(0) is called automatically by _start after main returns
 }

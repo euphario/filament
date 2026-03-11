@@ -297,19 +297,13 @@ impl PhysicalMemoryManager {
         // Scan for contiguous free pages
         let mut start_page = self.first_free_page;
         let mut consecutive = 0;
-        let mut max_consecutive = 0;
-        let mut scanned = 0;
 
         for page_idx in self.first_free_page..self.num_frames {
-            scanned += 1;
             if self.frame(page_idx).state == PageState::Free {
                 if consecutive == 0 {
                     start_page = page_idx;
                 }
                 consecutive += 1;
-                if consecutive > max_consecutive {
-                    max_consecutive = consecutive;
-                }
                 if consecutive == count {
                     // Found enough! Remove from free list and mark as used
                     self.remove_range_from_free_list(start_page, count);

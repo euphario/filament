@@ -392,7 +392,7 @@ impl UsbDriver {
         let mut xhci = XhciController::new(mmio);
         let caps = xhci.read_capabilities().ok_or("read_caps_failed")?;
 
-        unotice!("usbd", "xhci_caps"; slots = caps.max_slots as u32, ports = caps.max_ports as u32, version = caps.version as u32);
+        udebug!("usbd", "xhci_caps"; slots = caps.max_slots as u32, ports = caps.max_ports as u32, version = caps.version as u32);
 
         // Caps all-zero means the xHCI core isn't powered (e.g. combo PHY in PCIe mode)
         if caps.max_slots == 0 && caps.max_ports == 0 {
@@ -545,7 +545,7 @@ impl UsbDriver {
             let enabled = (portsc & usb::portsc::PED) != 0;
             let speed = ((portsc & usb::portsc::SPEED_MASK) >> usb::portsc::SPEED_SHIFT) as u8;
             if connected {
-                unotice!("usbd", "port_ready"; port = port as u32, enabled = enabled as u32, speed = speed as u32);
+                udebug!("usbd", "port_ready"; port = port as u32, enabled = enabled as u32, speed = speed as u32);
             }
         }
 
@@ -813,7 +813,7 @@ impl UsbDriver {
             if connected && enabled {
                 match self.enumerate_device(port) {
                     Some(slot_id) => {
-                        unotice!("usbd", "device_enumerated"; port = port as u32, slot = slot_id as u32);
+                        udebug!("usbd", "device_enumerated"; port = port as u32, slot = slot_id as u32);
                         found += 1;
                     }
                     None => {
@@ -822,7 +822,7 @@ impl UsbDriver {
                 }
             }
         }
-        unotice!("usbd", "enum_done"; devices = found);
+        unotice!("usbd", "enum_done"; devices = found);  // meaningful: total device count
     }
 
     // =========================================================================
@@ -2278,7 +2278,7 @@ fn log_always(msg: &str) {
 
 impl Driver for UsbDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        unotice!("usbd", "starting";);
+        udebug!("usbd", "starting";);
 
         // Get spawn context — the port name and BAR0 metadata from pcied
         let spawn_ctx = ctx.spawn_context().map_err(|e| {
@@ -2302,7 +2302,7 @@ impl Driver for UsbDriver {
             meta[8], meta[9], meta[10], meta[11],
         ]) as usize;
 
-        unotice!("usbd", "device_found"; bar0 = bar0_addr, size = bar0_size as u32);
+        udebug!("usbd", "device_found"; bar0 = bar0_addr, size = bar0_size as u32);
 
         // Configure and initialize xHCI hardware
         self.configure(bar0_addr, bar0_size);
@@ -2333,7 +2333,7 @@ impl Driver for UsbDriver {
         }
 
         if !self.partition_info.is_valid() {
-            unotice!("usbd", "ready_no_disks";);
+            unotice!("usbd", "ready_no_disks";);  // meaningful: operational outcome
             return Ok(());
         }
 
@@ -2356,7 +2356,7 @@ impl Driver for UsbDriver {
         info.port_subclass = port_subclass::BLOCK_RAW;
         let _ = ctx.register_port_with_info(&info, shmem_id);
 
-        unotice!("usbd", "ready"; disks = 1u32);
+        unotice!("usbd", "ready"; disks = 1u32);  // meaningful: operational outcome
 
         Ok(())
     }

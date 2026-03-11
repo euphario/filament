@@ -274,7 +274,7 @@ impl Wifi2 {
             0
         };
 
-        unotice!("wifi2", "device_found"; bar0 = bar0_addr, size = bar0_size, bdf = bdf as u64);
+        udebug!("wifi2", "device_found"; bar0 = bar0_addr, size = bar0_size, bdf = bdf as u64);
         ulog::flush();
 
         // Map BAR0

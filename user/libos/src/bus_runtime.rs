@@ -885,18 +885,13 @@ impl BusCtx for RuntimeCtx {
         let id = self.identity_buf();
         if let Some(ref mut bc) = self.bus_client {
             let mut val = [0u8; 128];
-            let nlen = info_to_send.name_len as usize;
-            val[0] = info_to_send.port_class as u8;
-            val[1] = info_to_send.port_subclass as u8;
-            val[2] = info_to_send.name_len;
-            val[3..3 + nlen].copy_from_slice(&info_to_send.name[..nlen]);
-            let total = 3 + nlen;
-            let _ = bc.emit(&id.0[..id.1], b"port.registered", &val[..total]);
+            let n = encode_port_info(&info_to_send, &mut val);
+            let _ = bc.emit(&id.0[..id.1], b"port.registered", &val[..n]);
         }
 
         // Log port registration from the framework — drivers don't need to
         if let Ok(name_str) = core::str::from_utf8(info_to_send.name_bytes()) {
-            crate::uinfo!("bus", "port_registered";
+            crate::unotice!("bus", "port_registered";
                 driver = core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("?"),
                 port = name_str,
                 class = info_to_send.port_class.as_str()
@@ -926,11 +921,8 @@ impl BusCtx for RuntimeCtx {
         let id = self.identity_buf();
         if let Some(ref mut bc) = self.bus_client {
             let mut val = [0u8; 64];
-            let nlen = name.len().min(60);
-            val[0] = state as u8;
-            val[1] = nlen as u8;
-            val[2..2 + nlen].copy_from_slice(&name[..nlen]);
-            let _ = bc.emit(&id.0[..id.1], b"port.state", &val[..2 + nlen]);
+            let n = encode_port_state(state, name, &mut val);
+            let _ = bc.emit(&id.0[..id.1], b"port.state", &val[..n]);
         }
         Ok(())
     }
@@ -1069,15 +1061,11 @@ impl<D: Driver> DriverRuntime<D> {
             syscall::exit(code);
         }
 
-        // Report Ready to busd (init done, accepting config queries)
+        // Report Ready to busd (init done, accepting config)
+        // devd2 will send config SETs, then config.done → framework emits Running
         let id = self.ctx.identity_buf();
         if let Some(ref mut bc) = self.ctx.bus_client {
             let _ = bc.emit(&id.0[..id.1], b"state", b"Ready");
-        }
-
-        // Report Running (fully operational, entering event loop)
-        if let Some(ref mut bc) = self.ctx.bus_client {
-            let _ = bc.emit(&id.0[..id.1], b"state", b"Running");
         }
 
         // Flush structured logs from reset before entering event loop
@@ -1898,13 +1886,19 @@ impl<D: Driver> DriverRuntime<D> {
                 let key = &payload[key_start..key_end];
                 let value = if value_start <= value_end { &payload[value_start..value_end] } else { &[] };
 
-                // Call driver's config_set
-                let mut reply_val = [0u8; 256];
-                let val_len = self.driver.config_set(key, value, &mut reply_val, &mut self.ctx);
-
-                // Auto-reply
-                if let Some(ref mut bc) = self.ctx.bus_client {
-                    let _ = bc.send_reply(header.seq_id, &reply_val[..val_len]);
+                if key == b"config.done" {
+                    // Reply OK, then let driver finalize and decide its own state
+                    if let Some(ref mut bc) = self.ctx.bus_client {
+                        let _ = bc.send_reply(header.seq_id, b"OK");
+                    }
+                    self.driver.config_done(&mut self.ctx);
+                } else {
+                    // Normal config_set
+                    let mut reply_val = [0u8; 256];
+                    let val_len = self.driver.config_set(key, value, &mut reply_val, &mut self.ctx);
+                    if let Some(ref mut bc) = self.ctx.bus_client {
+                        let _ = bc.send_reply(header.seq_id, &reply_val[..val_len]);
+                    }
                 }
             }
             bus_msg_type::LIFECYCLE => {
@@ -2084,14 +2078,13 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
     // Diagnostic: log mailbox state
     let mb_mapped = mailbox.is_some();
     let driver_name_str = core::str::from_utf8(name).unwrap_or("?");
-    crate::unotice!("bus", "driver_init"; driver = driver_name_str, mb_mapped = mb_mapped as u32, mb_valid = has_mailbox as u32);
+    crate::udebug!("bus", "driver_init"; driver = driver_name_str, mb_mapped = mb_mapped as u32, mb_valid = has_mailbox as u32);
     if has_mailbox {
         let hdr = mailbox.as_ref().unwrap().header();
-        crate::unotice!("bus", "mailbox_hdr"; kv_count = hdr.kv_count as u32, dev_count = hdr.device_count as u32, bus_type = hdr.bus_type as u32);
+        crate::udebug!("bus", "mailbox_hdr"; kv_count = hdr.kv_count as u32, dev_count = hdr.device_count as u32, bus_type = hdr.bus_type as u32);
     } else if mb_mapped {
-        // Mailbox shmem exists but header is invalid — dump raw magic for debugging
         let hdr = mailbox.as_ref().unwrap().header();
-        crate::unotice!("bus", "mailbox_invalid"; magic = crate::ulog::hex32(hdr.magic), version = hdr.version as u32);
+        crate::uwarn!("bus", "mailbox_invalid"; magic = crate::ulog::hex32(hdr.magic), version = hdr.version as u32);
     }
 
     // Pre-populate spawn context from mailbox if available
@@ -2145,21 +2138,21 @@ pub fn driver_main<D: Driver>(name: &[u8], driver: D) -> ! {
         Ok(mut bc) => {
             let path = &bus_path[..bus_path_len];
             let _ = bc.register(name, path, 0, false);
-            crate::unotice!("bus", "busd_connected"; path = core::str::from_utf8(path).unwrap_or("?"));
+            crate::udebug!("bus", "registered"; path = core::str::from_utf8(path).unwrap_or("?"));
             runtime.ctx.bus_client = Some(bc);
         }
         Err(_) => {
-            crate::unotice!("bus", "busd_not_available");
+            crate::uwarn!("bus", "busd_not_available");
         }
     }
 
     // If we have a pre-populated spawn context from mailbox, cache it
     // so the child never needs GET_SPAWN_CONTEXT.
     if let Some(ctx) = pre_spawn_ctx {
-        crate::unotice!("bus", "spawn_ctx_from_mb"; meta_len = ctx.metadata().len() as u32);
+        crate::udebug!("bus", "spawn_ctx_from_mb"; meta_len = ctx.metadata().len() as u32);
         runtime.ctx.spawn_ctx = SpawnCtxCache::Cached(ctx);
     } else if has_mailbox {
-        crate::unotice!("bus", "mb_parse_failed";);
+        crate::uwarn!("bus", "mb_parse_failed";);
     }
 
     // Flush diagnostic logs before entering reset — guarantees visibility
@@ -2411,5 +2404,32 @@ fn send_prefix_matches<D: Driver>(
     if pos > 0 {
         let _ = ctx.respond_info(seq_id, &buf[..pos]);
     }
+}
+
+// ============================================================================
+// Event Encoding
+// ============================================================================
+
+/// Encode port info for a `port.registered` event.
+/// Format: [class(1), subclass(1), name_len(1), name(N)]
+fn encode_port_info(info: &abi::PortInfo, buf: &mut [u8]) -> usize {
+    let nlen = info.name_len as usize;
+    if buf.len() < 3 + nlen { return 0; }
+    buf[0] = info.port_class as u8;
+    buf[1] = info.port_subclass as u8;
+    buf[2] = info.name_len;
+    buf[3..3 + nlen].copy_from_slice(&info.name[..nlen]);
+    3 + nlen
+}
+
+/// Encode port state for a `port.state` event.
+/// Format: [state(1), name_len(1), name(N)]
+fn encode_port_state(state: abi::PortState, name: &[u8], buf: &mut [u8]) -> usize {
+    let nlen = name.len().min(buf.len().saturating_sub(2));
+    if buf.len() < 2 + nlen { return 0; }
+    buf[0] = state as u8;
+    buf[1] = nlen as u8;
+    buf[2..2 + nlen].copy_from_slice(&name[..nlen]);
+    2 + nlen
 }
 

@@ -3409,7 +3409,7 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 
 impl Driver for EthDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        unotice!("ethd", "init";);
+        udebug!("ethd", "init";);
 
         // Map Frame Engine MMIO
         let fe = MmioRegion::open(FE_BASE, FE_SIZE).ok_or_else(|| {
@@ -3676,7 +3676,7 @@ impl Driver for EthDriver {
             }
         }
 
-        unotice!("ethd", "init_complete";);
+        unotice!("ethd", "init_complete";);  // meaningful: hardware init succeeded
         Ok(())
     }
 

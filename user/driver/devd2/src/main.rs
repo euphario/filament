@@ -11,7 +11,7 @@
 use abi::{self, PortClass, PortInfo, MailboxHeader, BusMsgHeader, bus_msg_type};
 use libsys::syscall;
 use libsys::ipc::{Channel, Port, Mux, MuxFilter};
-use libos::{uinfo, uwarn, uerror, udebug};
+use libos::{uinfo, uwarn, uerror, udebug, unotice};
 use libos::bus_client::BusClient;
 use libos::wire::WireWriter;
 
@@ -35,6 +35,11 @@ const MAX_ADMIN_CLIENTS: usize = 4;
 const CONFIG_MAGIC: u16 = 0xDE02;
 
 const MAX_RULES: usize = 16;
+const MAX_DRIVER_CONFIGS: usize = 16;
+const MAX_CONFIG_KVS: usize = 8;
+
+/// Config file magic for driver configs (little-endian)
+const DRIVER_CONFIG_MAGIC: u16 = 0xCF02;
 
 #[derive(Clone, Copy)]
 struct LoadedRule {
@@ -43,6 +48,26 @@ struct LoadedRule {
     binary_len: u8,
     caps: u64,
     priority: u8,
+}
+
+// =============================================================================
+// Driver Config (per-driver KVs from etc/drivers.conf)
+// =============================================================================
+
+#[derive(Clone, Copy)]
+struct ConfigKV {
+    key: [u8; 32],
+    key_len: u8,
+    value: [u8; 64],
+    value_len: u8,
+}
+
+#[derive(Clone, Copy)]
+struct DriverConfig {
+    name: [u8; 16],
+    name_len: u8,
+    kvs: [ConfigKV; MAX_CONFIG_KVS],
+    kv_count: u8,
 }
 
 // =============================================================================
@@ -119,6 +144,8 @@ struct Devd2 {
     admin_clients: [Option<AdminClient>; MAX_ADMIN_CLIENTS],
     rules: [Option<LoadedRule>; MAX_RULES],
     rule_count: usize,
+    configs: [Option<DriverConfig>; MAX_DRIVER_CONFIGS],
+    config_count: usize,
 }
 
 impl Devd2 {
@@ -132,6 +159,8 @@ impl Devd2 {
             admin_clients: [const { None }; MAX_ADMIN_CLIENTS],
             rules: [const { None }; MAX_RULES],
             rule_count: 0,
+            configs: [const { None }; MAX_DRIVER_CONFIGS],
+            config_count: 0,
         }
     }
 
@@ -142,6 +171,7 @@ impl Devd2 {
     fn boot(&mut self) {
         // Load config from initrd (falls back to defaults)
         self.load_config();
+        self.load_driver_configs();
 
         // Register devd-query: port for shell admin commands
         match Port::register(b"devd-query:") {
@@ -151,7 +181,7 @@ impl Devd2 {
                     uerror!("devd2", "query_port_mux_failed"; err = e.as_str());
                 }
                 self.query_port = Some(port);
-                uinfo!("devd2", "query_port_created");
+                udebug!("devd2", "query_port_created");
             }
             Err(e) => {
                 uwarn!("devd2", "query_port_failed"; err = e.as_str());
@@ -199,7 +229,7 @@ impl Devd2 {
             self.rule_count += 1;
         }
 
-        uinfo!("devd2", "config_loaded"; rules = self.rule_count as u32);
+        unotice!("devd2", "config_loaded"; rules = self.rule_count as u32);
     }
 
     fn load_default_rules(&mut self) {
@@ -224,6 +254,81 @@ impl Devd2 {
         uinfo!("devd2", "default_rules_loaded"; rules = self.rule_count as u32);
     }
 
+    fn load_driver_configs(&mut self) {
+        let mut buf = [0u8; 2048];
+        let n = syscall::ramfs_read(b"etc/drivers.conf", &mut buf);
+        if n < 4 {
+            // No driver config file — that's fine, drivers just won't get initial config
+            return;
+        }
+        let n = n as usize;
+
+        let magic = u16::from_le_bytes([buf[0], buf[1]]);
+        let version = buf[2];
+        let count = buf[3] as usize;
+
+        if magic != DRIVER_CONFIG_MAGIC || version != 1 {
+            uwarn!("devd2", "driver_config_bad_format"; magic = magic as u32, version = version as u32);
+            return;
+        }
+
+        let mut pos = 4;
+        for _ in 0..count.min(MAX_DRIVER_CONFIGS) {
+            if pos >= n { break; }
+
+            // Driver name
+            let name_len = buf[pos] as usize;
+            pos += 1;
+            if pos + name_len > n || name_len > 16 { break; }
+            let mut name = [0u8; 16];
+            name[..name_len].copy_from_slice(&buf[pos..pos + name_len]);
+            pos += name_len;
+
+            // KV count
+            if pos >= n { break; }
+            let kv_count = buf[pos] as usize;
+            pos += 1;
+
+            let mut kvs = [ConfigKV {
+                key: [0u8; 32], key_len: 0,
+                value: [0u8; 64], value_len: 0,
+            }; MAX_CONFIG_KVS];
+
+            let mut valid_kvs = 0u8;
+            for ki in 0..kv_count.min(MAX_CONFIG_KVS) {
+                // Key
+                if pos >= n { break; }
+                let klen = buf[pos] as usize;
+                pos += 1;
+                if pos + klen > n || klen > 32 { break; }
+                kvs[ki].key[..klen].copy_from_slice(&buf[pos..pos + klen]);
+                kvs[ki].key_len = klen as u8;
+                pos += klen;
+
+                // Value
+                if pos >= n { break; }
+                let vlen = buf[pos] as usize;
+                pos += 1;
+                if pos + vlen > n || vlen > 64 { break; }
+                kvs[ki].value[..vlen].copy_from_slice(&buf[pos..pos + vlen]);
+                kvs[ki].value_len = vlen as u8;
+                pos += vlen;
+
+                valid_kvs += 1;
+            }
+
+            self.configs[self.config_count] = Some(DriverConfig {
+                name,
+                name_len: name_len as u8,
+                kvs,
+                kv_count: valid_kvs,
+            });
+            self.config_count += 1;
+        }
+
+        uinfo!("devd2", "driver_configs_loaded"; count = self.config_count as u32);
+    }
+
     fn discover_kernel_buses(&mut self) {
         let mut buses = [PortInfo::empty(); 16];
         let count = match libsys::ipc::bus_list(&mut buses) {
@@ -234,7 +339,7 @@ impl Devd2 {
             }
         };
 
-        uinfo!("devd2", "bus_discovery"; count = count as u32);
+        unotice!("devd2", "bus_discovery"; count = count as u32);
 
         for i in 0..count {
             let port_info = &buses[i];
@@ -355,6 +460,9 @@ impl Devd2 {
                     let exit_code = event.signal_value as i32;
                     self.handle_child_exit(child_pid, exit_code);
                 }
+                // Always drain bus events — mux may not re-trigger for
+                // messages that arrived while processing other handles
+                self.handle_bus_message();
                 continue;
             }
 
@@ -364,7 +472,6 @@ impl Devd2 {
             if let Some(ref port) = self.query_port {
                 if handle == port.handle() {
                     self.accept_admin_client();
-                    continue;
                 }
             }
 
@@ -387,6 +494,9 @@ impl Devd2 {
                 self.handle_admin_command(idx);
             }
 
+            // Always drain bus events on every wake
+            self.handle_bus_message();
+
             libos::ulog::flush();
         }
     }
@@ -403,15 +513,68 @@ impl Devd2 {
             _ => return,
         };
 
+        // Find the service and extract what we need before mutating
+        let mut svc_name = [0u8; 16];
+        let mut svc_name_len = 0u8;
+        let mut svc_path = [0u8; 48];
+        let mut svc_path_len = 0u8;
+        let mut found = false;
+
         for slot in self.services.iter_mut() {
             if let Some(ref mut svc) = slot {
                 if svc.path_bytes() == sender {
                     svc.state = new_state;
-                    uinfo!("devd2", "service_state"; name = svc.name_str(), state = svc.state.as_str());
-                    return;
+                    svc_name = svc.name;
+                    svc_name_len = svc.name_len;
+                    svc_path = svc.path;
+                    svc_path_len = svc.path_len;
+                    found = true;
+                    // Ready = NOTICE (expected step), Running/Failed = INFO (final state transition)
+                    if new_state == ServiceState::Ready {
+                        unotice!("devd2", "service_state"; name = svc.name_str(), state = svc.state.as_str());
+                    } else {
+                        uinfo!("devd2", "service_state"; name = svc.name_str(), state = svc.state.as_str());
+                    }
+                    break;
                 }
             }
         }
+
+        if !found { return; }
+
+        // On Ready: send config KVs from file, then config.done
+        if new_state == ServiceState::Ready {
+            self.send_driver_config(
+                &svc_name[..svc_name_len as usize],
+                &svc_path[..svc_path_len as usize],
+            );
+        }
+    }
+
+    /// Send config KVs to a driver that just became Ready, then config.done.
+    fn send_driver_config(&mut self, name: &[u8], path: &[u8]) {
+        // Find matching config entry by driver name
+        for i in 0..self.config_count {
+            if let Some(ref cfg) = self.configs[i] {
+                if &cfg.name[..cfg.name_len as usize] != name {
+                    continue;
+                }
+
+                // Send each KV as a SET
+                for ki in 0..cfg.kv_count as usize {
+                    let kv = &cfg.kvs[ki];
+                    let key = &kv.key[..kv.key_len as usize];
+                    let value = &kv.value[..kv.value_len as usize];
+                    let _ = self.bus.send_set(path, key, value);
+                }
+
+                uinfo!("devd2", "config_sent"; name = core::str::from_utf8(name).unwrap_or("?"), kvs = cfg.kv_count as u32);
+                break;
+            }
+        }
+
+        // Always send config.done — even if no config was found
+        let _ = self.bus.send_set(path, b"config.done", b"");
     }
 
     // =========================================================================
@@ -486,18 +649,37 @@ impl Devd2 {
     // Bus Message Handling
     // =========================================================================
 
-    fn handle_bus_message(&mut self) {
-        let mut buf = [0u8; MSG_BUF_SIZE];
-        let len = match self.bus.try_recv(&mut buf) {
-            Ok(Some(n)) => n,
-            _ => return,
-        };
+    /// Drain all queued bus messages (call after boot, before event loop).
+    fn drain_bus_events(&mut self) {
+        loop {
+            let mut buf = [0u8; MSG_BUF_SIZE];
+            match self.bus.try_recv(&mut buf) {
+                Ok(Some(n)) if n > 0 => {
+                    self.process_bus_message(&buf[..n]);
+                }
+                _ => break,
+            }
+        }
+    }
 
-        let header = match BusMsgHeader::read_from(&buf[..len]) {
+    fn handle_bus_message(&mut self) {
+        // Drain all queued messages — mux is edge-triggered, so we
+        // won't get another wake for messages already in the buffer.
+        loop {
+            let mut buf = [0u8; MSG_BUF_SIZE];
+            match self.bus.try_recv(&mut buf) {
+                Ok(Some(n)) if n > 0 => self.process_bus_message(&buf[..n]),
+                _ => break,
+            }
+        }
+    }
+
+    fn process_bus_message(&mut self, msg: &[u8]) {
+        let header = match BusMsgHeader::read_from(msg) {
             Some(h) => h,
             None => return,
         };
-        let (addr, key, value) = extract_bus_fields(&buf[..len], &header);
+        let (addr, key, value) = extract_bus_fields(msg, &header);
 
         match header.msg_type {
             bus_msg_type::EVENT => {
@@ -931,7 +1113,7 @@ fn main() -> ! {
     // Register ulog flush for panic handler
     libsys::set_panic_flush(libos::ulog::flush);
 
-    uinfo!("devd2", "starting");
+    unotice!("devd2", "starting");
     libos::ulog::flush();
 
     // Connect to busd — retry since busd may not have registered bus: port yet
@@ -961,7 +1143,7 @@ fn main() -> ! {
         syscall::exit(1);
     }
 
-    uinfo!("devd2", "busd_connected");
+    unotice!("devd2", "busd_connected");
 
     // Create Mux
     let mux = match Mux::new() {
@@ -983,6 +1165,10 @@ fn main() -> ! {
 
     // Discover buses and spawn drivers
     devd.boot();
+
+    // Drain any bus events queued during boot (mux is edge-triggered —
+    // messages that arrived before the event loop won't trigger a wake)
+    devd.drain_bus_events();
 
     // Flush logs before entering event loop
     libos::ulog::flush();

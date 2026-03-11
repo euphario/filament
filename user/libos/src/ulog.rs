@@ -236,6 +236,10 @@ impl LogRing {
 
 static mut LOG_RING: LogRing = LogRing::new();
 
+/// Buffered debug/trace writes since last flush — auto-flush every 16
+static RING_WRITES: AtomicU32 = AtomicU32::new(0);
+const AUTO_FLUSH_THRESHOLD: u32 = 16;
+
 /// Boot time (set from kernel via shared memory or estimate from first log)
 static BOOT_TIME: AtomicU64 = AtomicU64::new(0);
 
@@ -388,9 +392,20 @@ impl RecordBuilder {
         self.buffer[0] = total_len as u8;
         self.buffer[1] = (total_len >> 8) as u8;
 
-        unsafe {
-            let ring = &mut *core::ptr::addr_of_mut!(LOG_RING);
-            ring.write(&self.buffer[..self.pos]);
+        let level = self.buffer[6];
+        if level <= Level::Notice as u8 {
+            // Error/Warn/Info/Notice → write directly to kernel klog (immediate)
+            libsys::syscall::klog_write(&self.buffer[..self.pos]);
+        } else {
+            // Debug/Trace → buffer locally, auto-flush every N writes
+            unsafe {
+                let ring = &mut *core::ptr::addr_of_mut!(LOG_RING);
+                ring.write(&self.buffer[..self.pos]);
+            }
+            if RING_WRITES.fetch_add(1, Ordering::Relaxed) + 1 >= AUTO_FLUSH_THRESHOLD {
+                RING_WRITES.store(0, Ordering::Relaxed);
+                flush();
+            }
         }
     }
 }

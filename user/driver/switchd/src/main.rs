@@ -342,7 +342,7 @@ impl SwitchDriver {
         }
 
         self.rebuild_port_map();
-        unotice!("switchd", "group_updated"; group = group_id as u32, ports = port_mask as u32);
+        udebug!("switchd", "group_updated"; group = group_id as u32, ports = port_mask as u32);
         copy_to(buf, b"OK\n")
     }
 

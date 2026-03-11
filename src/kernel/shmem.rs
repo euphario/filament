@@ -560,6 +560,14 @@ pub fn create(owner_pid: Pid, size: usize) -> Result<(u32, u64, u64), i64> {
 /// Map an existing shared memory region into a process
 /// Returns (vaddr, paddr) or error
 pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
+    // Get caller's parent PID before taking shmem lock (lock ordering: SCHEDULER < RESOURCE)
+    let caller_parent = crate::kernel::task::with_scheduler(|sched| {
+        sched.slot_by_pid(pid)
+            .and_then(|slot| sched.task(slot))
+            .map(|t| t.parent_id)
+            .unwrap_or(0)
+    });
+
     let (phys_addr, size) = {
         let mut guard = SHMEM.lock();
 
@@ -609,8 +617,11 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
             return Err(-11); // EAGAIN - resource temporarily unavailable
         }
 
-        // Check if allowed (owner, public, or in allowed list)
-        let is_allowed = pid == owner || is_public || allowed.iter().any(|&p| p == pid);
+        // Check if allowed (owner, public, allowed list, or child of owner)
+        let is_allowed = pid == owner
+            || is_public
+            || allowed.iter().any(|&p| p == pid)
+            || (caller_parent != 0 && caller_parent == owner);
         if !is_allowed {
             drop(guard);
             kwarn!("shmem", "map_denied";

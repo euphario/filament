@@ -13,7 +13,7 @@ use abi::{BusMsgHeader, bus_msg_type, bus_msg_flags};
 use libsys::syscall::{self, Handle};
 use libsys::ipc::{Port, Channel, Mux, MuxFilter, ObjHandle};
 use libsys::error::SysError;
-use libos::{uinfo, uwarn, uerror};
+use libos::{uinfo, unotice, uwarn, uerror, udebug};
 
 const MAX_CLIENTS: usize = 64;
 const MAX_PENDING_REPLIES: usize = 64;
@@ -90,7 +90,7 @@ impl BusDaemon {
         self.port = Some(port);
         self.mux = Some(mux);
 
-        uinfo!("busd", "ready";);
+        unotice!("busd", "ready";);
         Ok(())
     }
 
@@ -280,7 +280,9 @@ impl BusDaemon {
         route.class = class;
         route.subscribe_events = subscribe;
 
-        uinfo!("busd", "registered"; slot = idx as u32);
+        udebug!("busd", "registered";
+            name = core::str::from_utf8(route.name_bytes()).unwrap_or("?"),
+            path = core::str::from_utf8(route.path_bytes()).unwrap_or("?"));
     }
 
     // =========================================================================

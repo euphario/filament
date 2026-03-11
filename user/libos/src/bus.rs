@@ -643,6 +643,17 @@ pub trait Driver {
 
     /// Set a config value. Called by the framework for CONFIG_SET.
     fn config_set(&mut self, _key: &[u8], _value: &[u8], _buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize { 0 }
+
+    /// Called after all initial config KVs have been delivered (config.done).
+    /// The framework emits Running after this returns.
+    /// All config KVs delivered. Driver should apply config and transition:
+    /// - Success: call `ctx.report_running()`
+    /// - Failure: call `ctx.report_failed()`
+    ///
+    /// Default: emit Running immediately (no config needed).
+    fn config_done(&mut self, ctx: &mut dyn BusCtx) {
+        let _ = ctx.bus_emit(b"state", b"Running");
+    }
 }
 
 // ============================================================================
@@ -1169,6 +1180,7 @@ impl<D: Driver + ?Sized> Driver for &'static mut D {
     fn config_keys(&self) -> &[ConfigKey] { (**self).config_keys() }
     fn config_get(&self, key: &[u8], buf: &mut [u8]) -> usize { (**self).config_get(key, buf) }
     fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], ctx: &mut dyn BusCtx) -> usize { (**self).config_set(key, value, buf, ctx) }
+    fn config_done(&mut self, ctx: &mut dyn BusCtx) { (**self).config_done(ctx) }
 }
 
 /// Stream data transport (byte ring pattern).

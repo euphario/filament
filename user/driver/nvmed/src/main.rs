@@ -457,7 +457,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
     let dstrd = ((cap_val & cap::DSTRD_MASK) >> cap::DSTRD_SHIFT) as u32;
     ctrl.doorbell_stride = 4 << dstrd;
     let vs = ctrl.read32(regs::VS);
-    unotice!("nvmed", "hw_probe"; cap = cap_val, vs = vs as u64, stride = ctrl.doorbell_stride);
+    udebug!("nvmed", "hw_probe"; cap = cap_val, vs = vs as u64, stride = ctrl.doorbell_stride);
 
     // Disable controller
     ctrl.write32(regs::CC, 0);
@@ -499,7 +499,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
         uerror!("nvmed", "controller_timeout";);
         return Err(BusError::Timeout);
     }
-    unotice!("nvmed", "controller_ready"; cc = cc_val as u64, csts = ctrl.read32(regs::CSTS) as u64);
+    udebug!("nvmed", "controller_ready"; cc = cc_val as u64, csts = ctrl.read32(regs::CSTS) as u64);
 
     // Identify buffer
     let id_pool = match DmaPool::alloc(4096) {
@@ -516,7 +516,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
     match ctrl.identify_controller(id_buf_phys) {
         Ok(_) => {
             let id_ctrl = unsafe { &*(id_buf_virt as *const IdentifyController) };
-            unotice!("nvmed", "controller"; vendor = id_ctrl.vid as u32);
+            udebug!("nvmed", "controller"; vendor = id_ctrl.vid as u32);
         }
         Err(e) => {
             uerror!("nvmed", "identify_ctrl_err"; status = e as u32);
@@ -549,7 +549,7 @@ fn init_nvme_hardware(bar0_addr: u64, bar0_size: u64) -> Result<NvmeController, 
         return Err(BusError::Internal);
     }
 
-    unotice!("nvmed", "controller_ready"; blocks = ctrl.ns_size, block_size = ctrl.block_size);
+    unotice!("nvmed", "controller_ready"; blocks = ctrl.ns_size, block_size = ctrl.block_size);  // meaningful: disk geometry
     Ok(ctrl)
 }
 
@@ -719,7 +719,7 @@ impl NvmeDriver {
 
 impl Driver for NvmeDriver {
     fn reset(&mut self, ctx: &mut dyn BusCtx) -> Result<(), BusError> {
-        unotice!("nvmed", "starting";);
+        udebug!("nvmed", "starting";);
 
         // Get spawn context — the port name and BAR0 metadata from pcied
         // (e.g., "pci/00:02.0:nvme" registered by pcied with BAR0 info)
@@ -744,7 +744,7 @@ impl Driver for NvmeDriver {
             meta[8], meta[9], meta[10], meta[11],
         ]) as u64;
 
-        unotice!("nvmed", "device_found"; bar0 = bar0_addr, size = bar0_size);
+        udebug!("nvmed", "device_found"; bar0 = bar0_addr, size = bar0_size);
 
         // Initialize NVMe hardware
         let ctrl = init_nvme_hardware(bar0_addr, bar0_size)?;

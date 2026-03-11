@@ -395,9 +395,8 @@ pub fn complete_probed_exit() {
     // Spawn busd first — it registers the bus: port that devd connects to
     spawn_busd();
 
-    kinfo!("lifecycle", "spawning_devd2");
     match elf::spawn_from_path("bin/devd2", 0, Capabilities::from_bits(0)) {
-        Ok((_task_id, slot)) => {
+        Ok((task_id, slot)) => {
             super::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
                     task.set_capabilities(Capabilities::ALL);
@@ -405,7 +404,7 @@ pub fn complete_probed_exit() {
                     task.is_init = true;
                 }
             });
-            kinfo!("lifecycle", "devd_spawned"; slot = slot as u64);
+            kinfo!("lifecycle", "spawned"; binary = "devd2", pid = task_id as u64);
         }
         Err(_e) => {
             crate::print_str_uart("FATAL: probed_exit: cannot spawn devd\r\n");
@@ -422,17 +421,15 @@ pub fn spawn_busd() {
     use crate::kernel::elf;
     use crate::kernel::caps::Capabilities;
 
-    kinfo!("lifecycle", "spawning_busd");
     match elf::spawn_from_path("bin/busd", 0, Capabilities::from_bits(0)) {
-        Ok((_task_id, slot)) => {
+        Ok((task_id, slot)) => {
             super::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
-                    // busd needs IPC + port registration
                     task.set_capabilities(Capabilities::ALL);
                     task.set_priority(super::Priority::Critical);
                 }
             });
-            kinfo!("lifecycle", "busd_spawned"; slot = slot as u64);
+            kinfo!("lifecycle", "spawned"; binary = "busd", pid = task_id as u64);
         }
         Err(_e) => {
             crate::print_str_uart("WARN: failed to spawn busd\r\n");
