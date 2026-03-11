@@ -246,31 +246,39 @@ pub fn check_syscall_storm(num: u64) -> (StormAction, bool) {
     let _ = num; // available for future per-syscall tuning
     super::task::with_scheduler(|sched| {
         let slot = super::task::current_slot();
-        if let Some(task) = sched.task_mut(slot) {
-            // Record activity using raw counter (liveness expects counter units)
-            task.record_activity(crate::platform::current::timer::counter());
+        if sched.task(slot).is_none() {
+            return (StormAction::Allow, false);
+        }
+
+        let ptable = super::process::process_table();
+
+        // Record activity using raw counter (liveness expects counter units)
+        ptable.with_mut(slot, |p| {
+            p.record_activity(crate::platform::current::timer::counter());
 
             // Increment cumulative syscall counter
-            task.total_syscalls = task.total_syscalls.saturating_add(1);
+            p.total_syscalls = p.total_syscalls.saturating_add(1);
+        });
 
-            // Storm rate-limiting uses logical ticks (100/s granularity)
-            let current_tick = crate::platform::current::timer::logical_ticks();
-            let config = StormConfig::new();
-            let mut action = task.record_storm_syscall(current_tick, &config);
+        // Storm rate-limiting uses logical ticks (100/s granularity)
+        let current_tick = crate::platform::current::timer::logical_ticks();
+        let config = StormConfig::new();
+        let mut action = ptable.with_mut(slot, |p| {
+            p.record_storm_syscall(current_tick, &config)
+        }).unwrap_or(StormAction::Allow);
 
-            // Never evict init, but throttling is acceptable as a safety net.
-            // With inline timers, devd should stay well under the storm threshold.
-            if task.is_init && action == StormAction::Evict {
-                action = StormAction::Throttle;
-            }
+        let is_init = ptable.with(slot, |p| p.is_init).unwrap_or(false);
 
-            // The syscall itself IS the pong — proves the task is alive
-            task.reset_liveness_if_implicit_pong();
-
-            (action, task.is_init)
-        } else {
-            (StormAction::Allow, false)
+        // Never evict init, but throttling is acceptable as a safety net.
+        // With inline timers, devd should stay well under the storm threshold.
+        if is_init && action == StormAction::Evict {
+            action = StormAction::Throttle;
         }
+
+        // The syscall itself IS the pong — proves the task is alive
+        ptable.with_mut(slot, |p| p.reset_liveness_if_implicit_pong());
+
+        (action, is_init)
     })
 }
 

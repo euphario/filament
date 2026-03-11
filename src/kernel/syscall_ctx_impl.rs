@@ -65,8 +65,11 @@ impl SyscallContext for KernelSyscallContext {
 
         task::with_scheduler(|sched| {
             sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.capabilities.has(Capabilities::from_bits(cap)))
+                .map(|slot| {
+                    crate::kernel::process::process_table()
+                        .with(slot, |p| p.has_capability(Capabilities::from_bits(cap)))
+                        .unwrap_or(false)
+                })
                 .unwrap_or(false)
         })
     }

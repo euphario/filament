@@ -563,8 +563,9 @@ pub fn map(pid: Pid, shmem_id: u32) -> Result<(u64, u64), i64> {
     // Get caller's parent PID before taking shmem lock (lock ordering: SCHEDULER < RESOURCE)
     let caller_parent = crate::kernel::task::with_scheduler(|sched| {
         sched.slot_by_pid(pid)
-            .and_then(|slot| sched.task(slot))
-            .map(|t| t.parent_id)
+            .and_then(|slot| {
+                crate::kernel::process::process_table().with(slot, |p| p.parent_id)
+            })
             .unwrap_or(0)
     });
 

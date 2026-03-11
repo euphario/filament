@@ -717,7 +717,10 @@ pub fn timer_tick(current_time: u64) {
         let now = crate::platform::current::timer::counter();
         for slot in percpu::MAX_CPUS..task::MAX_TASKS {
             let should_kill = sched.task(slot).map(|t| {
-                t.is_frozen() && t.frozen_deadline > 0 && now >= t.frozen_deadline
+                if !t.is_frozen() { return false; }
+                let fd = crate::kernel::process::process_table()
+                    .with(slot, |p| p.frozen_deadline).unwrap_or(0);
+                fd > 0 && now >= fd
             }).unwrap_or(false);
             if should_kill {
                 if let Some(task) = sched.task_mut(slot) {

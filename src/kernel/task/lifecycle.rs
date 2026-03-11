@@ -19,6 +19,7 @@
 use crate::{kinfo, knotice, kdebug};
 use super::{TaskId, Scheduler, MAX_TASKS};
 use crate::kernel::ipc::{waker, traits::WakeReason};
+use crate::kernel::process;
 
 /// Flag set when probed exits — checked by exit handler to spawn devd
 #[no_mangle]
@@ -78,38 +79,35 @@ pub struct ExitInfo {
 pub fn exit(sched: &mut Scheduler, task_id: TaskId, code: i32) -> Result<Option<ExitInfo>, LifecycleError> {
     let slot = sched.slot_by_pid(task_id).ok_or(LifecycleError::NotFound)?;
 
+    let ptable = process::process_table();
+
+    // Get metadata from ProcessTable
     let (parent_id, was_probed) = {
         let task = sched.tasks[slot].as_mut().ok_or(LifecycleError::NotFound)?;
 
         // Transition state via state machine
         if let Err(_e) = task.set_exiting(code) {
-            // Already terminated? That's ok, just return
             if task.is_terminated() {
                 return Ok(None);
             }
             return Err(LifecycleError::InvalidState);
         }
 
-        // Clear is_init flag so new devd can be init
-        task.is_init = false;
-
-        // Detect probed exit — trigger bus creation lock and devd spawn
-        let probed = task.is_probed;
-        if probed {
-            task.is_probed = false;
-        }
+        // Read and clear flags in ProcessTable
+        let parent_id = ptable.with(slot, |p| p.parent_id).unwrap_or(0);
+        let was_probed = ptable.with_mut(slot, |p| {
+            let probed = p.is_probed;
+            if probed {
+                p.is_probed = false;
+            }
+            p.is_init = false;
+            probed
+        }).unwrap_or(false);
 
         knotice!("lifecycle", "exit"; pid = task_id, code = code as i64);
 
-        (task.parent_id, probed)
+        (parent_id, was_probed)
     };
-
-    // NOTE: Don't wake parent here. Parent will be woken by:
-    // 1. NotifyParentExit microtask → ProcessObject WaitQueue (immediate, outside lock)
-    // 2. KillChildren microtask → wake_parent_if_sleeping
-    // Waking here causes a lost-wake race: devd wakes, polls Mux, finds nothing,
-    // goes back to sleep. Then consoled's set_port_state arrives during the
-    // Running→Sleeping transition and the channel wake is lost.
 
     // If probed just exited, lock bus creation and spawn devd
     if was_probed {
@@ -142,30 +140,30 @@ pub fn kill(
 ) -> Result<Option<ExitInfo>, LifecycleError> {
     let slot = sched.slot_by_pid(task_id).ok_or(LifecycleError::NotFound)?;
 
-    // Check permission
+    let ptable = process::process_table();
+
+    // Check permission via ProcessTable
     let (parent_id, allowed, was_init) = {
         let task = sched.tasks[slot].as_ref().ok_or(LifecycleError::NotFound)?;
+        let _ = task; // existence check only
 
-        // Check allowlist
-        let is_parent = task.parent_id == killer_id;
-        let is_self = task_id == killer_id;
-        let in_allowlist = task.signal_allowlist_count == 0
-            || task.signal_allowlist[..task.signal_allowlist_count]
-                .iter()
-                .any(|&pid| pid == killer_id);
+        let (parent_id, is_init, signal_allowed) = ptable.with(slot, |p| {
+            let is_parent = p.parent_id == killer_id;
+            let is_self = task_id == killer_id;
+            let in_allowlist = p.can_receive_signal_from(killer_id);
+            (p.parent_id, p.is_init, is_self || is_parent || in_allowlist)
+        }).unwrap_or((0, false, false));
 
         // Check capabilities (killer needs CAP_KILL for non-self, non-child)
         let has_cap_kill = if let Some(killer_slot) = sched.slot_by_pid(killer_id) {
-            sched.tasks[killer_slot]
-                .as_ref()
-                .map(|t| t.has_capability(crate::kernel::caps::Capabilities::KILL))
-                .unwrap_or(false)
+            ptable.with(killer_slot, |p| {
+                p.has_capability(crate::kernel::caps::Capabilities::KILL)
+            }).unwrap_or(false)
         } else {
             false
         };
 
-        let allowed = is_self || is_parent || in_allowlist || has_cap_kill;
-        (task.parent_id, allowed, task.is_init)
+        (parent_id, signal_allowed || has_cap_kill, is_init)
     };
 
     if !allowed {
@@ -183,15 +181,10 @@ pub fn kill(
             return Err(LifecycleError::InvalidState);
         }
 
-        task.is_init = false;
+        ptable.with_mut(slot, |p| { p.is_init = false; });
 
         kinfo!("lifecycle", "kill"; pid = task_id, killer = killer_id);
     }
-
-    // NOTE: Don't wake parent here — same lost-wake race as exit().
-    // Parent will be woken by microtask pipeline:
-    // 1. NotifyParentExit → ProcessObject WaitQueue (immediate, outside lock)
-    // 2. KillChildren → wake_parent_if_sleeping
 
     // If this was the init process (devd), trigger recovery
     if was_init {
@@ -232,23 +225,26 @@ pub fn wait_child(
         None => return WaitResult::NoChildren,
     };
 
-    // Check if parent has children
-    let has_children = sched.tasks[parent_slot]
-        .as_ref()
-        .map(|t| t.has_children())
+    // Check if parent has children (via ProcessTable)
+    let has_children = process::process_table()
+        .with(parent_slot, |p| p.has_children())
         .unwrap_or(false);
 
     if !has_children {
         return WaitResult::NoChildren;
     }
 
-    // Look for exited child
+    // Look for exited child — need to check parent_id via ProcessTable
     let mut found: Option<(usize, TaskId, i32)> = None;
 
     for slot in 0..MAX_TASKS {
         if let Some(ref task) = sched.tasks[slot] {
-            // Must be child of parent
-            if task.parent_id != parent_id {
+            // Check parent_id via ProcessTable
+            let is_child = process::process_table()
+                .with(slot, |p| p.parent_id == parent_id)
+                .unwrap_or(false);
+
+            if !is_child {
                 continue;
             }
 
@@ -320,19 +316,19 @@ pub fn complete_exit_notification(info: ExitInfo) {
 ///
 /// The child is detached (parent_id = 0) so wait_child won't find it again.
 /// The timer scanner picks up the GracePeriod and enqueues Phase 2 later.
-fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, child_pid: TaskId) {
+fn reap_child(_sched: &mut Scheduler, parent_slot: usize, child_slot: usize, child_pid: TaskId) {
     use crate::kernel::ipc::{waker, traits::WakeReason};
     use crate::kernel::task::tcb::CleanupPhase;
 
-    // Remove from parent's child list
-    if let Some(ref mut parent) = sched.tasks[parent_slot] {
-        parent.remove_child(child_pid);
-    }
+    let ptable = process::process_table();
 
-    // Check cleanup progress to determine what work remains
-    let cleanup_phase = sched.tasks[child_slot]
-        .as_ref()
-        .map(|t| t.cleanup_phase)
+    // Remove from parent's child list (via ProcessTable)
+    ptable.with_mut(parent_slot, |p| {
+        p.remove_child(child_pid);
+    });
+
+    // Check cleanup progress (via ProcessTable)
+    let cleanup_phase = ptable.with(child_slot, |p| p.cleanup_phase)
         .unwrap_or(CleanupPhase::None);
 
     let needs_phase1 = matches!(cleanup_phase, CleanupPhase::None);
@@ -349,16 +345,15 @@ fn reap_child(sched: &mut Scheduler, parent_slot: usize, child_slot: usize, chil
         crate::kernel::shmem::begin_cleanup(child_pid);
     }
 
-    // Detach from parent so wait_child won't find this task again.
-    // Phase 2 (FinalCleanup + SlotReap) goes through the microtask grace period.
-    if let Some(task) = sched.task_mut(child_slot) {
-        task.parent_id = 0;
-        if matches!(task.cleanup_phase, CleanupPhase::None | CleanupPhase::Phase1Enqueued) {
-            task.cleanup_phase = CleanupPhase::GracePeriod {
+    // Detach from parent and set grace period (via ProcessTable)
+    ptable.with_mut(child_slot, |p| {
+        p.parent_id = 0;
+        if matches!(p.cleanup_phase, CleanupPhase::None | CleanupPhase::Phase1Enqueued) {
+            p.cleanup_phase = CleanupPhase::GracePeriod {
                 until: crate::platform::current::timer::deadline_ns(100_000_000),
             };
         }
-    }
+    });
 }
 
 /// Handle probed exit: lock bus creation, set flag for deferred devd spawn
@@ -397,11 +392,15 @@ pub fn complete_probed_exit() {
 
     match elf::spawn_from_path("bin/devd2", 0, Capabilities::from_bits(0)) {
         Ok((task_id, slot)) => {
+            // Set capabilities via ProcessTable
+            process::process_table().with_mut(slot, |p| {
+                p.set_capabilities(Capabilities::ALL);
+                p.is_init = true;
+            });
+            // Set priority via scheduler
             super::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
-                    task.set_capabilities(Capabilities::ALL);
                     task.set_priority(super::Priority::Critical);
-                    task.is_init = true;
                 }
             });
             kinfo!("lifecycle", "spawned"; binary = "devd2", pid = task_id as u64);
@@ -423,9 +422,13 @@ pub fn spawn_busd() {
 
     match elf::spawn_from_path("bin/busd", 0, Capabilities::from_bits(0)) {
         Ok((task_id, slot)) => {
+            // Set capabilities via ProcessTable
+            process::process_table().with_mut(slot, |p| {
+                p.set_capabilities(Capabilities::ALL);
+            });
+            // Set priority via scheduler
             super::with_scheduler(|sched| {
                 if let Some(task) = sched.task_mut(slot) {
-                    task.set_capabilities(Capabilities::ALL);
                     task.set_priority(super::Priority::Critical);
                 }
             });
@@ -433,7 +436,6 @@ pub fn spawn_busd() {
         }
         Err(_e) => {
             crate::print_str_uart("WARN: failed to spawn busd\r\n");
-            // Non-fatal for now — devd can still work without busd during migration
         }
     }
 }

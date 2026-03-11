@@ -274,19 +274,22 @@ pub(crate) enum ContextRestoreState {
     Saved,
 }
 
-/// Task Control Block
+/// Task Control Block — Scheduling State Only
 ///
-/// Fields are private to enforce access through methods.
-/// Use accessor methods for reading and state machine methods for transitions.
+/// Contains ONLY state needed for scheduling: CPU context, state machine,
+/// priority, kernel stack, and address space. All process metadata (name,
+/// capabilities, signals, resource counters, children, liveness) is in
+/// ProcessInfo, owned by the ProcessTable with its own lock.
+///
+/// This separation means external code accesses process metadata through
+/// `process::process_table()` without touching the scheduler lock.
 pub struct Task {
     // ========================================================================
-    // Immutable identifiers (public - safe to read directly)
+    // Immutable identifiers
     // ========================================================================
 
     /// Unique task ID
     pub id: TaskId,
-    /// Parent task ID (0 for orphan/init)
-    pub parent_id: TaskId,
     /// Is this a user-mode task?
     pub is_user: bool,
     /// Kernel stack base (physical address, after guard page)
@@ -297,11 +300,10 @@ pub struct Task {
     pub guard_page: u64,
 
     // ========================================================================
-    // Private state - access via methods only
+    // Scheduling state — access via methods only
     // ========================================================================
 
     /// Current state - use state() accessor and transition methods
-    /// PRIVATE: all access must go through state machine methods
     state: TaskState,
     /// Base scheduling priority - set at spawn, changed by supervisor
     pub(crate) base_priority: Priority,
@@ -321,94 +323,32 @@ pub struct Task {
     pub(crate) trap_frame: TrapFrame,
     /// User address space (None for kernel tasks)
     pub(crate) address_space: Option<AddressSpace>,
-    /// Is this the init process (devd)?
-    pub(crate) is_init: bool,
-    /// Is this the probed process (boot-time bus discovery)?
-    pub is_probed: bool,
-    /// Task name for debugging
-    pub(crate) name: [u8; 16],
     /// Heap mappings for mmap/munmap tracking
     pub(crate) heap_mappings: [HeapMapping; MAX_HEAP_MAPPINGS],
     /// Next heap address for bump allocation
     pub(crate) heap_next: u64,
-    // NOTE: object_table removed - now owned by ObjectService
-    /// Per-process resource limits
-    pub(crate) limits: ResourceLimits,
-    /// Per-process resource counters
-    pub(crate) channel_count: u16,
-    pub(crate) port_count: u16,
-    pub(crate) shmem_count: u16,
-    /// Child task IDs
-    pub(crate) children: [TaskId; MAX_CHILDREN],
-    /// Number of children
-    pub(crate) num_children: usize,
-    /// Capability set for this task
-    pub(crate) capabilities: crate::kernel::caps::Capabilities,
-    /// Signal allowlist - PIDs allowed to send signals
-    pub(crate) signal_allowlist: [u32; MAX_SIGNAL_SENDERS],
-    /// Number of entries in signal allowlist
-    pub(crate) signal_allowlist_count: usize,
-    /// Liveness tracking state
-    pub(crate) liveness_state: crate::kernel::liveness::LivenessState,
-    /// Last activity tick (syscall made)
-    pub(crate) last_activity_tick: u64,
-    /// Storm protection state (syscall/wake rate limiting)
-    pub(crate) storm: crate::kernel::storm::StormState,
-    /// Whether this task needs its kernel context restored via context_switch.
-    /// Set to Saved when task blocks and context_switch saves its context.
-    /// Set to Fresh when context_switch restores its context.
-    context_restore: ContextRestoreState,
 
+    // ========================================================================
+    // Context switch / SMP safety
+    // ========================================================================
+
+    /// Whether this task needs its kernel context restored via context_switch
+    context_restore: ContextRestoreState,
     /// SMP exclusivity: which CPU is currently using this task's kernel stack?
-    ///
-    /// Set in Phase 1 of context switch (before releasing scheduler lock).
-    /// Cleared in Phase 3 of context switch (after switch completes).
-    ///
-    /// A task is selectable iff:
-    /// - `state == Ready`
-    /// - `kernel_stack_owner.is_none()`
-    ///
-    /// This prevents the bug where CPU 0 is mid-context-switch using a task's
-    /// kernel stack while CPU 1 tries to select and run the same task.
     kernel_stack_owner: Option<u32>,
 
-    /// Cleanup phase for exiting tasks (microtask-driven)
-    pub(crate) cleanup_phase: CleanupPhase,
+    // ========================================================================
+    // Scheduling accounting
+    // ========================================================================
 
-    /// IPC messages sent by this task (saturating counter)
-    pub(crate) ipc_sent: u32,
-    /// IPC messages received by this task (saturating counter)
-    pub(crate) ipc_recv: u32,
     /// Context switches into this task (saturating counter)
     pub(crate) context_switches: u32,
-    /// Page faults handled for this task (demand paging)
-    pub(crate) page_faults: u32,
-
     /// Total CPU time consumed by this task (nanoseconds)
     pub(crate) cpu_time_ns: u64,
-    /// Cumulative syscall count (saturating)
-    pub(crate) total_syscalls: u64,
     /// Counter snapshot when this task was last scheduled to run
     pub(crate) last_scheduled_at: u64,
 
-    /// Data delivered with the last wake (for Mux fast path)
-    pub(crate) wake_data: Option<WakeData>,
-
-    /// Exception channel: if set, user faults freeze the task and deliver
-    /// fault info on this channel instead of killing. (parent_task_id, channel_id)
-    pub(crate) exception_channel: Option<(TaskId, u32)>,
-
-    /// Deadline (counter ticks) for frozen task timeout — kill if exceeded
-    pub(crate) frozen_deadline: u64,
-
-    /// Per-task signal queue (fixed ring buffer)
-    pub(crate) signal_queue: [abi::PendingSignal; MAX_PENDING_SIGNALS],
-    pub(crate) signal_head: u8,  // next write position
-    pub(crate) signal_tail: u8,  // next read position
-    pub(crate) signal_count: u8, // current count
-
     /// Debug invariant: is this task currently in a ready queue?
-    /// Used to assert that tasks are enqueued/dequeued correctly.
     #[cfg(debug_assertions)]
     on_runq: bool,
 }
@@ -514,43 +454,13 @@ impl Task {
             guard_page: guard_page as u64,
             address_space: None,
             is_user: false,
-            is_init: false,
-            is_probed: false,
-            name: task_name,
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
-            limits: ResourceLimits::default(),
-            channel_count: 0,
-            port_count: 0,
-            shmem_count: 0,
-
-            parent_id: 0,
-            children: [0; MAX_CHILDREN],
-            num_children: 0,
-
-            capabilities: crate::kernel::caps::Capabilities::ALL,
-            signal_allowlist: [0; MAX_SIGNAL_SENDERS],
-            signal_allowlist_count: 0,
-            liveness_state: crate::kernel::liveness::LivenessState::Normal,
-            last_activity_tick: 0,
-            storm: crate::kernel::storm::StormState::new(),
-            context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
+            context_restore: ContextRestoreState::Saved,
             kernel_stack_owner: None,
-            cleanup_phase: CleanupPhase::None,
-            ipc_sent: 0,
-            ipc_recv: 0,
             context_switches: 0,
-            page_faults: 0,
             cpu_time_ns: 0,
-            total_syscalls: 0,
             last_scheduled_at: 0,
-            wake_data: None,
-            exception_channel: None,
-            frozen_deadline: 0,
-            signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
-            signal_head: 0,
-            signal_tail: 0,
-            signal_count: 0,
             #[cfg(debug_assertions)]
             on_runq: false,
         })
@@ -590,43 +500,13 @@ impl Task {
             guard_page: 0,  // No guard page for static stack
             address_space: None,
             is_user: false,
-            is_init: false,
-            is_probed: false,
-            name: *b"idle\0\0\0\0\0\0\0\0\0\0\0\0",
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
-            limits: ResourceLimits::default(),
-            channel_count: 0,
-            port_count: 0,
-            shmem_count: 0,
-
-            parent_id: 0,
-            children: [0; MAX_CHILDREN],
-            num_children: 0,
-
-            capabilities: crate::kernel::caps::Capabilities::NONE,  // No capabilities needed
-            signal_allowlist: [0; MAX_SIGNAL_SENDERS],
-            signal_allowlist_count: 0,
-            liveness_state: crate::kernel::liveness::LivenessState::Normal,
-            last_activity_tick: 0,
-            storm: crate::kernel::storm::StormState::new(),
-            context_restore: ContextRestoreState::Saved,  // Kernel task always uses CpuContext
+            context_restore: ContextRestoreState::Saved,
             kernel_stack_owner: None,
-            cleanup_phase: CleanupPhase::None,
-            ipc_sent: 0,
-            ipc_recv: 0,
             context_switches: 0,
-            page_faults: 0,
             cpu_time_ns: 0,
-            total_syscalls: 0,
             last_scheduled_at: 0,
-            wake_data: None,
-            exception_channel: None,
-            frozen_deadline: 0,
-            signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
-            signal_head: 0,
-            signal_tail: 0,
-            signal_count: 0,
             #[cfg(debug_assertions)]
             on_runq: false,
         }
@@ -636,7 +516,7 @@ impl Task {
     ///
     /// The task's CpuContext is initialized to point to `user_task_trampoline`,
     /// which will set up globals and eret to userspace when first scheduled.
-    pub fn new_user(id: TaskId, name: &str) -> Option<Self> {
+    pub fn new_user(id: TaskId) -> Option<Self> {
         let total_pages = (KERNEL_STACK_SIZE / 4096) + 1;
         let alloc_base = pmm::alloc_pages(total_pages)?;
 
@@ -670,11 +550,6 @@ impl Task {
 
         let trap_frame = TrapFrame::new();
 
-        let mut task_name = [0u8; 16];
-        let name_bytes = name.as_bytes();
-        let copy_len = core::cmp::min(name_bytes.len(), 15);
-        task_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-
         Some(Self {
             id,
             state: TaskState::Ready,
@@ -691,144 +566,16 @@ impl Task {
             guard_page: guard_page as u64,
             address_space: Some(address_space),
             is_user: true,
-            is_init: false,
-            is_probed: false,
-            name: task_name,
             heap_mappings: [HeapMapping::empty(); MAX_HEAP_MAPPINGS],
             heap_next: USER_HEAP_START,
-            limits: ResourceLimits::default(),
-            channel_count: 0,
-            port_count: 0,
-            shmem_count: 0,
-
-            parent_id: 0,
-            children: [0; MAX_CHILDREN],
-            num_children: 0,
-
-            capabilities: crate::kernel::caps::Capabilities::DRIVER_DEFAULT,
-            signal_allowlist: [0; MAX_SIGNAL_SENDERS],
-            signal_allowlist_count: 0,
-            liveness_state: crate::kernel::liveness::LivenessState::Normal,
-            last_activity_tick: 0,
-            storm: crate::kernel::storm::StormState::new(),
             context_restore: ContextRestoreState::Saved,
             kernel_stack_owner: None,
-            cleanup_phase: CleanupPhase::None,
-            ipc_sent: 0,
-            ipc_recv: 0,
             context_switches: 0,
-            page_faults: 0,
             cpu_time_ns: 0,
-            total_syscalls: 0,
             last_scheduled_at: 0,
-            wake_data: None,
-            exception_channel: None,
-            frozen_deadline: 0,
-            signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
-            signal_head: 0,
-            signal_tail: 0,
-            signal_count: 0,
             #[cfg(debug_assertions)]
             on_runq: false,
         })
-    }
-
-    /// Set task capabilities
-    pub fn set_capabilities(&mut self, caps: crate::kernel::caps::Capabilities) {
-        self.capabilities = caps;
-    }
-
-    /// Check if task has a capability
-    pub fn has_capability(&self, cap: crate::kernel::caps::Capabilities) -> bool {
-        self.capabilities.has(cap)
-    }
-
-    /// Check if task can create another channel
-    #[inline]
-    pub fn can_create_channel(&self) -> bool {
-        self.channel_count < self.limits.max_channels
-    }
-
-    #[inline]
-    pub fn add_channel(&mut self) {
-        self.channel_count = self.channel_count.saturating_add(1);
-    }
-
-    #[inline]
-    pub fn remove_channel(&mut self) {
-        self.channel_count = self.channel_count.saturating_sub(1);
-    }
-
-    #[inline]
-    pub fn can_create_port(&self) -> bool {
-        self.port_count < self.limits.max_ports
-    }
-
-    #[inline]
-    pub fn add_port(&mut self) {
-        self.port_count = self.port_count.saturating_add(1);
-    }
-
-    #[inline]
-    pub fn remove_port(&mut self) {
-        self.port_count = self.port_count.saturating_sub(1);
-    }
-
-    #[inline]
-    pub fn can_create_shmem(&self) -> bool {
-        self.shmem_count < self.limits.max_shmem
-    }
-
-    #[inline]
-    pub fn add_shmem(&mut self) {
-        self.shmem_count = self.shmem_count.saturating_add(1);
-    }
-
-    #[inline]
-    pub fn remove_shmem(&mut self) {
-        self.shmem_count = self.shmem_count.saturating_sub(1);
-    }
-
-    /// Check if task can spawn another child
-    #[inline]
-    pub fn can_add_child(&self) -> bool {
-        (self.num_children as u16) < self.limits.max_children
-    }
-
-    /// Add a PID to the signal allowlist
-    pub fn allow_signals_from(&mut self, sender_pid: u32) -> bool {
-        for i in 0..self.signal_allowlist_count {
-            if self.signal_allowlist[i] == sender_pid {
-                return true;
-            }
-        }
-
-        if self.signal_allowlist_count < MAX_SIGNAL_SENDERS {
-            self.signal_allowlist[self.signal_allowlist_count] = sender_pid;
-            self.signal_allowlist_count += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Check if a sender PID is allowed to send signals
-    pub fn can_receive_signal_from(&self, sender_pid: u32) -> bool {
-        if self.signal_allowlist_count == 0 {
-            return true;
-        }
-
-        if sender_pid == self.parent_id && self.parent_id != 0 {
-            return true;
-        }
-
-        for i in 0..self.signal_allowlist_count {
-            if self.signal_allowlist[i] == sender_pid {
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Set base priority. Recomputes effective priority.
@@ -959,55 +706,8 @@ impl Task {
         self.cpu_time_ns
     }
 
-    /// Reset all per-task statistics counters.
-    pub fn reset_stats(&mut self) {
-        self.cpu_time_ns = 0;
-        self.total_syscalls = 0;
-        self.ipc_sent = 0;
-        self.ipc_recv = 0;
-        self.context_switches = 0;
-        self.page_faults = 0;
-        self.last_activity_tick = 0;
-    }
-
-    pub fn set_parent(&mut self, parent_id: TaskId) {
-        self.parent_id = parent_id;
-    }
-
-    pub fn add_child(&mut self, child_id: TaskId) -> bool {
-        if self.num_children >= MAX_CHILDREN {
-            return false;
-        }
-        self.children[self.num_children] = child_id;
-        self.num_children += 1;
-        true
-    }
-
-    pub fn remove_child(&mut self, child_id: TaskId) -> bool {
-        for i in 0..self.num_children {
-            if self.children[i] == child_id {
-                for j in i..self.num_children - 1 {
-                    self.children[j] = self.children[j + 1];
-                }
-                self.children[self.num_children - 1] = 0;
-                self.num_children -= 1;
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn has_children(&self) -> bool {
-        self.num_children > 0
-    }
-
     pub fn set_user_entry(&mut self, entry: u64, user_stack: u64) {
         self.trap_frame.init_user(entry, user_stack);
-    }
-
-    pub fn name_str(&self) -> &str {
-        let len = self.name.iter().position(|&c| c == 0).unwrap_or(16);
-        core::str::from_utf8(&self.name[..len]).unwrap_or("???")
     }
 
     pub fn address_space_mut(&mut self) -> Option<&mut AddressSpace> {
@@ -1026,50 +726,6 @@ impl Task {
             let canary_virt = mmu::phys_to_virt(self.kernel_stack) as *const u64;
             core::ptr::read_volatile(canary_virt) == STACK_CANARY
         }
-    }
-
-    /// Take wake data (consumes it — returns None on second call).
-    pub fn take_wake_data(&mut self) -> Option<WakeData> {
-        self.wake_data.take()
-    }
-
-    // ========================================================================
-    // Signal Queue API
-    // ========================================================================
-
-    /// Enqueue a signal into this task's signal queue.
-    ///
-    /// When the queue is full, coalesces by ORing event bits into the newest
-    /// entry. This ensures no event *type* is lost, though the value may be
-    /// from a different event. Returns true always (coalescing never fails).
-    pub fn enqueue_signal(&mut self, event: u32, value: u64) -> bool {
-        debug_assert!(event <= 0xFFFF, "signal event {:#x} exceeds u16 range for MuxEvent delivery", event);
-        if self.signal_count >= MAX_PENDING_SIGNALS as u8 {
-            // Coalesce: OR event bits into the newest (head-1) entry
-            let tail_idx = (self.signal_head + MAX_PENDING_SIGNALS as u8 - 1) % MAX_PENDING_SIGNALS as u8;
-            self.signal_queue[tail_idx as usize].event |= event;
-            return true;
-        }
-        self.signal_queue[self.signal_head as usize] = abi::PendingSignal { event, value };
-        self.signal_head = (self.signal_head + 1) % MAX_PENDING_SIGNALS as u8;
-        self.signal_count += 1;
-        true
-    }
-
-    /// Dequeue a signal from this task's signal queue.
-    pub fn dequeue_signal(&mut self) -> Option<abi::PendingSignal> {
-        if self.signal_count == 0 {
-            return None;
-        }
-        let sig = self.signal_queue[self.signal_tail as usize];
-        self.signal_tail = (self.signal_tail + 1) % MAX_PENDING_SIGNALS as u8;
-        self.signal_count -= 1;
-        Some(sig)
-    }
-
-    /// Check if this task has pending signals.
-    pub fn has_pending_signals(&self) -> bool {
-        self.signal_count > 0
     }
 
     // ========================================================================
@@ -1281,27 +937,8 @@ impl Task {
         false
     }
 
-    /// Record syscall activity for liveness tracking
-    /// Called at syscall entry to prove task is responsive
-    #[inline]
-    pub fn record_activity(&mut self, tick: u64) {
-        self.last_activity_tick = tick;
-    }
-
-    /// Reset liveness state if task is in implicit pong state
-    /// A syscall itself proves the task is alive - no explicit pong needed
-    #[inline]
-    pub fn reset_liveness_if_implicit_pong(&mut self) {
-        if let crate::kernel::liveness::LivenessState::PingSent { channel: 0, .. } = self.liveness_state {
-            self.liveness_state = crate::kernel::liveness::LivenessState::Normal;
-        }
-    }
-
-    /// Record a syscall for storm protection and return action to take
-    #[inline]
-    pub fn record_storm_syscall(&mut self, tick: u64, config: &crate::kernel::storm::StormConfig) -> crate::kernel::storm::StormAction {
-        self.storm.record_syscall(tick, config)
-    }
+    // record_activity, reset_liveness_if_implicit_pong, record_storm_syscall
+    // moved to ProcessInfo in kernel/process.rs
 
     /// Set deferred return value for syscall (written to trap_frame.x0)
     /// Used when syscall return value needs to be set after blocking
@@ -1332,37 +969,8 @@ impl Task {
         count
     }
 
-    /// Get capabilities as raw bits for syscall return
-    #[inline]
-    pub fn get_capabilities_bits(&self) -> u64 {
-        self.capabilities.bits()
-    }
-
-    /// Get activity age in milliseconds since last syscall.
-    /// `current_counter` must be a raw hardware counter value (same units as last_activity_tick).
-    #[inline]
-    pub fn get_activity_age_ms(&self, current_counter: u64) -> u32 {
-        if self.last_activity_tick == 0 {
-            0
-        } else {
-            let delta = current_counter.saturating_sub(self.last_activity_tick);
-            let freq = crate::platform::current::timer::frequency();
-            if freq == 0 { return 0; }
-            // delta * 1000 / freq — safe for up to ~9 years at 62.5MHz
-            (delta * 1000 / freq) as u32
-        }
-    }
-
-    /// Get liveness status code for ABI
-    #[inline]
-    pub fn get_liveness_status_code(&self) -> u8 {
-        use abi::liveness_status;
-        match self.liveness_state {
-            crate::kernel::liveness::LivenessState::Normal => liveness_status::NORMAL,
-            crate::kernel::liveness::LivenessState::PingSent { .. } => liveness_status::PING_SENT,
-            crate::kernel::liveness::LivenessState::ClosePending { .. } => liveness_status::CLOSE_PENDING,
-        }
-    }
+    // get_capabilities_bits, get_activity_age_ms, get_liveness_status_code
+    // moved to ProcessInfo in kernel/process.rs
 
     // ========================================================================
     // Unified Memory Mapping API

@@ -1,19 +1,15 @@
 //! Task Operations Backend Implementation
 //!
-//! Implements the `TaskOperations` trait by delegating to the existing
-//! task module. This provides a clean trait boundary for testing without
-//! changing the internal implementation.
-//!
-//! # Thread Safety
-//!
-//! All operations go through `with_scheduler()` which holds the scheduler
-//! lock with IRQ-save semantics, ensuring proper serialization on SMP systems.
+//! Implements the `TaskOperations` trait by delegating to the ProcessTable.
+//! All metadata queries (resource counts, capabilities, signals, names)
+//! go through the ProcessTable lock — the scheduler lock is never touched.
 
 use crate::kernel::traits::task::{
     TaskOperations, TaskId, ResourceCounts, Capabilities as TraitCapabilities, TaskError,
 };
-use crate::kernel::task::{self};
+use crate::kernel::task;
 use crate::kernel::caps::Capabilities as KernelCapabilities;
+use crate::kernel::process;
 
 // ============================================================================
 // Type Conversions
@@ -29,6 +25,11 @@ fn convert_caps_from_trait(caps: TraitCapabilities) -> KernelCapabilities {
     KernelCapabilities::from_bits(caps.bits())
 }
 
+/// Resolve a PID to a scheduler slot index.
+fn slot_for(task_id: TaskId) -> Option<usize> {
+    task::with_scheduler(|sched| sched.slot_by_pid(task_id))
+}
+
 // ============================================================================
 // Kernel Task Operations Implementation
 // ============================================================================
@@ -36,11 +37,10 @@ fn convert_caps_from_trait(caps: TraitCapabilities) -> KernelCapabilities {
 /// Kernel task operations backend implementation
 ///
 /// A zero-sized type that implements `TaskOperations` by delegating to the
-/// global scheduler via `with_scheduler()`.
+/// ProcessTable for all metadata queries.
 pub struct KernelTaskOperations;
 
 impl KernelTaskOperations {
-    /// Create a new kernel task operations instance
     pub const fn new() -> Self {
         Self
     }
@@ -52,119 +52,84 @@ impl TaskOperations for KernelTaskOperations {
     // ========================================================================
 
     fn can_create_channel(&self, task_id: TaskId) -> bool {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.can_create_channel())
-                .unwrap_or(false)
-        })
+        slot_for(task_id)
+            .and_then(|s| process::process_table().with(s, |p| p.can_create_channel()))
+            .unwrap_or(false)
     }
 
     fn add_channel(&self, task_id: TaskId) -> Result<(), TaskError> {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    if t.can_create_channel() {
-                        t.add_channel();
-                        return Ok(());
-                    } else {
-                        return Err(TaskError::LimitReached);
-                    }
-                }
+        let slot = slot_for(task_id).ok_or(TaskError::NotFound)?;
+        process::process_table().with_mut(slot, |p| {
+            if p.can_create_channel() {
+                p.add_channel();
+                Ok(())
+            } else {
+                Err(TaskError::LimitReached)
             }
-            Err(TaskError::NotFound)
-        })
+        }).unwrap_or(Err(TaskError::NotFound))
     }
 
     fn remove_channel(&self, task_id: TaskId) {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    t.remove_channel();
-                }
-            }
-        });
+        if let Some(slot) = slot_for(task_id) {
+            process::process_table().with_mut(slot, |p| p.remove_channel());
+        }
     }
 
     fn can_create_port(&self, task_id: TaskId) -> bool {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.can_create_port())
-                .unwrap_or(false)
-        })
+        slot_for(task_id)
+            .and_then(|s| process::process_table().with(s, |p| p.can_create_port()))
+            .unwrap_or(false)
     }
 
     fn add_port(&self, task_id: TaskId) -> Result<(), TaskError> {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    if t.can_create_port() {
-                        t.add_port();
-                        return Ok(());
-                    } else {
-                        return Err(TaskError::LimitReached);
-                    }
-                }
+        let slot = slot_for(task_id).ok_or(TaskError::NotFound)?;
+        process::process_table().with_mut(slot, |p| {
+            if p.can_create_port() {
+                p.add_port();
+                Ok(())
+            } else {
+                Err(TaskError::LimitReached)
             }
-            Err(TaskError::NotFound)
-        })
+        }).unwrap_or(Err(TaskError::NotFound))
     }
 
     fn remove_port(&self, task_id: TaskId) {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    t.remove_port();
-                }
-            }
-        });
+        if let Some(slot) = slot_for(task_id) {
+            process::process_table().with_mut(slot, |p| p.remove_port());
+        }
     }
 
     fn can_create_shmem(&self, task_id: TaskId) -> bool {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.can_create_shmem())
-                .unwrap_or(false)
-        })
+        slot_for(task_id)
+            .and_then(|s| process::process_table().with(s, |p| p.can_create_shmem()))
+            .unwrap_or(false)
     }
 
     fn add_shmem(&self, task_id: TaskId) -> Result<(), TaskError> {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    if t.can_create_shmem() {
-                        t.add_shmem();
-                        return Ok(());
-                    } else {
-                        return Err(TaskError::LimitReached);
-                    }
-                }
+        let slot = slot_for(task_id).ok_or(TaskError::NotFound)?;
+        process::process_table().with_mut(slot, |p| {
+            if p.can_create_shmem() {
+                p.add_shmem();
+                Ok(())
+            } else {
+                Err(TaskError::LimitReached)
             }
-            Err(TaskError::NotFound)
-        })
+        }).unwrap_or(Err(TaskError::NotFound))
     }
 
     fn remove_shmem(&self, task_id: TaskId) {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    t.remove_shmem();
-                }
-            }
-        });
+        if let Some(slot) = slot_for(task_id) {
+            process::process_table().with_mut(slot, |p| p.remove_shmem());
+        }
     }
 
     fn get_resource_counts(&self, task_id: TaskId) -> Option<ResourceCounts> {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| ResourceCounts {
-                    channels: t.channel_count,
-                    ports: t.port_count,
-                    shmem: t.shmem_count,
-                })
+        slot_for(task_id).and_then(|s| {
+            process::process_table().with(s, |p| ResourceCounts {
+                channels: p.channel_count,
+                ports: p.port_count,
+                shmem: p.shmem_count,
+            })
         })
     }
 
@@ -173,32 +138,24 @@ impl TaskOperations for KernelTaskOperations {
     // ========================================================================
 
     fn get_capabilities(&self, task_id: TaskId) -> Option<TraitCapabilities> {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| convert_caps_to_trait(t.capabilities))
+        slot_for(task_id).and_then(|s| {
+            process::process_table().with(s, |p| convert_caps_to_trait(p.capabilities))
         })
     }
 
     fn has_capability(&self, task_id: TaskId, cap: u64) -> bool {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.capabilities.has(KernelCapabilities::from_bits(cap)))
-                .unwrap_or(false)
-        })
+        slot_for(task_id)
+            .and_then(|s| process::process_table().with(s, |p| {
+                p.capabilities.has(KernelCapabilities::from_bits(cap))
+            }))
+            .unwrap_or(false)
     }
 
     fn set_capabilities(&self, task_id: TaskId, caps: TraitCapabilities) -> Result<(), TaskError> {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    t.set_capabilities(convert_caps_from_trait(caps));
-                    return Ok(());
-                }
-            }
-            Err(TaskError::NotFound)
-        })
+        let slot = slot_for(task_id).ok_or(TaskError::NotFound)?;
+        process::process_table().with_mut(slot, |p| {
+            p.set_capabilities(convert_caps_from_trait(caps));
+        }).ok_or(TaskError::NotFound)
     }
 
     // ========================================================================
@@ -206,27 +163,16 @@ impl TaskOperations for KernelTaskOperations {
     // ========================================================================
 
     fn can_receive_signal_from(&self, task_id: TaskId, sender: TaskId) -> bool {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.can_receive_signal_from(sender))
-                .unwrap_or(false)
-        })
+        slot_for(task_id)
+            .and_then(|s| process::process_table().with(s, |p| p.can_receive_signal_from(sender)))
+            .unwrap_or(false)
     }
 
     fn allow_signals_from(&self, task_id: TaskId, sender: TaskId) -> Result<(), TaskError> {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(t) = sched.task_mut(slot) {
-                    if t.allow_signals_from(sender) {
-                        return Ok(());
-                    } else {
-                        return Err(TaskError::AllowlistFull);
-                    }
-                }
-            }
-            Err(TaskError::NotFound)
-        })
+        let slot = slot_for(task_id).ok_or(TaskError::NotFound)?;
+        process::process_table().with_mut(slot, |p| {
+            p.allow_signals_from(sender);
+        }).ok_or(TaskError::NotFound)
     }
 
     // ========================================================================
@@ -234,30 +180,23 @@ impl TaskOperations for KernelTaskOperations {
     // ========================================================================
 
     fn get_name(&self, task_id: TaskId) -> Option<[u8; 32]> {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| {
-                    // Task has 16 byte name, trait expects 32
-                    let mut name = [0u8; 32];
-                    name[..16].copy_from_slice(&t.name);
-                    name
-                })
+        slot_for(task_id).and_then(|s| {
+            process::process_table().with(s, |p| {
+                let mut name = [0u8; 32];
+                name[..16].copy_from_slice(&p.name);
+                name
+            })
         })
     }
 
     fn get_parent(&self, task_id: TaskId) -> Option<TaskId> {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id)
-                .and_then(|slot| sched.task(slot))
-                .map(|t| t.parent_id)
+        slot_for(task_id).and_then(|s| {
+            process::process_table().with(s, |p| p.parent_id)
         })
     }
 
     fn exists(&self, task_id: TaskId) -> bool {
-        task::with_scheduler(|sched| {
-            sched.slot_by_pid(task_id).is_some()
-        })
+        slot_for(task_id).is_some()
     }
 }
 
@@ -326,7 +265,6 @@ pub mod mock {
     }
 
     impl MockTaskOperations {
-        /// Create a new mock with default limits
         pub fn new() -> Self {
             const NONE: Option<MockTaskInfo> = None;
             Self {
@@ -337,7 +275,6 @@ pub mod mock {
             }
         }
 
-        /// Create a mock with custom limits
         pub fn with_limits(max_channels: u16, max_ports: u16, max_shmem: u16) -> Self {
             const NONE: Option<MockTaskInfo> = None;
             Self {
@@ -348,7 +285,6 @@ pub mod mock {
             }
         }
 
-        /// Add a task to the mock
         pub fn add_task(&self, task_id: TaskId, parent_id: TaskId, name: &str) -> bool {
             let mut tasks = self.tasks.borrow_mut();
             for slot in tasks.iter_mut() {
@@ -366,7 +302,6 @@ pub mod mock {
             false
         }
 
-        /// Remove a task from the mock
         pub fn remove_task(&self, task_id: TaskId) -> bool {
             let mut tasks = self.tasks.borrow_mut();
             for slot in tasks.iter_mut() {
@@ -380,7 +315,6 @@ pub mod mock {
             false
         }
 
-        /// Set capabilities for a task
         pub fn set_task_capabilities(&self, task_id: TaskId, caps: TraitCapabilities) -> bool {
             let mut tasks = self.tasks.borrow_mut();
             for slot in tasks.iter_mut() {
@@ -394,7 +328,6 @@ pub mod mock {
             false
         }
 
-        /// Get all task IDs
         pub fn task_ids(&self) -> Vec<TaskId> {
             let tasks = self.tasks.borrow();
             tasks.iter()
@@ -591,15 +524,12 @@ pub mod mock {
             for slot in tasks.iter() {
                 if let Some(ref t) = slot {
                     if t.id == task_id {
-                        // If allowlist is empty, allow all
                         if t.signal_allowlist_count == 0 {
                             return true;
                         }
-                        // Parent always allowed
                         if sender == t.parent_id && t.parent_id != 0 {
                             return true;
                         }
-                        // Check allowlist
                         for i in 0..t.signal_allowlist_count {
                             if t.signal_allowlist[i] == sender {
                                 return true;
@@ -617,13 +547,11 @@ pub mod mock {
             for slot in tasks.iter_mut() {
                 if let Some(ref mut t) = slot {
                     if t.id == task_id {
-                        // Check if already in list
                         for i in 0..t.signal_allowlist_count {
                             if t.signal_allowlist[i] == sender {
                                 return Ok(());
                             }
                         }
-                        // Add if space
                         if t.signal_allowlist_count < MAX_ALLOWLIST {
                             t.signal_allowlist[t.signal_allowlist_count] = sender;
                             t.signal_allowlist_count += 1;
@@ -706,19 +634,13 @@ mod tests {
         let mock = MockTaskOperations::with_limits(2, 4, 16);
         mock.add_task(1, 0, "test");
 
-        // Can create first channel
         assert!(mock.can_create_channel(1));
         assert!(mock.add_channel(1).is_ok());
-
-        // Can create second channel
         assert!(mock.can_create_channel(1));
         assert!(mock.add_channel(1).is_ok());
-
-        // At limit - can't create third
         assert!(!mock.can_create_channel(1));
         assert!(matches!(mock.add_channel(1), Err(TaskError::LimitReached)));
 
-        // Remove one - can create again
         mock.remove_channel(1);
         assert!(mock.can_create_channel(1));
     }
@@ -766,17 +688,14 @@ mod tests {
         let mock = MockTaskOperations::new();
         mock.add_task(1, 0, "test");
 
-        // Initially no capabilities
         let caps = mock.get_capabilities(1).unwrap();
         assert_eq!(caps.bits(), 0);
 
-        // Set some capabilities
         let new_caps = TraitCapabilities::from_bits(
             TraitCapabilities::PCI_ACCESS | TraitCapabilities::DMA_ALLOC
         );
         mock.set_capabilities(1, new_caps).unwrap();
 
-        // Verify has_capability
         assert!(mock.has_capability(1, TraitCapabilities::PCI_ACCESS));
         assert!(mock.has_capability(1, TraitCapabilities::DMA_ALLOC));
         assert!(!mock.has_capability(1, TraitCapabilities::KILL));
@@ -788,7 +707,6 @@ mod tests {
         mock.add_task(1, 0, "receiver");
         mock.add_task(2, 0, "sender");
 
-        // Empty allowlist = allow all
         assert!(mock.can_receive_signal_from(1, 2));
         assert!(mock.can_receive_signal_from(1, 999));
     }
@@ -800,10 +718,8 @@ mod tests {
         mock.add_task(2, 0, "allowed");
         mock.add_task(3, 0, "blocked");
 
-        // Add sender 2 to allowlist
         mock.allow_signals_from(1, 2).unwrap();
 
-        // Only sender 2 can send
         assert!(mock.can_receive_signal_from(1, 2));
         assert!(!mock.can_receive_signal_from(1, 3));
     }
@@ -812,12 +728,10 @@ mod tests {
     fn test_signal_permissions_parent_always_allowed() {
         let mock = MockTaskOperations::new();
         mock.add_task(1, 0, "parent");
-        mock.add_task(2, 1, "child"); // Parent is 1
+        mock.add_task(2, 1, "child");
 
-        // Add some other sender to create a non-empty allowlist
         mock.allow_signals_from(2, 99).unwrap();
 
-        // Parent (1) should still be allowed even if not in allowlist
         assert!(mock.can_receive_signal_from(2, 1));
     }
 
@@ -826,12 +740,10 @@ mod tests {
         let mock = MockTaskOperations::new();
         mock.add_task(1, 0, "receiver");
 
-        // Fill up the allowlist
         for i in 10..18 {
             assert!(mock.allow_signals_from(1, i).is_ok());
         }
 
-        // Should be full now
         assert!(matches!(mock.allow_signals_from(1, 100), Err(TaskError::AllowlistFull)));
     }
 
@@ -842,7 +754,7 @@ mod tests {
 
         let name = mock.get_name(1).unwrap();
         assert_eq!(&name[..9], b"test_task");
-        assert_eq!(name[9], 0); // Null terminated
+        assert_eq!(name[9], 0);
     }
 
     #[test]
@@ -859,7 +771,6 @@ mod tests {
     fn test_nonexistent_task() {
         let mock = MockTaskOperations::new();
 
-        // All operations on non-existent task should fail gracefully
         assert!(!mock.can_create_channel(999));
         assert!(matches!(mock.add_channel(999), Err(TaskError::NotFound)));
         assert!(mock.get_resource_counts(999).is_none());
@@ -877,7 +788,6 @@ mod tests {
         let mock = MockTaskOperations::new();
         mock.add_task(1, 0, "test");
 
-        // Remove when count is 0 - should not underflow
         mock.remove_channel(1);
         mock.remove_port(1);
         mock.remove_shmem(1);

@@ -36,14 +36,16 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// ## Ordering (outermost → innermost)
 ///
 /// ```text
-/// SCHEDULER(10) → OBJ_SERVICE(20) → SUBSYSTEM(30) → RESOURCE(40)
+/// SCHEDULER(10) → PROCESS(12) → MICROTASK(15) → OBJ_SERVICE(20) → SUBSYSTEM(30) → RESOURCE(40)
 /// ```
 pub mod lock_class {
     /// Skip ordering checks (test locks, one-off locks)
     pub const UNORDERED: u8 = 0;
     /// Scheduler lock — acquired first (outermost)
     pub const SCHEDULER: u8 = 10;
-    /// Microtask queue — between scheduler and ObjectService
+    /// ProcessTable — process metadata (name, caps, signals, counters)
+    pub const PROCESS: u8 = 12;
+    /// Microtask queue — between ProcessTable and ObjectService
     pub const MICROTASK: u8 = 15;
     /// ObjectService per-task table locks
     pub const OBJ_SERVICE: u8 = 20;

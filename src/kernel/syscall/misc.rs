@@ -644,14 +644,17 @@ pub(super) fn sys_set_exception_channel(child_pid: u32, channel_handle: u32) -> 
             Some(s) => s,
             None => return KernelError::NoProcess.to_errno(),
         };
-        let child = match sched.task_mut(child_slot) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.to_errno(),
-        };
-        if child.parent_id != caller_pid {
+        if sched.task(child_slot).is_none() {
+            return KernelError::NoProcess.to_errno();
+        }
+        let ptable = crate::kernel::process::process_table();
+        let child_parent = ptable.with(child_slot, |p| p.parent_id).unwrap_or(0);
+        if child_parent != caller_pid {
             return KernelError::PermDenied.to_errno();
         }
-        child.exception_channel = Some((caller_pid, channel_id));
+        ptable.with_mut(child_slot, |p| {
+            p.exception_channel = Some((caller_pid, channel_id));
+        });
         0
     })
 }
@@ -676,17 +679,20 @@ pub(super) fn sys_set_resource_limits(child_pid: u32, max_channels: u16, max_por
             Some(s) => s,
             None => return KernelError::NoProcess.to_errno(),
         };
-        let child = match sched.task_mut(child_slot) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.to_errno(),
-        };
-        if child.parent_id != caller_pid {
+        if sched.task(child_slot).is_none() {
+            return KernelError::NoProcess.to_errno();
+        }
+        let ptable = crate::kernel::process::process_table();
+        let child_parent = ptable.with(child_slot, |p| p.parent_id).unwrap_or(0);
+        if child_parent != caller_pid {
             return KernelError::PermDenied.to_errno();
         }
-        child.limits.max_channels = max_channels;
-        child.limits.max_ports = max_ports;
-        child.limits.max_shmem = max_shmem;
-        child.limits.max_children = max_children;
+        ptable.with_mut(child_slot, |p| {
+            p.limits.max_channels = max_channels;
+            p.limits.max_ports = max_ports;
+            p.limits.max_shmem = max_shmem;
+            p.limits.max_children = max_children;
+        });
         0
     })
 }
@@ -717,7 +723,9 @@ pub(super) fn sys_exception_resume(child_pid: u32, action: u32) -> i64 {
         };
 
         // Verify parent relationship
-        if child.parent_id != caller_pid {
+        let child_parent = crate::kernel::process::process_table()
+            .with(child_slot, |p| p.parent_id).unwrap_or(0);
+        if child_parent != caller_pid {
             return KernelError::PermDenied.to_errno();
         }
 

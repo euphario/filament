@@ -8,6 +8,7 @@ use crate::kernel::traits::task::TaskId;
 use crate::kernel::task::{self, lifecycle};
 use crate::kernel::caps::Capabilities;
 use crate::kernel::elf;
+use crate::kernel::process;
 use crate::{kdebug, kwarn};
 
 // ============================================================================
@@ -42,11 +43,11 @@ impl ProcessOps for KernelProcessOps {
                 kdebug!("process_ops", "exit_lifecycle_error"; pid = task_id as u64, err = e as i64);
             }
 
-            // Set cleanup phase on the task
+            // Set cleanup phase via ProcessTable
             if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(task) = sched.task_mut(slot) {
-                    task.cleanup_phase = CleanupPhase::Phase1Enqueued;
-                }
+                process::process_table().with_mut(slot, |p| {
+                    p.cleanup_phase = CleanupPhase::Phase1Enqueued;
+                });
             }
 
             // Enqueue Phase 1 microtasks (lock ordering: SCHEDULER(10) → MICROTASK(15) is valid)
@@ -92,11 +93,11 @@ impl ProcessOps for KernelProcessOps {
         let (result, need_resched) = task::with_scheduler(|sched| {
             match lifecycle::kill(sched, target, killer) {
                 Ok(_info) => {
-                    // Set cleanup phase
+                    // Set cleanup phase via ProcessTable
                     if let Some(slot) = sched.slot_by_pid(target) {
-                        if let Some(task) = sched.task_mut(slot) {
-                            task.cleanup_phase = CleanupPhase::Phase1Enqueued;
-                        }
+                        process::process_table().with_mut(slot, |p| {
+                            p.cleanup_phase = CleanupPhase::Phase1Enqueued;
+                        });
                     }
 
                     // Enqueue Phase 1 microtasks
@@ -129,14 +130,15 @@ impl ProcessOps for KernelProcessOps {
     }
 
     fn get_capabilities(&self, task_id: TaskId) -> Result<u64, ProcessError> {
-        task::with_scheduler(|sched| {
-            if let Some(slot) = sched.slot_by_pid(task_id) {
-                if let Some(task) = sched.task(slot) {
-                    return Ok(task.get_capabilities_bits() as u64);
-                }
+        let slot = task::with_scheduler(|sched| sched.slot_by_pid(task_id));
+        match slot {
+            Some(s) => {
+                crate::kernel::process::process_table()
+                    .with(s, |p| Ok(p.get_capabilities_bits()))
+                    .unwrap_or(Err(ProcessError::NotFound))
             }
-            Err(ProcessError::NotFound)
-        })
+            None => Err(ProcessError::NotFound),
+        }
     }
 
     fn wait_child(&self, caller: TaskId, target_pid: i32, no_hang: bool) -> WaitChildResult {
@@ -167,95 +169,131 @@ impl ProcessOps for KernelProcessOps {
     }
 
     fn list_processes(&self, buf: &mut [abi::ProcessInfo], max: usize) -> usize {
-        task::with_scheduler(|sched| {
-            let mut count = 0usize;
+        // Collect scheduler-only data under scheduler lock
+        #[derive(Clone, Copy)]
+        struct SchedData { pid: u32, state: u8, cpu: u8, base_prio: u8, eff_prio: u8, cpu_time_ns: u64, slot: usize }
+        let mut sched_buf = [SchedData { pid: 0, state: 0, cpu: 0, base_prio: 0, eff_prio: 0, cpu_time_ns: 0, slot: 0 }; 64];
+        let actual_max = max.min(64);
 
-            for (slot, task_opt) in sched.iter_tasks() {
-                if crate::kernel::sched::is_idle_slot(slot) {
-                    continue;
-                }
-                if count >= max {
-                    break;
-                }
-                if let Some(task) = task_opt {
-                    let current_tick = crate::platform::current::timer::counter();
-                    buf[count] = abi::ProcessInfo {
-                        pid: task.id,
-                        ppid: task.parent_id,
-                        state: task.state().state_code(),
-                        liveness_status: task.get_liveness_status_code(),
-                        cpu: sched.task_cpu(slot).map_or(0xFF, |c| c as u8),
-                        base_priority: task.base_priority() as u8,
-                        effective_priority: task.effective_priority() as u8,
-                        _pad: [0; 3],
-                        activity_age_ms: task.get_activity_age_ms(current_tick),
-                        cpu_time_ns: task.cpu_time_ns(),
-                        name: task.name,
-                    };
-                    count += 1;
-                }
-            }
-
-            count
-        })
-    }
-
-    fn list_processes_ex(&self, buf: &mut [abi::ProcessInfoEx], max: usize) -> usize {
-        // Two-pass approach: scheduler lock first, then ObjectService (lock ordering safe)
-        let actual_max = max.min(buf.len());
-
-        // Temporary storage for slot indices (needed for Pass 2)
-        let mut slots = [0usize; 32];
-        let count;
-
-        // Pass 1: Fill all TCB fields under scheduler lock
-        count = task::with_scheduler(|sched| {
+        let count = task::with_scheduler(|sched| {
             let mut i = 0usize;
-            let current_tick = crate::platform::current::timer::counter();
-
             for (slot, task_opt) in sched.iter_tasks() {
-                if crate::kernel::sched::is_idle_slot(slot) {
-                    continue;
-                }
-                if i >= actual_max || i >= 32 {
-                    break;
-                }
+                if crate::kernel::sched::is_idle_slot(slot) { continue; }
+                if i >= actual_max { break; }
                 if let Some(task) = task_opt {
-                    slots[i] = slot;
-                    buf[i] = abi::ProcessInfoEx {
+                    sched_buf[i] = SchedData {
                         pid: task.id,
-                        ppid: task.parent_id,
                         state: task.state().state_code(),
                         cpu: sched.task_cpu(slot).map_or(0xFF, |c| c as u8),
-                        base_priority: task.base_priority() as u8,
-                        effective_priority: task.effective_priority() as u8,
-                        handle_count: 0, // filled in Pass 2
-                        channel_count: task.channel_count,
+                        base_prio: task.base_priority() as u8,
+                        eff_prio: task.effective_priority() as u8,
                         cpu_time_ns: task.cpu_time_ns(),
-                        name: task.name,
-                        port_count: task.port_count,
-                        shmem_count: task.shmem_count,
-                        heap_pages: task.total_heap_pages(),
-                        mapping_count: task.mapping_count(),
-                        num_children: task.num_children as u8,
-                        signal_pending: task.signal_count,
-                        liveness_status: task.get_liveness_status_code(),
-                        ipc_sent: task.ipc_sent.min(u16::MAX as u32) as u16,
-                        ipc_recv: task.ipc_recv.min(u16::MAX as u32) as u16,
-                        capabilities: task.get_capabilities_bits(),
-                        activity_age_ms: task.get_activity_age_ms(current_tick),
-                        context_switches: task.context_switches,
-                        page_faults: task.page_faults,
-                        total_syscalls: task.total_syscalls as u32,
+                        slot,
                     };
                     i += 1;
                 }
             }
-
             i
         });
 
-        // Pass 2: Fill handle_count from ObjectService (no scheduler lock held)
+        // Fill ProcessTable fields outside scheduler lock
+        let ptable = process::process_table();
+        let current_tick = crate::platform::current::timer::counter();
+        for i in 0..count {
+            let sd = &sched_buf[i];
+            let (ppid, liveness, age, name) = ptable.with(sd.slot, |p| {
+                (p.parent_id, p.get_liveness_status_code(), p.get_activity_age_ms(current_tick), p.name)
+            }).unwrap_or((0, 0, 0, [0u8; 16]));
+
+            buf[i] = abi::ProcessInfo {
+                pid: sd.pid,
+                ppid,
+                state: sd.state,
+                liveness_status: liveness,
+                cpu: sd.cpu,
+                base_priority: sd.base_prio,
+                effective_priority: sd.eff_prio,
+                _pad: [0; 3],
+                activity_age_ms: age,
+                cpu_time_ns: sd.cpu_time_ns,
+                name,
+            };
+        }
+
+        count
+    }
+
+    fn list_processes_ex(&self, buf: &mut [abi::ProcessInfoEx], max: usize) -> usize {
+        // Three-pass: scheduler → ProcessTable → ObjectService (lock ordering safe)
+        let actual_max = max.min(buf.len()).min(32);
+
+        let mut slots = [0usize; 32];
+        let count;
+
+        // Pass 1: Scheduler-only fields
+        count = task::with_scheduler(|sched| {
+            let mut i = 0usize;
+
+            for (slot, task_opt) in sched.iter_tasks() {
+                if crate::kernel::sched::is_idle_slot(slot) { continue; }
+                if i >= actual_max { break; }
+                if let Some(task) = task_opt {
+                    slots[i] = slot;
+                    buf[i] = abi::ProcessInfoEx {
+                        pid: task.id,
+                        ppid: 0, // filled in Pass 2
+                        state: task.state().state_code(),
+                        cpu: sched.task_cpu(slot).map_or(0xFF, |c| c as u8),
+                        base_priority: task.base_priority() as u8,
+                        effective_priority: task.effective_priority() as u8,
+                        handle_count: 0, // filled in Pass 3
+                        channel_count: 0, // filled in Pass 2
+                        cpu_time_ns: task.cpu_time_ns(),
+                        name: [0u8; 16], // filled in Pass 2
+                        port_count: 0,
+                        shmem_count: 0,
+                        heap_pages: task.total_heap_pages(),
+                        mapping_count: task.mapping_count(),
+                        num_children: 0,
+                        signal_pending: 0,
+                        liveness_status: 0,
+                        ipc_sent: 0,
+                        ipc_recv: 0,
+                        capabilities: 0,
+                        activity_age_ms: 0,
+                        context_switches: task.context_switches,
+                        page_faults: 0,
+                        total_syscalls: 0,
+                    };
+                    i += 1;
+                }
+            }
+            i
+        });
+
+        // Pass 2: ProcessTable fields
+        let ptable = process::process_table();
+        let current_tick = crate::platform::current::timer::counter();
+        for i in 0..count {
+            ptable.with(slots[i], |p| {
+                buf[i].ppid = p.parent_id;
+                buf[i].channel_count = p.channel_count;
+                buf[i].port_count = p.port_count;
+                buf[i].shmem_count = p.shmem_count;
+                buf[i].name = p.name;
+                buf[i].num_children = p.num_children as u8;
+                buf[i].signal_pending = p.signal_count;
+                buf[i].liveness_status = p.get_liveness_status_code();
+                buf[i].ipc_sent = p.ipc_sent.min(u16::MAX as u32) as u16;
+                buf[i].ipc_recv = p.ipc_recv.min(u16::MAX as u32) as u16;
+                buf[i].capabilities = p.get_capabilities_bits();
+                buf[i].activity_age_ms = p.get_activity_age_ms(current_tick);
+                buf[i].page_faults = p.page_faults;
+                buf[i].total_syscalls = p.total_syscalls as u32;
+            });
+        }
+
+        // Pass 3: ObjectService handle count
         let obj_svc = crate::kernel::object_service::object_service();
         for i in 0..count {
             buf[i].handle_count = obj_svc.handle_count(slots[i]);

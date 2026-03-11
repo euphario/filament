@@ -543,9 +543,10 @@ fn exec_kill_children(pid: TaskId) {
             None => return,
         };
 
-        // Snapshot children array
-        let children: [TaskId; MAX_CHILDREN] = sched.task(slot)
-            .map(|t| t.children)
+        // Snapshot children array from ProcessTable
+        let ptable = crate::kernel::process::process_table();
+        let children: [TaskId; MAX_CHILDREN] = ptable
+            .with(slot, |p| p.children)
             .unwrap_or([0; MAX_CHILDREN]);
 
         for child_pid in children {
@@ -558,9 +559,9 @@ fn exec_kill_children(pid: TaskId) {
                 Ok(_info) => {
                     // Set cleanup phase on the killed child
                     if let Some(child_slot) = sched.slot_by_pid(child_pid) {
-                        if let Some(child) = sched.task_mut(child_slot) {
-                            child.cleanup_phase = CleanupPhase::Phase1Enqueued;
-                        }
+                        ptable.with_mut(child_slot, |p| {
+                            p.cleanup_phase = CleanupPhase::Phase1Enqueued;
+                        });
                     }
                     if killed_count < MAX_CHILDREN {
                         killed_pids[killed_count] = child_pid;
@@ -579,9 +580,9 @@ fn exec_kill_children(pid: TaskId) {
         // Transition dying task: Phase1Enqueued → GracePeriod
         // 100ms grace period in hardware counter units
         let grace_until = crate::platform::current::timer::deadline_ns(100_000_000);
-        if let Some(task) = sched.task_mut(slot) {
-            task.cleanup_phase = CleanupPhase::GracePeriod { until: grace_until };
-        }
+        ptable.with_mut(slot, |p| {
+            p.cleanup_phase = CleanupPhase::GracePeriod { until: grace_until };
+        });
     });
 
     // Enqueue Phase 1 cleanup for each killed child (outside scheduler lock).
@@ -651,10 +652,13 @@ fn exec_evict(pid: TaskId, reason_val: u8) {
 fn exec_signal(target: TaskId, event: u32, value: u64) {
     let woken = crate::kernel::task::with_scheduler(|sched| {
         if let Some(slot) = sched.slot_by_pid(target) {
-            if let Some(task) = sched.task_mut(slot) {
+            if let Some(task) = sched.task(slot) {
                 // Only deliver to non-terminated tasks
                 if !task.is_terminated() {
-                    if !task.enqueue_signal(event, value) {
+                    let delivered = crate::kernel::process::process_table()
+                        .with_mut(slot, |p| p.enqueue_signal(event, value))
+                        .unwrap_or(false);
+                    if !delivered {
                         crate::kwarn!("signal", "queue_full"; target = target as u64, event = event as u64);
                     }
                 }

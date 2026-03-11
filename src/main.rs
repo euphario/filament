@@ -328,11 +328,7 @@ pub extern "C" fn kmain() -> ! {
                 kdebug!("kernel", "probed_spawned"; slot = slot);
                 klog::flush();
                 // Mark as probed process (for lifecycle/devd spawn trigger)
-                task::with_scheduler(|sched| {
-                    if let Some(task) = sched.task_mut(slot) {
-                        task.is_probed = true;
-                    }
-                });
+                kernel::process::process_table().with_mut(slot, |p| p.is_probed = true);
                 Some(slot)
             }
             Err(e) => {
@@ -609,9 +605,11 @@ pub extern "C" fn ttbr0_zero_diagnostic(caller_id: u64) {
             print_str_uart(task.state().name());
             print_str_uart("\r\n");
             print_str_uart("  Task name: ");
-            for &c in &task.name {
-                if c == 0 { break; }
-                uart::putc(c as char);
+            if let Some(name) = kernel::process::process_table().with(slot, |p| p.name) {
+                for &c in &name {
+                    if c == 0 { break; }
+                    uart::putc(c as char);
+                }
             }
             print_str_uart("\r\n");
             if let Some(ref addr_space) = task.address_space {
@@ -709,7 +707,10 @@ fn try_demand_page(far: u64) -> bool {
         let asid = task.address_space.as_ref().map(|a| a.get_asid()).unwrap_or(0);
         kernel::arch::tlb::invalidate_va_range(asid, page_virt, 1);
 
-        task.page_faults = task.page_faults.saturating_add(1);
+        // Track page fault count in ProcessTable
+        kernel::process::process_table().with_mut(slot, |p| {
+            p.page_faults = p.page_faults.saturating_add(1);
+        });
 
         Some(())
     })
@@ -742,18 +743,14 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
     }
 
     // Get current task info
-    let (pid, parent_id, task_name, is_init, exc_channel) = unsafe {
+    let slot = kernel::task::current_slot();
+    let pid = unsafe {
         let sched = kernel::task::scheduler();
-        let slot = kernel::task::current_slot();
-        if let Some(task) = sched.task(slot) {
-            let mut name = [0u8; 16];
-            let name_len = task.name.len().min(16);
-            name[..name_len].copy_from_slice(&task.name[..name_len]);
-            (task.id, task.parent_id, name, task.is_init, task.exception_channel)
-        } else {
-            (0, 0, [0u8; 16], false, None)
-        }
+        sched.task(slot).map(|t| t.id).unwrap_or(0)
     };
+    let (parent_id, task_name, is_init, exc_channel) = kernel::process::process_table()
+        .with(slot, |p| (p.parent_id, p.name, p.is_init, p.exception_channel))
+        .unwrap_or((0, [0u8; 16], false, None));
 
     // If task has an exception channel, freeze it instead of killing.
     // Send fault info on the channel so supervisor can inspect and decide.
@@ -786,9 +783,11 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
                 let current_slot = kernel::task::current_slot();
                 if let Some(task) = sched.task_mut(current_slot) {
                     let _ = task.freeze(esr, elr, far);
-                    // 5-second timeout — kill if parent doesn't respond
-                    task.frozen_deadline = crate::platform::current::timer::deadline_ns(5_000_000_000);
                 }
+                // 5-second timeout — kill if parent doesn't respond
+                kernel::process::process_table().with_mut(current_slot, |p| {
+                    p.frozen_deadline = crate::platform::current::timer::deadline_ns(5_000_000_000);
+                });
 
                 // Wake parent if blocked
                 if let Some(parent_slot) = sched.slot_by_pid(parent_task_id) {
@@ -957,9 +956,11 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
                                 print_str_uart(" pid=");
                                 print_hex_uart(other.id as u64);
                                 print_str_uart(" (");
-                                for &c in &other.name {
-                                    if c == 0 { break; }
-                                    uart::putc(c as char);
+                                if let Some(name) = kernel::process::process_table().with(s, |p| p.name) {
+                                    for &c in &name {
+                                        if c == 0 { break; }
+                                        uart::putc(c as char);
+                                    }
                                 }
                                 print_str_uart(")");
                                 break;
@@ -1104,8 +1105,10 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
                     print_str_uart("] pid=");
                     print_hex_uart(pid as u64);
                     print_str_uart(" '");
-                    for c in task.name.iter().take_while(|&&c| c != 0) {
-                        uart::putc(*c as char);
+                    if let Some(name) = kernel::process::process_table().with(slot_idx, |p| p.name) {
+                        for c in name.iter().take_while(|&&c| c != 0) {
+                            uart::putc(*c as char);
+                        }
                     }
                     print_str_uart("'\r\n");
 
@@ -1148,11 +1151,13 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
                 // Give devd ALL capabilities, high priority, and mark as init
                 unsafe {
                     if let Some(task) = kernel::task::scheduler().task_mut(slot) {
-                        task.set_capabilities(kernel::caps::Capabilities::ALL);
                         task.set_priority(kernel::task::Priority::Critical);  // devd is critical
-                        task.is_init = true;  // Mark as init for heartbeat watchdog
                     }
                 }
+                kernel::process::process_table().with_mut(slot, |p| {
+                    p.set_capabilities(kernel::caps::Capabilities::ALL);
+                    p.is_init = true;  // Mark as init for heartbeat watchdog
+                });
 
                 // Schedule devd
                 unsafe {
@@ -1222,9 +1227,12 @@ pub extern "C" fn exception_from_user_rust(esr: u64, elr: u64, far: u64) -> i64 
         // - freeing task slot
 
         // Kill all children of this task
-        for (_slot, task_opt) in sched.iter_tasks_mut() {
+        for (child_slot, task_opt) in sched.iter_tasks_mut() {
             if let Some(task) = task_opt {
-                if task.parent_id == pid && !task.is_terminated() {
+                let child_parent = kernel::process::process_table()
+                    .with(child_slot, |p| p.parent_id)
+                    .unwrap_or(0);
+                if child_parent == pid && !task.is_terminated() {
                     // Mark child as terminated
                     let _ = task.set_exiting(-9);  // SIGKILL
                 }
@@ -1397,14 +1405,12 @@ pub extern "C" fn exception_handler_rust(esr: u64, elr: u64, far: u64) -> ! {
     let slot = kernel::task::current_slot();
     print_str_uart("\r\n  SLOT: ");
     print_dec_uart(slot as u32);
-    let (pid, name) = unsafe {
-        let sched = kernel::task::scheduler();
-        if let Some(t) = sched.task(slot) {
-            (t.id, t.name)
-        } else {
-            (0, [0u8; 16])
-        }
-    };
+    let pid = kernel::task::with_scheduler(|sched| {
+        sched.task(slot).map(|t| t.id).unwrap_or(0)
+    });
+    let name = kernel::process::process_table()
+        .with(slot, |p| p.name)
+        .unwrap_or([0u8; 16]);
     print_str_uart("  PID: ");
     print_dec_uart(pid);
     print_str_uart(" (");
@@ -1534,13 +1540,15 @@ pub extern "C" fn recover_devd() {
             print_str_uart("\r\n");
 
             // Configure devd (same as boot)
-            unsafe {
-                if let Some(task) = kernel::task::scheduler().task_mut(slot) {
-                    task.set_capabilities(kernel::caps::Capabilities::ALL);
+            kernel::process::process_table().with_mut(slot, |p| {
+                p.set_capabilities(kernel::caps::Capabilities::ALL);
+                p.is_init = true;
+            });
+            kernel::task::with_scheduler(|sched| {
+                if let Some(task) = sched.task_mut(slot) {
                     task.set_priority(kernel::task::Priority::Critical);
-                    task.is_init = true;
                 }
-            }
+            });
 
             // Step 4: Request reschedule - scheduler will pick up devd
             // The task is in Ready state, scheduler will switch to it

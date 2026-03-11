@@ -37,6 +37,7 @@
 //! - Add waiting channel and liveness status to ps output
 
 use super::ipc::{Message, MessageHeader, MessageType, MAX_INLINE_PAYLOAD, waker, WakeReason};
+use super::process::process_table;
 use super::task::SleepReason;
 
 /// How often to check liveness (in timer IRQs, ~100/sec)
@@ -209,9 +210,11 @@ pub fn check_liveness(current_tick: u64) -> usize {
 
         for (slot, task_opt) in sched.iter_tasks_mut() {
             if let Some(task) = task_opt {
+                let pid = task.id;
+
                 // Reset liveness state for non-blocked tasks
                 if !task.is_blocked() {
-                    task.liveness_state.reset(task.id);
+                    process_table().with_mut(slot, |p| p.liveness_state.reset(pid));
                     continue;
                 }
 
@@ -219,7 +222,7 @@ pub fn check_liveness(current_tick: u64) -> usize {
                 // Scheduler's check_timeouts handles deadline enforcement
                 if task.state().is_waiting() {
                     // Just reset liveness - deadline is the enforcement
-                    task.liveness_state.reset(task.id);
+                    process_table().with_mut(slot, |p| p.liveness_state.reset(pid));
                     continue;
                 }
 
@@ -233,44 +236,53 @@ pub fn check_liveness(current_tick: u64) -> usize {
                 // Convert counter values to nanoseconds for comparison
                 let current_ns = counter_to_ns(current_tick);
 
-                match task.liveness_state {
+                // Read liveness state and last_activity_tick from ProcessTable
+                let (liveness, last_activity) = process_table().with(slot, |p| {
+                    (p.liveness_state, p.last_activity_tick)
+                }).unwrap_or((LivenessState::Normal, 0));
+
+                match liveness {
                     LivenessState::Normal => {
                         // Check if task has been sleeping too long
-                        let wait_started = task.last_activity_tick;
+                        let wait_started = last_activity;
                         let wait_started_ns = counter_to_ns(wait_started);
                         if wait_started > 0 && current_ns > wait_started_ns + PING_INTERVAL_NS {
                             // For EventLoop sleep (handle_wait), use implicit pong:
                             // Just wake the task - its next syscall proves it's alive
                             if matches!(sleep_reason, Some(SleepReason::EventLoop)) {
                                 // Mark slot to wake after iteration (can't call wake_task during iteration)
-                                // Set liveness state now while we have the task reference
+                                // Set liveness state now via ProcessTable
                                 let new_state = LivenessState::PingSent {
                                     channel: 0, // No channel - implicit pong via syscall
                                     sent_at: current_tick,
                                 };
-                                let _ = task.liveness_state.transition_to(new_state, task.id);
+                                process_table().with_mut(slot, |p| {
+                                    let _ = p.liveness_state.transition_to(new_state, pid);
+                                });
                                 if wake_count < wake_slots.len() {
                                     wake_slots[wake_count] = Some(slot);
                                     wake_count += 1;
                                 }
                                 actions += 1;
-                                crate::kdebug!("live", "wake"; pid = task.id as u64);
+                                crate::kdebug!("live", "wake"; pid = pid as u64);
                             } else if matches!(sleep_reason, Some(SleepReason::Irq)) {
                                 // For IRQ sleep, send ping message via channel if available
                                 if let Some(channel) = find_wait_channel(task) {
-                                    if send_ping(channel, task.id) {
+                                    if send_ping(channel, pid) {
                                         let new_state = LivenessState::PingSent {
                                             channel,
                                             sent_at: current_tick,
                                         };
-                                        let _ = task.liveness_state.transition_to(new_state, task.id);
+                                        process_table().with_mut(slot, |p| {
+                                            let _ = p.liveness_state.transition_to(new_state, pid);
+                                        });
                                         actions += 1;
-                                        crate::kdebug!("live", "ping"; pid = task.id as u64, ch = channel as u64);
+                                        crate::kdebug!("live", "ping"; pid = pid as u64, ch = channel as u64);
                                     } else {
-                                        crate::kwarn!("live", "ping_fail"; pid = task.id as u64, ch = channel as u64);
+                                        crate::kwarn!("live", "ping_fail"; pid = pid as u64, ch = channel as u64);
                                     }
                                 } else {
-                                    crate::kwarn!("live", "no_channel"; pid = task.id as u64);
+                                    crate::kwarn!("live", "no_channel"; pid = pid as u64);
                                 }
                             }
                         }
@@ -287,9 +299,11 @@ pub fn check_liveness(current_tick: u64) -> usize {
                                     channel: 0,
                                     closed_at: current_tick,
                                 };
-                                let _ = task.liveness_state.transition_to(new_state, task.id);
+                                process_table().with_mut(slot, |p| {
+                                    let _ = p.liveness_state.transition_to(new_state, pid);
+                                });
                                 actions += 1;
-                                crate::kwarn!("live", "unresponsive"; pid = task.id as u64);
+                                crate::kwarn!("live", "unresponsive"; pid = pid as u64);
                             } else {
                                 // Channel-based ping - close the channel
                                 close_channel_for_liveness(channel);
@@ -297,9 +311,11 @@ pub fn check_liveness(current_tick: u64) -> usize {
                                     channel,
                                     closed_at: current_tick,
                                 };
-                                let _ = task.liveness_state.transition_to(new_state, task.id);
+                                process_table().with_mut(slot, |p| {
+                                    let _ = p.liveness_state.transition_to(new_state, pid);
+                                });
                                 actions += 1;
-                                crate::kwarn!("live", "close_channel"; pid = task.id as u64, ch = channel as u64);
+                                crate::kwarn!("live", "close_channel"; pid = pid as u64, ch = channel as u64);
                             }
                         }
                     }
@@ -310,14 +326,13 @@ pub fn check_liveness(current_tick: u64) -> usize {
                         let closed_at_ns = counter_to_ns(closed_at);
                         if current_ns > closed_at_ns + KILL_TIMEOUT_NS {
                             // Task didn't recover - kill it
-                            let pid = task.id;
-                            let is_init = task.is_init;
+                            let is_init = process_table().with(slot, |p| p.is_init).unwrap_or(false);
                             crate::kerror!("live", "kill"; pid = pid as u64, init = is_init);
 
                             // Mark for termination (actual kill happens in scheduler)
                             crate::transition_or_evict!(task, set_exiting, -9); // SIGKILL equivalent
                             // Reset liveness state (transition logging handled by reset())
-                            task.liveness_state.reset(pid);
+                            process_table().with_mut(slot, |p| p.liveness_state.reset(pid));
                             actions += 1;
 
                             // Special case: if this is devd (init), trigger full recovery
@@ -422,11 +437,13 @@ fn close_channel_for_liveness(channel_id: u32) {
 
 /// Called when a task makes a syscall - reset liveness tracking
 /// This proves the task is alive and responsive
-pub fn task_activity(task: &mut super::task::Task, current_tick: u64) {
-    task.last_activity_tick = current_tick;
+pub fn task_activity(slot: usize, pid: u32, current_tick: u64) {
+    process_table().with_mut(slot, |p| {
+        p.last_activity_tick = current_tick;
 
-    // If we were tracking this task, it responded - reset to Normal
-    task.liveness_state.reset(task.id);
+        // If we were tracking this task, it responded - reset to Normal
+        p.liveness_state.reset(pid);
+    });
 }
 
 /// Check if a message is a liveness ping and auto-respond

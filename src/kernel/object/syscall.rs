@@ -28,6 +28,7 @@ use crate::kernel::ipc;
 use crate::kernel::ipc::waker;
 use crate::kernel::shmem;
 use crate::kernel::object_service::object_service;
+use crate::kernel::process::process_table;
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -230,10 +231,9 @@ pub fn read(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
 
     // Deferred actions after table lock release (lock ordering)
     if increment_ipc_recv {
-        task::with_scheduler(|sched| {
-            if let Some(t) = sched.current_task_mut() {
-                t.ipc_recv = t.ipc_recv.saturating_add(1);
-            }
+        let slot = task::current_slot();
+        process_table().with_mut(slot, |p| {
+            p.ipc_recv = p.ipc_recv.saturating_add(1);
         });
     }
 
@@ -385,10 +385,9 @@ pub fn write(handle_raw: u32, buf_ptr: u64, buf_len: usize) -> i64 {
                 PendingAction::ChannelWake(r) => {
                     // Deferred ipc_sent increment (lock ordering: scheduler after table)
                     if r.increment_ipc_sent {
-                        task::with_scheduler(|sched| {
-                            if let Some(t) = sched.current_task_mut() {
-                                t.ipc_sent = t.ipc_sent.saturating_add(1);
-                            }
+                        let slot = task::current_slot();
+                        process_table().with_mut(slot, |p| {
+                            p.ipc_sent = p.ipc_sent.saturating_add(1);
                         });
                     }
                     if let Some(peer) = r.peer {
@@ -581,14 +580,13 @@ pub fn close(handle_raw: u32) -> i64 {
         _ => Counter::None,
     };
 
-    // Update resource counters via scheduler
+    // Update resource counters via process table
     if !matches!(counter, Counter::None) {
-        task::with_scheduler(|sched| {
-            let Some(task) = sched.task_mut(slot) else { return };
+        process_table().with_mut(slot, |p| {
             match counter {
-                Counter::Channel => task.remove_channel(),
-                Counter::Port => task.remove_port(),
-                Counter::Shmem => task.remove_shmem(),
+                Counter::Channel => p.remove_channel(),
+                Counter::Port => p.remove_port(),
+                Counter::Shmem => p.remove_shmem(),
                 Counter::None => {}
             }
         });
@@ -991,10 +989,10 @@ fn open_bus_create(params_ptr: u64, params_len: usize) -> i64 {
     }
 
     // Check caller has CAP_BUS_CREATE
-    let has_cap = task::with_scheduler(|sched| {
+    let has_cap = {
         let slot = task::current_slot();
-        sched.task(slot).map(|t| t.has_capability(caps::Capabilities::BUS_CREATE)).unwrap_or(false)
-    });
+        process_table().with(slot, |p| p.has_capability(caps::Capabilities::BUS_CREATE)).unwrap_or(false)
+    };
     if !has_cap {
         return KernelError::PermDenied.to_errno();
     }
@@ -1897,21 +1895,19 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
 
     // Drain pending signals (task-level, bypasses per-watch filters)
     let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
-    task::with_scheduler(|sched| {
-        if let Some(task) = sched.task_mut(slot) {
-            while event_count < max_events {
-                if let Some(sig) = task.dequeue_signal() {
-                    events[event_count] = super::MuxEvent {
-                        handle: abi::Handle::INVALID,
-                        event: abi::mux_filter::SIGNAL,
-                        signal_event: sig.event as u16,
-                        _pad: 0,
-                        signal_value: sig.value,
-                    };
-                    event_count += 1;
-                } else {
-                    break;
-                }
+    process_table().with_mut(slot, |proc| {
+        while event_count < max_events {
+            if let Some(sig) = proc.dequeue_signal() {
+                events[event_count] = super::MuxEvent {
+                    handle: abi::Handle::INVALID,
+                    event: abi::mux_filter::SIGNAL,
+                    signal_event: sig.event as u16,
+                    _pad: 0,
+                    signal_value: sig.value,
+                };
+                event_count += 1;
+            } else {
+                break;
             }
         }
     });
@@ -2074,8 +2070,10 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                     crate::transition_or_evict!(task, set_running, cpu);
                 }
                 // Reset liveness — proves task is responsive (raw counter units)
-                task.record_activity(crate::platform::current::timer::counter());
-                task.reset_liveness_if_implicit_pong();
+                process_table().with_mut(slot, |p| {
+                    p.record_activity(crate::platform::current::timer::counter());
+                    p.reset_liveness_if_implicit_pong();
+                });
             }
         });
     }
@@ -2084,9 +2082,7 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
     uart::clear_blocked_if_pid(task_id);
 
     // Fast path: if wake delivered data, skip the O(n) re-poll
-    let wake_data = task::with_scheduler(|sched| {
-        sched.task_mut(slot).and_then(|t| t.take_wake_data())
-    });
+    let wake_data = process_table().with_mut(slot, |p| p.wake_data.take()).flatten();
     if let Some(wd) = wake_data {
         let mut events = [super::MuxEvent::empty(); super::MAX_MUX_EVENTS];
         events[0] = super::MuxEvent {
@@ -2099,21 +2095,19 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
         let mut event_count = 1usize;
         // Also drain pending signals alongside the WakeData event
         let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
-        task::with_scheduler(|sched| {
-            if let Some(task) = sched.task_mut(slot) {
-                while event_count < max_events {
-                    if let Some(sig) = task.dequeue_signal() {
-                        events[event_count] = super::MuxEvent {
-                            handle: abi::Handle::INVALID,
-                            event: abi::mux_filter::SIGNAL,
-                            signal_event: sig.event as u16,
-                            _pad: 0,
-                            signal_value: sig.value,
-                        };
-                        event_count += 1;
-                    } else {
-                        break;
-                    }
+        process_table().with_mut(slot, |proc| {
+            while event_count < max_events {
+                if let Some(sig) = proc.dequeue_signal() {
+                    events[event_count] = super::MuxEvent {
+                        handle: abi::Handle::INVALID,
+                        event: abi::mux_filter::SIGNAL,
+                        signal_event: sig.event as u16,
+                        _pad: 0,
+                        signal_value: sig.value,
+                    };
+                    event_count += 1;
+                } else {
+                    break;
                 }
             }
         });
@@ -2158,21 +2152,19 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
 
     // Drain pending signals after re-poll (same pattern as Phase 1)
     let max_events = buf_len / core::mem::size_of::<super::MuxEvent>();
-    task::with_scheduler(|sched| {
-        if let Some(task) = sched.task_mut(slot) {
-            while event_count < max_events {
-                if let Some(sig) = task.dequeue_signal() {
-                    events[event_count] = super::MuxEvent {
-                        handle: abi::Handle::INVALID,
-                        event: abi::mux_filter::SIGNAL,
-                        signal_event: sig.event as u16,
-                        _pad: 0,
-                        signal_value: sig.value,
-                    };
-                    event_count += 1;
-                } else {
-                    break;
-                }
+    process_table().with_mut(slot, |proc| {
+        while event_count < max_events {
+            if let Some(sig) = proc.dequeue_signal() {
+                events[event_count] = super::MuxEvent {
+                    handle: abi::Handle::INVALID,
+                    event: abi::mux_filter::SIGNAL,
+                    signal_event: sig.event as u16,
+                    _pad: 0,
+                    signal_value: sig.value,
+                };
+                event_count += 1;
+            } else {
+                break;
             }
         }
     });

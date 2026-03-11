@@ -1,558 +1,484 @@
-//! Process Management
+//! Process Metadata Table
 //!
-//! Manages processes in the microkernel. Each process has:
-//! - A unique ID (PID)
-//! - Its own address space (page tables)
-//! - A task structure for scheduling
-//! - State (running, ready, blocked, zombie)
+//! Owns all per-task metadata that is NOT scheduling state. This separates
+//! "who is this process" from "when does it run" — external code accesses
+//! ProcessInfo without touching the scheduler lock.
 //!
-//! For a Redox-style microkernel, most drivers run as processes.
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────┐
+//! │         Scheduler               │  Owns: state, context, priority,
+//! │    (task::with_scheduler)       │  trap_frame, address_space, stack
+//! └─────────────────────────────────┘
+//!
+//! ┌─────────────────────────────────┐
+//! │       ProcessTable              │  Owns: name, capabilities, signals,
+//! │    (process::with/with_mut)     │  resource counts, children, liveness
+//! └─────────────────────────────────┘
+//!
+//! ┌─────────────────────────────────┐
+//! │       ObjectService             │  Owns: handle tables (channels,
+//! │    (object_service::with_table) │  ports, timers, mux objects)
+//! └─────────────────────────────────┘
+//! ```
+//!
+//! # Lock Ordering
+//!
+//! ```text
+//! SCHEDULER(10) → PROCESS(12) → MICROTASK(15) → OBJ_SERVICE(20) → ...
+//! ```
+//!
+//! The scheduler NEVER needs process metadata during scheduling decisions.
+//! External code acquires the ProcessTable lock directly.
 
-#![allow(dead_code)]  // Some states and methods are for future use
-
-use super::addrspace::AddressSpace;
-use super::pmm;
-use crate::print_direct;
-use crate::kernel::arch::mmu;
-
-/// Process ID type
+/// Process ID type (legacy re-export — equivalent to TaskId)
 pub type Pid = u32;
 
-/// Process states
+use crate::kernel::lock::{SpinLock, lock_class};
+use crate::kernel::task::{TaskId, MAX_TASKS};
+use crate::kernel::task::tcb::{
+    WakeData, ResourceLimits, CleanupPhase, MAX_CHILDREN,
+    MAX_SIGNAL_SENDERS, MAX_PENDING_SIGNALS,
+};
+use crate::kernel::caps::Capabilities;
+use crate::kernel::liveness::LivenessState;
+use crate::kernel::storm::StormState;
+
+/// Process metadata — everything about a task that isn't scheduling state.
 ///
-/// State machine:
-/// ```text
-///   Creating ──────► Ready ◄────────► Running
-///                      │                 │
-///                      │                 │
-///                      ▼                 ▼
-///                   Blocked ──────────► Zombie ──────► Free
-///                      │                   ▲
-///                      └───────────────────┘
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ProcessState {
-    /// Process is being created
-    Creating = 0,
-    /// Process is ready to run
-    Ready = 1,
-    /// Process is currently running
-    Running = 2,
-    /// Process is waiting for something (IPC, I/O, etc.)
-    Blocked = 3,
-    /// Process has exited but not yet reaped
-    Zombie = 4,
-    /// Process slot is free
-    Free = 255,
+/// Created when a task spawns, destroyed when a task is reaped.
+pub struct ProcessInfo {
+    // ========================================================================
+    // Identity
+    // ========================================================================
+
+    /// Task ID (duplicated from Task for convenience — always matches)
+    pub id: TaskId,
+    /// Parent task ID (0 for orphan/init)
+    pub parent_id: TaskId,
+    /// Is this the init process (devd)?
+    pub is_init: bool,
+    /// Is this the probed process (boot-time bus discovery)?
+    pub is_probed: bool,
+    /// Task name for debugging
+    pub name: [u8; 16],
+
+    // ========================================================================
+    // Security
+    // ========================================================================
+
+    /// Capability set for this task
+    pub capabilities: Capabilities,
+    /// Signal allowlist — PIDs allowed to send signals
+    pub signal_allowlist: [u32; MAX_SIGNAL_SENDERS],
+    /// Number of entries in signal allowlist
+    pub signal_allowlist_count: usize,
+
+    // ========================================================================
+    // Resource accounting
+    // ========================================================================
+
+    /// Per-process resource limits
+    pub limits: ResourceLimits,
+    /// Per-process resource counters
+    pub channel_count: u16,
+    pub port_count: u16,
+    pub shmem_count: u16,
+
+    // ========================================================================
+    // Process tree
+    // ========================================================================
+
+    /// Child task IDs
+    pub children: [TaskId; MAX_CHILDREN],
+    /// Number of children
+    pub num_children: usize,
+
+    // ========================================================================
+    // Liveness & storm protection
+    // ========================================================================
+
+    /// Liveness tracking state
+    pub liveness_state: LivenessState,
+    /// Last activity tick (syscall made)
+    pub last_activity_tick: u64,
+    /// Storm protection state (syscall/wake rate limiting)
+    pub storm: StormState,
+
+    // ========================================================================
+    // Lifecycle
+    // ========================================================================
+
+    /// Cleanup phase for exiting tasks (microtask-driven)
+    pub cleanup_phase: CleanupPhase,
+
+    // ========================================================================
+    // Metrics
+    // ========================================================================
+
+    /// IPC messages sent by this task (saturating counter)
+    pub ipc_sent: u32,
+    /// IPC messages received by this task (saturating counter)
+    pub ipc_recv: u32,
+    /// Cumulative syscall count (saturating)
+    pub total_syscalls: u64,
+    /// Page faults handled for this task (demand paging)
+    pub page_faults: u32,
+
+    // ========================================================================
+    // Mux / wake fast path
+    // ========================================================================
+
+    /// Data delivered with the last wake (for Mux fast path)
+    pub wake_data: Option<WakeData>,
+
+    // ========================================================================
+    // Exception handling
+    // ========================================================================
+
+    /// Exception channel: if set, user faults freeze the task and deliver
+    /// fault info on this channel instead of killing. (parent_task_id, channel_id)
+    pub exception_channel: Option<(TaskId, u32)>,
+    /// Deadline (counter ticks) for frozen task timeout — kill if exceeded
+    pub frozen_deadline: u64,
+
+    // ========================================================================
+    // Signal queue
+    // ========================================================================
+
+    /// Per-task signal queue (fixed ring buffer)
+    pub signal_queue: [abi::PendingSignal; MAX_PENDING_SIGNALS],
+    pub signal_head: u8,  // next write position
+    pub signal_tail: u8,  // next read position
+    pub signal_count: u8, // current count
 }
 
-impl ProcessState {
-    /// Check if transition to new state is valid
-    pub fn can_transition_to(&self, new: &ProcessState) -> bool {
-        match (self, new) {
-            // Creating → Ready (after load complete)
-            (ProcessState::Creating, ProcessState::Ready) => true,
-
-            // Ready ↔ Running (scheduling)
-            (ProcessState::Ready, ProcessState::Running) => true,
-            (ProcessState::Running, ProcessState::Ready) => true,
-
-            // Running → Blocked (waiting for I/O, IPC, etc.)
-            (ProcessState::Running, ProcessState::Blocked) => true,
-            // Blocked → Ready (event arrived)
-            (ProcessState::Blocked, ProcessState::Ready) => true,
-
-            // Any active state → Zombie (exit/kill)
-            (ProcessState::Running, ProcessState::Zombie) => true,
-            (ProcessState::Ready, ProcessState::Zombie) => true,
-            (ProcessState::Blocked, ProcessState::Zombie) => true,
-
-            // Zombie → Free (reaped by parent)
-            (ProcessState::Zombie, ProcessState::Free) => true,
-
-            // Free → Creating (slot reused)
-            (ProcessState::Free, ProcessState::Creating) => true,
-
-            // All other transitions are invalid
-            _ => false,
-        }
-    }
-
-    /// Get state name for logging
-    pub fn name(&self) -> &'static str {
-        match self {
-            ProcessState::Creating => "Creating",
-            ProcessState::Ready => "Ready",
-            ProcessState::Running => "Running",
-            ProcessState::Blocked => "Blocked",
-            ProcessState::Zombie => "Zombie",
-            ProcessState::Free => "Free",
-        }
-    }
-}
-
-/// What a blocked process is waiting for
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockReason {
-    /// Not blocked
-    None,
-    /// Waiting to receive on a channel
-    IpcReceive(u32),  // channel_id
-    /// Waiting to send (queue full)
-    IpcSend(u32),     // channel_id
-    /// Waiting for a child to exit
-    WaitChild(Pid),
-    /// Sleeping for a duration
-    Sleep,
-}
-
-/// Saved user-mode context for returning to user space
-#[repr(C)]
-pub struct UserContext {
-    // General purpose registers
-    pub x: [u64; 31],  // x0-x30
-    pub sp: u64,       // Stack pointer (SP_EL0)
-    pub pc: u64,       // Program counter (ELR_EL1)
-    pub pstate: u64,   // Saved Program Status Register (SPSR_EL1)
-}
-
-impl UserContext {
-    pub const fn new() -> Self {
+impl ProcessInfo {
+    /// Create a new ProcessInfo with default values.
+    pub fn new(id: TaskId, parent_id: TaskId, name: [u8; 16], caps: Capabilities) -> Self {
         Self {
-            x: [0; 31],
-            sp: 0,
-            pc: 0,
-            pstate: 0,
+            id,
+            parent_id,
+            is_init: false,
+            is_probed: false,
+            name,
+            capabilities: caps,
+            signal_allowlist: [0; MAX_SIGNAL_SENDERS],
+            signal_allowlist_count: 0,
+            limits: ResourceLimits::default(),
+            channel_count: 0,
+            port_count: 0,
+            shmem_count: 0,
+            children: [0; MAX_CHILDREN],
+            num_children: 0,
+            liveness_state: LivenessState::Normal,
+            last_activity_tick: 0,
+            storm: StormState::new(),
+            cleanup_phase: CleanupPhase::None,
+            ipc_sent: 0,
+            ipc_recv: 0,
+            total_syscalls: 0,
+            page_faults: 0,
+            wake_data: None,
+            exception_channel: None,
+            frozen_deadline: 0,
+            signal_queue: [abi::PendingSignal { event: 0, value: 0 }; MAX_PENDING_SIGNALS],
+            signal_head: 0,
+            signal_tail: 0,
+            signal_count: 0,
         }
     }
 
-    /// Set up context for starting a user process
-    pub fn setup_for_user(&mut self, entry: u64, user_stack: u64) {
-        self.pc = entry;
-        self.sp = user_stack;
-        // PSTATE for EL0:
-        // - M[3:0] = 0b0000 (EL0t - EL0 using SP_EL0)
-        // - DAIF = 0 (interrupts enabled)
-        self.pstate = 0;
-    }
-}
-
-/// Process Control Block
-pub struct Process {
-    /// Process ID
-    pub pid: Pid,
-    /// Parent process ID
-    pub parent_pid: Pid,
-    /// Current state - private, use state() and transition methods
-    state: ProcessState,
-    /// Why the process is blocked (if state == Blocked)
-    pub block_reason: BlockReason,
-    /// Virtual address space
-    pub address_space: Option<AddressSpace>,
-    /// Saved user context
-    pub user_context: UserContext,
-    /// Kernel stack (for handling syscalls/exceptions)
-    pub kernel_stack: u64,
-    pub kernel_stack_size: usize,
-    /// Exit code (valid when state == Zombie)
-    pub exit_code: i32,
-    /// Process name
-    pub name: [u8; 32],
-}
-
-/// Kernel stack size per process (64KB)
-/// Must be large enough for syscall handlers that create large local variables
-const KERNEL_STACK_SIZE: usize = 64 * 1024;
-
-/// Maximum number of processes
-const MAX_PROCESSES: usize = 64;
-
-impl Process {
-    /// Get current state
-    pub fn state(&self) -> ProcessState { self.state }
-
-    /// Create a new process
-    pub fn new(pid: Pid, parent_pid: Pid, name: &str) -> Option<Self> {
-        // Allocate kernel stack
-        let stack_pages = (KERNEL_STACK_SIZE + 4095) / 4096;
-        let kernel_stack = pmm::alloc_pages(stack_pages)? as u64;
-
-        // Create address space
-        let address_space = AddressSpace::new();
-
-        // Copy name
-        let mut proc_name = [0u8; 32];
-        let name_bytes = name.as_bytes();
-        let copy_len = core::cmp::min(name_bytes.len(), 31);
-        proc_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
-
-        Some(Self {
-            pid,
-            parent_pid,
-            state: ProcessState::Creating,
-            block_reason: BlockReason::None,
-            address_space,
-            user_context: UserContext::new(),
-            kernel_stack,
-            kernel_stack_size: KERNEL_STACK_SIZE,
-            exit_code: 0,
-            name: proc_name,
-        })
-    }
-
-    /// Block the process waiting for IPC receive
-    pub fn block_on_receive(&mut self, channel_id: u32) {
-        self.state = ProcessState::Blocked;
-        self.block_reason = BlockReason::IpcReceive(channel_id);
-    }
-
-    /// Block the process waiting for IPC send (queue full)
-    pub fn block_on_send(&mut self, channel_id: u32) {
-        self.state = ProcessState::Blocked;
-        self.block_reason = BlockReason::IpcSend(channel_id);
-    }
-
-    /// Wake up a blocked process
-    pub fn wake(&mut self) {
-        if self.state == ProcessState::Blocked {
-            self.state = ProcessState::Ready;
-            self.block_reason = BlockReason::None;
-        }
-    }
-
-    /// Check if process is blocked on a specific channel for receive
-    pub fn is_blocked_on_receive(&self, channel_id: u32) -> bool {
-        self.state == ProcessState::Blocked &&
-        matches!(self.block_reason, BlockReason::IpcReceive(ch) if ch == channel_id)
-    }
-
-    /// Check if process is blocked on a specific channel for send
-    pub fn is_blocked_on_send(&self, channel_id: u32) -> bool {
-        self.state == ProcessState::Blocked &&
-        matches!(self.block_reason, BlockReason::IpcSend(ch) if ch == channel_id)
-    }
-
-    /// Get process name
+    /// Get task name as a string slice.
     pub fn name_str(&self) -> &str {
-        let len = self.name.iter().position(|&c| c == 0).unwrap_or(32);
+        let len = self.name.iter().position(|&c| c == 0).unwrap_or(16);
         core::str::from_utf8(&self.name[..len]).unwrap_or("???")
     }
 
-    /// Allocate user stack in process address space
-    pub fn alloc_user_stack(&mut self, size: usize) -> Option<u64> {
-        // OVERFLOW CHECK: Calculate pages safely
-        let pages = size.checked_add(4095)? / 4096;
-        let phys = pmm::alloc_pages(pages)? as u64;
+    // ========================================================================
+    // Resource counter methods
+    // ========================================================================
 
-        // Map at a high user address
-        let virt_base = 0x7FFF_F000_0000u64 - (pages as u64 * 4096);
+    pub fn can_create_channel(&self) -> bool {
+        self.channel_count < self.limits.max_channels
+    }
 
-        if let Some(ref mut addr_space) = self.address_space {
-            for i in 0..pages {
-                let virt = virt_base + (i as u64 * 4096);
-                let page_phys = phys + (i as u64 * 4096);
-                if !addr_space.map_page(virt, page_phys, true, false) {
-                    // Mapping failed - clean up
-                    pmm::free_pages(phys as usize, pages);
-                    return None;
-                }
+    pub fn add_channel(&mut self) {
+        self.channel_count = self.channel_count.saturating_add(1);
+    }
+
+    pub fn remove_channel(&mut self) {
+        self.channel_count = self.channel_count.saturating_sub(1);
+    }
+
+    pub fn can_create_port(&self) -> bool {
+        self.port_count < self.limits.max_ports
+    }
+
+    pub fn add_port(&mut self) {
+        self.port_count = self.port_count.saturating_add(1);
+    }
+
+    pub fn remove_port(&mut self) {
+        self.port_count = self.port_count.saturating_sub(1);
+    }
+
+    pub fn can_create_shmem(&self) -> bool {
+        self.shmem_count < self.limits.max_shmem
+    }
+
+    pub fn add_shmem(&mut self) {
+        self.shmem_count = self.shmem_count.saturating_add(1);
+    }
+
+    pub fn remove_shmem(&mut self) {
+        self.shmem_count = self.shmem_count.saturating_sub(1);
+    }
+
+    // ========================================================================
+    // Capability methods
+    // ========================================================================
+
+    pub fn has_capability(&self, cap: Capabilities) -> bool {
+        self.capabilities.has(cap)
+    }
+
+    pub fn get_capabilities_bits(&self) -> u64 {
+        self.capabilities.bits()
+    }
+
+    pub fn set_capabilities(&mut self, caps: Capabilities) {
+        self.capabilities = caps;
+    }
+
+    // ========================================================================
+    // Signal queue methods
+    // ========================================================================
+
+    /// Enqueue a signal into the task's signal queue.
+    ///
+    /// When the queue is full, coalesces by ORing event bits into the newest
+    /// entry. This ensures no event *type* is lost, though the value may be
+    /// from a different event. Returns true always (coalescing never fails).
+    pub fn enqueue_signal(&mut self, event: u32, value: u64) -> bool {
+        debug_assert!(event <= 0xFFFF, "signal event {:#x} exceeds u16 range for MuxEvent delivery", event);
+        if self.signal_count >= MAX_PENDING_SIGNALS as u8 {
+            // Coalesce: OR event bits into the newest (head-1) entry
+            let tail_idx = (self.signal_head + MAX_PENDING_SIGNALS as u8 - 1) % MAX_PENDING_SIGNALS as u8;
+            self.signal_queue[tail_idx as usize].event |= event;
+            return true;
+        }
+        self.signal_queue[self.signal_head as usize] = abi::PendingSignal { event, value };
+        self.signal_head = (self.signal_head + 1) % MAX_PENDING_SIGNALS as u8;
+        self.signal_count += 1;
+        true
+    }
+
+    /// Dequeue one signal. Returns None if empty.
+    pub fn dequeue_signal(&mut self) -> Option<abi::PendingSignal> {
+        if self.signal_count == 0 {
+            return None;
+        }
+        let sig = self.signal_queue[self.signal_tail as usize];
+        self.signal_tail = (self.signal_tail + 1) % MAX_PENDING_SIGNALS as u8;
+        self.signal_count -= 1;
+        Some(sig)
+    }
+
+    /// Check if there are pending signals.
+    pub fn has_pending_signals(&self) -> bool {
+        self.signal_count > 0
+    }
+
+    // ========================================================================
+    // Signal allowlist methods
+    // ========================================================================
+
+    pub fn can_receive_signal_from(&self, sender: TaskId) -> bool {
+        // Allow from parent always
+        if sender == self.parent_id {
+            return true;
+        }
+        // Check allowlist
+        for i in 0..self.signal_allowlist_count {
+            if self.signal_allowlist[i] == sender {
+                return true;
             }
         }
-
-        // Return top of stack (stack grows down)
-        Some(virt_base + (pages as u64 * 4096))
+        false
     }
 
-    /// Load a simple program into the process address space
-    /// Returns the entry point
-    pub fn load_program(&mut self, code: &[u8], load_addr: u64) -> Option<u64> {
-        // OVERFLOW CHECK: Calculate pages safely
-        let pages = code.len().checked_add(4095)? / 4096;
-        let phys = pmm::alloc_pages(pages)? as u64;
+    pub fn allow_signals_from(&mut self, sender: TaskId) {
+        if self.signal_allowlist_count < MAX_SIGNAL_SENDERS {
+            self.signal_allowlist[self.signal_allowlist_count] = sender;
+            self.signal_allowlist_count += 1;
+        }
+    }
 
-        // Copy program to physical memory (use TTBR1 virtual address)
-        unsafe {
-            let dest = mmu::phys_to_virt(phys) as *mut u8;
-            for (i, &byte) in code.iter().enumerate() {
-                core::ptr::write_volatile(dest.add(i), byte);
+    // ========================================================================
+    // Children methods
+    // ========================================================================
+
+    pub fn add_child(&mut self, child_id: TaskId) -> bool {
+        if self.num_children >= MAX_CHILDREN {
+            return false;
+        }
+        self.children[self.num_children] = child_id;
+        self.num_children += 1;
+        true
+    }
+
+    pub fn remove_child(&mut self, child_id: TaskId) {
+        for i in 0..self.num_children {
+            if self.children[i] == child_id {
+                // Swap with last
+                self.children[i] = self.children[self.num_children - 1];
+                self.children[self.num_children - 1] = 0;
+                self.num_children -= 1;
+                return;
             }
         }
+    }
 
-        // Map into user address space
-        if let Some(ref mut addr_space) = self.address_space {
-            for i in 0..pages {
-                let virt = load_addr + (i as u64 * 4096);
-                let page_phys = phys + (i as u64 * 4096);
-                // Code pages are readable and executable, not writable
-                if !addr_space.map_page(virt, page_phys, false, true) {
-                    pmm::free_pages(phys as usize, pages);
-                    return None;
-                }
-            }
+    // ========================================================================
+    // Activity / liveness
+    // ========================================================================
+
+    pub fn record_activity(&mut self, tick: u64) {
+        self.last_activity_tick = tick;
+    }
+
+    pub fn reset_liveness_if_implicit_pong(&mut self) {
+        if matches!(self.liveness_state, LivenessState::PingSent { .. }) {
+            self.liveness_state = LivenessState::Normal;
         }
-
-        Some(load_addr)
     }
 
-    /// Mark process as ready to run
-    pub fn make_ready(&mut self) {
-        self.state = ProcessState::Ready;
+    /// Record a syscall for storm protection and return action to take
+    #[inline]
+    pub fn record_storm_syscall(&mut self, tick: u64, config: &crate::kernel::storm::StormConfig) -> crate::kernel::storm::StormAction {
+        self.storm.record_syscall(tick, config)
     }
 
-    /// Terminate the process (any -> Zombie)
-    pub fn terminate(&mut self, exit_code: i32) {
-        self.state = ProcessState::Zombie;
-        self.exit_code = exit_code;
-    }
-
-    /// Mark as running
-    pub fn make_running(&mut self) {
-        self.state = ProcessState::Running;
-    }
-
-    /// Start running the process (switch to user mode)
-    /// # Safety
-    /// Must be called with interrupts properly configured
-    pub unsafe fn run(&mut self) -> ! {
-        self.make_running();
-
-        // Switch to process's address space
-        if let Some(ref addr_space) = self.address_space {
-            addr_space.activate();
+    /// Get activity age in milliseconds since last syscall.
+    #[inline]
+    pub fn get_activity_age_ms(&self, current_counter: u64) -> u32 {
+        if self.last_activity_tick == 0 {
+            0
+        } else {
+            let delta = current_counter.saturating_sub(self.last_activity_tick);
+            let freq = crate::platform::current::timer::frequency();
+            if freq == 0 { return 0; }
+            (delta * 1000 / freq) as u32
         }
+    }
 
-        // Jump to user mode
-        // This is done by setting up ELR_EL1 and SPSR_EL1, then doing eret
-        core::arch::asm!(
-            "msr elr_el1, {entry}",
-            "msr sp_el0, {sp}",
-            "msr spsr_el1, {pstate}",
-            "eret",
-            entry = in(reg) self.user_context.pc,
-            sp = in(reg) self.user_context.sp,
-            pstate = in(reg) self.user_context.pstate,
-            options(noreturn)
-        );
+    /// Get liveness status code for ABI
+    #[inline]
+    pub fn get_liveness_status_code(&self) -> u8 {
+        use abi::liveness_status;
+        match self.liveness_state {
+            LivenessState::Normal => liveness_status::NORMAL,
+            LivenessState::PingSent { .. } => liveness_status::PING_SENT,
+            LivenessState::ClosePending { .. } => liveness_status::CLOSE_PENDING,
+        }
+    }
+
+    /// Check if task can spawn another child
+    #[inline]
+    pub fn can_add_child(&self) -> bool {
+        (self.num_children as u16) < self.limits.max_children
+    }
+
+    /// Check if task has children
+    pub fn has_children(&self) -> bool {
+        self.num_children > 0
+    }
+
+    /// Reset per-task statistics counters to zero.
+    pub fn reset_stats(&mut self) {
+        self.ipc_sent = 0;
+        self.ipc_recv = 0;
+        self.total_syscalls = 0;
+        self.page_faults = 0;
     }
 }
 
-impl Drop for Process {
-    fn drop(&mut self) {
-        // Free kernel stack
-        // Note: kernel_stack_size is set during Process::new() with known-safe values
-        // Use saturating_add for defense in depth (won't overflow, just cap at max)
-        let pages = self.kernel_stack_size.saturating_add(4095) / 4096;
-        pmm::free_pages(self.kernel_stack as usize, pages);
-        // address_space is automatically dropped
-    }
-}
+// ============================================================================
+// ProcessTable — Global table with its own lock
+// ============================================================================
 
-/// Process table
+/// Global process metadata table.
+///
+/// Indexed by task slot (same slots as the scheduler). Lock class is PROCESS(12),
+/// between SCHEDULER(10) and MICROTASK(15).
 pub struct ProcessTable {
-    processes: [Option<Process>; MAX_PROCESSES],
-    next_pid: Pid,
-    current_pid: Option<Pid>,
+    entries: SpinLock<[Option<ProcessInfo>; MAX_TASKS]>,
 }
 
 impl ProcessTable {
-    pub const fn new() -> Self {
-        const NONE: Option<Process> = None;
+    const fn new() -> Self {
+        const NONE: Option<ProcessInfo> = None;
         Self {
-            processes: [NONE; MAX_PROCESSES],
-            next_pid: 1,  // PID 0 is reserved for idle/kernel
-            current_pid: None,
+            entries: SpinLock::new(lock_class::PROCESS, [NONE; MAX_TASKS]),
         }
     }
 
-    /// Create a new process
-    pub fn create(&mut self, parent_pid: Pid, name: &str) -> Option<Pid> {
-        // Find free slot
-        let slot = self.processes.iter().position(|p| p.is_none())?;
-
-        let pid = self.next_pid;
-        self.next_pid += 1;
-
-        self.processes[slot] = Process::new(pid, parent_pid, name);
-        if self.processes[slot].is_some() {
-            Some(pid)
-        } else {
-            None
-        }
+    /// Access process info by slot (read-only).
+    #[inline]
+    pub fn with<R, F: FnOnce(&ProcessInfo) -> R>(&self, slot: usize, f: F) -> Option<R> {
+        let guard = self.entries.lock();
+        guard[slot].as_ref().map(f)
     }
 
-    /// Get a process by PID
-    pub fn get(&self, pid: Pid) -> Option<&Process> {
-        self.processes.iter()
-            .flatten()
-            .find(|p| p.pid == pid)
+    /// Access process info by slot (mutable).
+    #[inline]
+    pub fn with_mut<R, F: FnOnce(&mut ProcessInfo) -> R>(&self, slot: usize, f: F) -> Option<R> {
+        let mut guard = self.entries.lock();
+        guard[slot].as_mut().map(f)
     }
 
-    /// Get a process mutably by PID
-    pub fn get_mut(&mut self, pid: Pid) -> Option<&mut Process> {
-        self.processes.iter_mut()
-            .flatten()
-            .find(|p| p.pid == pid)
+    /// Create ProcessInfo for a task slot.
+    pub fn create(&self, slot: usize, info: ProcessInfo) {
+        let mut guard = self.entries.lock();
+        guard[slot] = Some(info);
     }
 
-    /// Get current running process
-    pub fn current(&self) -> Option<&Process> {
-        self.current_pid.and_then(|pid| self.get(pid))
+    /// Destroy ProcessInfo when a task is reaped.
+    pub fn destroy(&self, slot: usize) {
+        let mut guard = self.entries.lock();
+        guard[slot] = None;
     }
 
-    /// Get current running process mutably
-    pub fn current_mut(&mut self) -> Option<&mut Process> {
-        let pid = self.current_pid?;
-        self.get_mut(pid)
-    }
-
-    /// Set current process
-    pub fn set_current(&mut self, pid: Pid) {
-        self.current_pid = Some(pid);
-    }
-
-    /// Terminate a process
-    pub fn terminate(&mut self, pid: Pid, exit_code: i32) {
-        if let Some(proc) = self.get_mut(pid) {
-            proc.terminate(exit_code);
-        }
-    }
-
-    /// Reap a zombie process (remove from table)
-    pub fn reap(&mut self, pid: Pid) -> Option<i32> {
-        let slot = self.processes.iter().position(|p| {
-            p.as_ref().map_or(false, |proc| proc.pid == pid && proc.state == ProcessState::Zombie)
-        })?;
-
-        let exit_code = self.processes[slot].as_ref()?.exit_code;
-        self.processes[slot] = None;
-        Some(exit_code)
-    }
-
-    /// Wake a process by PID
-    pub fn wake(&mut self, pid: Pid) -> bool {
-        if let Some(proc) = self.get_mut(pid) {
-            proc.wake();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Wake all processes blocked on a channel for receive
-    pub fn wake_receivers(&mut self, channel_id: u32) {
-        for proc in self.processes.iter_mut().flatten() {
-            if proc.is_blocked_on_receive(channel_id) {
-                proc.wake();
+    /// Iterate all occupied slots (read-only).
+    ///
+    /// Acquires the lock for the duration of the closure. The closure receives
+    /// an iterator of (slot, &ProcessInfo) pairs.
+    pub fn for_each<F: FnMut(usize, &ProcessInfo)>(&self, mut f: F) {
+        let guard = self.entries.lock();
+        for (slot, entry) in guard.iter().enumerate() {
+            if let Some(info) = entry {
+                f(slot, info);
             }
         }
     }
 
-    /// Wake all processes blocked on a channel for send
-    pub fn wake_senders(&mut self, channel_id: u32) {
-        for proc in self.processes.iter_mut().flatten() {
-            if proc.is_blocked_on_send(channel_id) {
-                proc.wake();
+    /// Iterate all occupied slots (mutable).
+    pub fn for_each_mut<F: FnMut(usize, &mut ProcessInfo)>(&self, mut f: F) {
+        let mut guard = self.entries.lock();
+        for (slot, entry) in guard.iter_mut().enumerate() {
+            if let Some(info) = entry {
+                f(slot, info);
             }
-        }
-    }
-
-    /// Print process table
-    pub fn print_info(&self) {
-        print_direct!("  Process table ({} max):\n", MAX_PROCESSES);
-        for proc in self.processes.iter().flatten() {
-            let state_str = match proc.state {
-                ProcessState::Creating => "creating",
-                ProcessState::Ready => "ready",
-                ProcessState::Running => "RUNNING",
-                ProcessState::Blocked => "waiting",
-                ProcessState::Zombie => "zombie",
-                ProcessState::Free => "free",
-            };
-            let marker = if Some(proc.pid) == self.current_pid { ">" } else { " " };
-            print_direct!("    {} [{}] {} ({})\n", marker, proc.pid, proc.name_str(), state_str);
-        }
-        if self.processes.iter().flatten().count() == 0 {
-            print_direct!("    (no processes)\n");
         }
     }
 }
 
-/// Global process table
-static mut PROCESS_TABLE: ProcessTable = ProcessTable::new();
+static PROCESS_TABLE: ProcessTable = ProcessTable::new();
 
-/// Get the global process table
-/// # Safety
-/// Must ensure proper synchronization
-pub(crate) unsafe fn process_table() -> &'static mut ProcessTable {
-    &mut *core::ptr::addr_of_mut!(PROCESS_TABLE)
-}
-
-/// A minimal "hello world" user program in AArch64 machine code
-/// This program does:
-///   mov x8, #1      ; syscall number = DebugWrite
-///   adr x0, msg     ; buffer address
-///   mov x1, #14     ; length
-///   svc #0          ; syscall
-///   mov x8, #0      ; syscall number = Exit
-///   mov x0, #0      ; exit code
-///   svc #0          ; syscall
-/// msg:
-///   .ascii "Hello, User!\n"
-const HELLO_USER_PROGRAM: &[u8] = &[
-    // mov x8, #1
-    0x28, 0x00, 0x80, 0xd2,
-    // adr x0, msg (offset to msg = 24 bytes)
-    0xc0, 0x00, 0x00, 0x10,
-    // mov x1, #14
-    0xc1, 0x01, 0x80, 0xd2,
-    // svc #0
-    0x01, 0x00, 0x00, 0xd4,
-    // mov x8, #0
-    0x08, 0x00, 0x80, 0xd2,
-    // mov x0, #0
-    0x00, 0x00, 0x80, 0xd2,
-    // svc #0
-    0x01, 0x00, 0x00, 0xd4,
-    // "Hello, User!\n\0"
-    0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x2c, 0x20, 0x55,
-    0x73, 0x65, 0x72, 0x21, 0x0a, 0x00,
-];
-
-/// Test process creation
-pub fn test() {
-    print_direct!("  Testing process creation...\n");
-
-    unsafe {
-        let ptable = process_table();
-
-        // Create a test process
-        if let Some(pid) = ptable.create(0, "test_proc") {
-            print_direct!("    Created process with PID {}\n", pid);
-
-            if let Some(proc) = ptable.get_mut(pid) {
-                // Allocate user stack (4KB)
-                if let Some(stack_top) = proc.alloc_user_stack(4096) {
-                    print_direct!("    Allocated user stack at 0x{:016x}\n", stack_top);
-                } else {
-                    print_direct!("    [!!] Failed to allocate user stack\n");
-                }
-
-                // Mark as ready
-                proc.make_ready();
-            }
-
-            ptable.print_info();
-
-            // Clean up - terminate and reap
-            ptable.terminate(pid, 0);
-            ptable.reap(pid);
-            print_direct!("    Process terminated and reaped\n");
-
-        } else {
-            print_direct!("    [!!] Failed to create process\n");
-        }
-    }
-
-    print_direct!("    [OK] Process structure test passed\n");
+/// Get the global process table.
+#[inline]
+pub fn process_table() -> &'static ProcessTable {
+    &PROCESS_TABLE
 }

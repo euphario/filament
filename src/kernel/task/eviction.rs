@@ -173,17 +173,27 @@ pub(crate) fn do_evict_task(task_id: TaskId, reason: EvictionReason) -> bool {
                 }
 
                 // Log the eviction with full context
+                let ptable = crate::kernel::process::process_table();
+                let pname = ptable.with(slot, |p| {
+                    let mut buf = [0u8; 16];
+                    buf.copy_from_slice(&p.name);
+                    buf
+                }).unwrap_or([0u8; 16]);
+                let pname_len = pname.iter().position(|&b| b == 0).unwrap_or(16);
+                let name_s = core::str::from_utf8(&pname[..pname_len]).unwrap_or("???");
+                let parent = ptable.with(slot, |p| p.parent_id).unwrap_or(0);
                 kerror!("evict", "evicting";
                     pid = task_id as u64,
-                    name = task.name_str(),
+                    name = name_s,
                     from_state = task.state().name(),
                     reason = reason_to_u8(reason) as u64,
-                    parent = task.parent_id as u64
+                    parent = parent as u64
                 );
 
                 // Safety net: if evicting init, set DEVD_LIVENESS_KILLED so
                 // the timer tick handler triggers recovery (respawn devd)
-                if task.is_init {
+                let is_init = ptable.with(slot, |p| p.is_init).unwrap_or(false);
+                if is_init {
                     crate::DEVD_LIVENESS_KILLED.store(true, core::sync::atomic::Ordering::SeqCst);
                     kerror!("evict", "init_evicted_recovery";
                         pid = task_id as u64

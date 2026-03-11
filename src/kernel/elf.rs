@@ -516,72 +516,67 @@ fn spawn_process(
         let heap_jitter = super::rng::random_offset(256 * 4096, 4096);
         task.heap_next = super::memory::USER_HEAP_START + heap_jitter;
 
-        // Set parent if specified
-        if parent_id != 0 {
-            task.set_parent(parent_id);
-        }
     }
 
-    // Set up parent-child relationship and handle capabilities
-    if parent_id != 0 {
-        // First pass: find parent's capabilities
-        let mut parent_caps = None;
-        for (_slot, task_opt) in sched.iter_tasks() {
-            if let Some(parent_task) = task_opt {
-                if parent_task.id == parent_id {
-                    parent_caps = Some(parent_task.capabilities);
-                    break;
-                }
-            }
-        }
-        // Second pass: add child to parent's children list
-        for (_slot, task_opt) in sched.iter_tasks_mut() {
-            if let Some(parent_task) = task_opt {
-                if parent_task.id == parent_id {
-                    let _ = parent_task.add_child(task_id);
-                    break;
-                }
-            }
-        }
-        // Find parent priority first (before mutable borrow for child)
-        let parent_priority = sched.iter_tasks()
-            .find_map(|(_, task_opt)| {
-                task_opt.as_ref()
-                    .filter(|t| t.id == parent_id)
-                    .map(|t| t.base_priority)
-            });
+    // Set up parent-child relationship and handle capabilities via ProcessTable
+    let ptable = super::process::process_table();
 
-        // Compute and apply child capabilities and priority
-        if let Some(p_caps) = parent_caps {
-            // Note: slot was just allocated, so task_mut should always succeed
-            let Some(child_task) = sched.task_mut(slot) else {
-                // Should never happen - task was just created
-                return Err(ElfError::OutOfMemory);
-            };
-            let final_caps = match explicit_caps {
-                Some(requested) => {
-                    // Explicit grant: use child_capabilities() for proper filtering
-                    super::caps::child_capabilities(p_caps, requested)
-                }
-                None => {
-                    // Legacy: inherit all parent capabilities
-                    p_caps
-                }
-            };
-            child_task.set_capabilities(final_caps);
+    // Create ProcessInfo for the new task
+    {
+        let mut name_buf = [0u8; 16];
+        let name_bytes = name.as_bytes();
+        let copy_len = name_bytes.len().min(16);
+        name_buf[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
-            // Inherit parent's priority (children of High priority tasks get High priority)
-            if let Some(prio) = parent_priority {
-                child_task.set_priority(prio);
+        let mut info = super::process::ProcessInfo::new(
+            task_id,
+            parent_id,
+            name_buf,
+            super::caps::Capabilities::NONE,
+        );
+
+        if parent_id != 0 {
+            // Get parent's capabilities and priority from ProcessTable and scheduler
+            let parent_caps = {
+                let parent_slot = sched.slot_by_pid(parent_id);
+                parent_slot.and_then(|ps| ptable.with(ps, |p| p.capabilities))
+            };
+            let parent_priority = sched.iter_tasks()
+                .find_map(|(_, task_opt)| {
+                    task_opt.as_ref()
+                        .filter(|t| t.id == parent_id)
+                        .map(|t| t.base_priority)
+                });
+
+            // Add child to parent's children list
+            if let Some(ps) = sched.slot_by_pid(parent_id) {
+                ptable.with_mut(ps, |p| { let _ = p.add_child(task_id); });
             }
+
+            // Compute child capabilities
+            if let Some(p_caps) = parent_caps {
+                let final_caps = match explicit_caps {
+                    Some(requested) => {
+                        super::caps::child_capabilities(p_caps, requested)
+                    }
+                    None => {
+                        p_caps
+                    }
+                };
+                info.set_capabilities(final_caps);
+
+                // Inherit parent's priority
+                if let Some(prio) = parent_priority {
+                    if let Some(child_task) = sched.task_mut(slot) {
+                        child_task.set_priority(prio);
+                    }
+                }
+            }
+        } else if let Some(caps) = explicit_caps {
+            info.set_capabilities(caps);
         }
-    } else if let Some(caps) = explicit_caps {
-        // No parent (kernel-spawned): apply explicit capabilities directly.
-        // Must be set under the scheduler lock before the task can be
-        // scheduled on another CPU (notify_ready already called above).
-        if let Some(child_task) = sched.task_mut(slot) {
-            child_task.set_capabilities(caps);
-        }
+
+        ptable.create(slot, info);
     }
 
         Ok((task_id, slot, elf_info))

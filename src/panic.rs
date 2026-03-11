@@ -76,14 +76,17 @@ fn panic(info: &PanicInfo) -> ! {
     let slot = crate::kernel::task::current_slot();
     let task_info = crate::kernel::task::try_with_scheduler(|sched| {
         if let Some(t) = sched.task(slot) {
-            (t.id, t.name)
+            t.id
         } else {
-            (0, [0u8; 16])
+            0
         }
     });
     println_direct!("    SLOT:    {}", slot);
-    if let Some((pid, name)) = task_info {
+    if let Some(pid) = task_info {
         println_direct!("    PID:     {}", pid);
+        let name: [u8; 16] = crate::kernel::process::process_table()
+            .with(slot, |p| p.name)
+            .unwrap_or([0u8; 16]);
         let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
         if name_len > 0 {
             if let Ok(s) = core::str::from_utf8(&name[..name_len]) {

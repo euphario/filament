@@ -508,10 +508,9 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
-        // Check limit via scheduler (separate from object table access)
-        let can_create = crate::kernel::task::with_scheduler(|sched| {
-            sched.task(slot).map(|t| t.can_create_port()).unwrap_or(false)
-        });
+        // Check limit via ProcessTable (separate from object table access)
+        let can_create = crate::kernel::process::process_table()
+            .with(slot, |p| p.can_create_port()).unwrap_or(false);
 
         if !can_create {
             return Err(KernelError::OutOfHandles);
@@ -546,12 +545,9 @@ impl ObjectService {
         // Drop table lock before scheduler access
         drop(guard);
 
-        // Update limit counter via scheduler
-        crate::kernel::task::with_scheduler(|sched| {
-            if let Some(task) = sched.task_mut(slot) {
-                task.add_port();
-            }
-        });
+        // Update limit counter via ProcessTable
+        crate::kernel::process::process_table()
+            .with_mut(slot, |p| p.add_port());
 
         Ok(handle)
     }
@@ -602,12 +598,9 @@ impl ObjectService {
                 match table.alloc(ObjectType::Channel, ch_obj) {
                     Some(ch_handle) => {
                         drop(guard);
-                        // Update limit counter via scheduler
-                        crate::kernel::task::with_scheduler(|sched| {
-                            if let Some(task) = sched.task_mut(slot) {
-                                task.add_channel();
-                            }
-                        });
+                        // Update limit counter via ProcessTable
+                        crate::kernel::process::process_table()
+                            .with_mut(slot, |p| p.add_channel());
                         Ok((ReadAttempt::Success(8), Some((ch_handle, client_pid))))
                     }
                     None => {
@@ -633,10 +626,9 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
-        // Per-process limit check via scheduler
-        let can_create = crate::kernel::task::with_scheduler(|sched| {
-            sched.task(slot).map(|t| t.can_create_channel()).unwrap_or(false)
-        });
+        // Per-process limit check via ProcessTable
+        let can_create = crate::kernel::process::process_table()
+            .with(slot, |p| p.can_create_channel()).unwrap_or(false);
         if !can_create {
             return Err(KernelError::OutOfHandles);
         }
@@ -681,13 +673,9 @@ impl ObjectService {
 
         drop(guard);
 
-        // Track resource usage via scheduler
-        crate::kernel::task::with_scheduler(|sched| {
-            if let Some(task) = sched.task_mut(slot) {
-                task.add_channel();
-                task.add_channel();
-            }
-        });
+        // Track resource usage via ProcessTable
+        crate::kernel::process::process_table()
+            .with_mut(slot, |p| { p.add_channel(); p.add_channel(); });
 
         Ok((handle_a, handle_b))
     }
@@ -703,10 +691,9 @@ impl ObjectService {
 
         let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
-        // Per-process limit check via scheduler
-        let can_create = crate::kernel::task::with_scheduler(|sched| {
-            sched.task(slot).map(|t| t.can_create_channel()).unwrap_or(false)
-        });
+        // Per-process limit check via ProcessTable
+        let can_create = crate::kernel::process::process_table()
+            .with(slot, |p| p.can_create_channel()).unwrap_or(false);
         if !can_create {
             return Err(KernelError::OutOfHandles);
         }
@@ -771,12 +758,9 @@ impl ObjectService {
 
         drop(caller_guard);
 
-        // Track resource usage via scheduler
-        crate::kernel::task::with_scheduler(|sched| {
-            if let Some(task) = sched.task_mut(slot) {
-                task.add_channel();
-            }
-        });
+        // Track resource usage via ProcessTable
+        crate::kernel::process::process_table()
+            .with_mut(slot, |p| p.add_channel());
 
         Ok(handle)
     }
@@ -848,9 +832,8 @@ impl ObjectService {
         let slot = slot_from_task_id(task_id).ok_or(KernelError::NoProcess)?;
 
         // Check per-task shmem limit
-        let can_create = crate::kernel::task::with_scheduler(|sched| {
-            sched.task(slot).map(|t| t.can_create_shmem()).unwrap_or(false)
-        });
+        let can_create = crate::kernel::process::process_table()
+            .with(slot, |p| p.can_create_shmem()).unwrap_or(false);
 
         if !can_create {
             return Err(KernelError::OutOfHandles);
@@ -884,11 +867,8 @@ impl ObjectService {
         drop(guard);
 
         if result.is_ok() {
-            crate::kernel::task::with_scheduler(|sched| {
-                if let Some(task) = sched.task_mut(slot) {
-                    task.add_shmem();
-                }
-            });
+            crate::kernel::process::process_table()
+                .with_mut(slot, |p| p.add_shmem());
         }
 
         result

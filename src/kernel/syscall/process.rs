@@ -25,6 +25,7 @@ use super::super::syscall_ctx_impl::create_syscall_context;
 use super::super::traits::syscall_ctx::SyscallContext;
 use super::uaccess_to_errno;
 use crate::kernel::error::KernelError;
+use crate::kernel::process;
 
 /// Wait flags
 pub const WNOHANG: u32 = 1;  // Don't block if no child has exited
@@ -158,10 +159,10 @@ pub(super) fn sys_exec_with_mailbox(path_ptr: u64, path_len: usize, capabilities
     };
 
     // Check per-task children limit
-    let can_spawn = crate::kernel::task::with_scheduler(|sched| {
-        let slot = crate::kernel::task::current_slot();
-        sched.task(slot).map(|t| t.can_add_child()).unwrap_or(false)
-    });
+    let slot = crate::kernel::task::current_slot();
+    let can_spawn = process::process_table()
+        .with(slot, |p| p.can_add_child())
+        .unwrap_or(false);
 
     if !can_spawn {
         return KernelError::OutOfHandles.to_errno();
@@ -374,18 +375,27 @@ pub(super) fn sys_signal(target_pid: u32, event: u32, value: u64) -> i64 {
 
     let caller_pid = super::current_pid();
 
-    // Validate target exists and is allowed to receive signals from caller
-    let allowed = task::with_scheduler(|sched| {
+    // Validate target exists and is not terminated
+    let target_slot = task::with_scheduler(|sched| {
         if let Some(slot) = sched.slot_by_pid(target_pid) {
             if let Some(target) = sched.task(slot) {
-                if target.is_terminated() {
-                    return false;
+                if !target.is_terminated() {
+                    return Some(slot);
                 }
-                return target.can_receive_signal_from(caller_pid);
             }
         }
-        false
+        None
     });
+
+    let target_slot = match target_slot {
+        Some(s) => s,
+        None => return KernelError::PermDenied.to_errno(),
+    };
+
+    // Check signal permission via ProcessTable
+    let allowed = process::process_table()
+        .with(target_slot, |p| p.can_receive_signal_from(caller_pid))
+        .unwrap_or(false);
 
     if !allowed {
         return KernelError::PermDenied.to_errno();
@@ -425,31 +435,40 @@ pub(super) fn sys_signal_peek(target_pid: u32, buf_ptr: u64, max_count: usize) -
     let mut sig_buf = [abi::PendingSignal { event: 0, value: 0 }; MAX_STACK_SIGNALS];
     let actual_max = max_count.min(MAX_STACK_SIGNALS);
 
-    let result: Result<usize, i64> = task::with_scheduler(|sched| {
+    // Get slot and check terminated under scheduler lock
+    let target_slot: Result<usize, i64> = task::with_scheduler(|sched| {
         let slot = sched.slot_by_pid(target_pid).ok_or(KernelError::NoProcess.to_errno())?;
         let target = sched.task(slot).ok_or(KernelError::NoProcess.to_errno())?;
-
         if target.is_terminated() {
             return Err(KernelError::NoProcess.to_errno());
         }
-
-        // Permission: caller is parent, or caller==target, or caller has CAP_ADMIN
-        let allowed = caller_pid == target_pid
-            || target.parent_id == caller_pid
-            || target.can_receive_signal_from(caller_pid);
-        if !allowed {
-            return Err(KernelError::PermDenied.to_errno());
-        }
-
-        // Copy to stack buffer under lock
-        let count = (target.signal_count as usize).min(actual_max);
-        for i in 0..count {
-            let idx = ((target.signal_tail as usize) + i) % crate::kernel::task::tcb::MAX_PENDING_SIGNALS;
-            sig_buf[i] = target.signal_queue[idx];
-        }
-
-        Ok(count)
+        Ok(slot)
     });
+
+    let target_slot = match target_slot {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+
+    // Check permission and copy signals via ProcessTable
+    let result: Result<usize, i64> = process::process_table()
+        .with(target_slot, |p| {
+            let allowed = caller_pid == target_pid
+                || p.parent_id == caller_pid
+                || p.can_receive_signal_from(caller_pid);
+            if !allowed {
+                return Err(KernelError::PermDenied.to_errno());
+            }
+
+            let count = (p.signal_count as usize).min(actual_max);
+            for i in 0..count {
+                let idx = ((p.signal_tail as usize) + i) % crate::kernel::task::tcb::MAX_PENDING_SIGNALS;
+                sig_buf[i] = p.signal_queue[idx];
+            }
+
+            Ok(count)
+        })
+        .unwrap_or(Err(KernelError::NoProcess.to_errno()));
 
     // Copy to userspace outside scheduler lock
     match result {
@@ -480,34 +499,40 @@ pub(super) fn sys_signal_flush(target_pid: u32) -> i64 {
 
     let caller_pid = super::current_pid();
 
-    task::with_scheduler(|sched| {
+    // Check terminated under scheduler lock
+    let target_slot = task::with_scheduler(|sched| {
         let slot = match sched.slot_by_pid(target_pid) {
             Some(s) => s,
-            None => return KernelError::NoProcess.to_errno(),
+            None => return Err(KernelError::NoProcess.to_errno()),
         };
-        let target = match sched.task_mut(slot) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.to_errno(),
-        };
-
-        if target.is_terminated() {
-            return KernelError::NoProcess.to_errno();
+        match sched.task(slot) {
+            Some(t) if !t.is_terminated() => Ok(slot),
+            _ => Err(KernelError::NoProcess.to_errno()),
         }
+    });
 
-        // Permission: caller is parent, or caller==target, or caller has CAP_ADMIN
-        let allowed = caller_pid == target_pid
-            || target.parent_id == caller_pid
-            || target.can_receive_signal_from(caller_pid);
-        if !allowed {
-            return KernelError::PermDenied.to_errno();
-        }
+    let target_slot = match target_slot {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
 
-        let flushed = target.signal_count as i64;
-        target.signal_head = 0;
-        target.signal_tail = 0;
-        target.signal_count = 0;
-        flushed
-    })
+    // Check permission and flush via ProcessTable
+    process::process_table()
+        .with_mut(target_slot, |p| {
+            let allowed = caller_pid == target_pid
+                || p.parent_id == caller_pid
+                || p.can_receive_signal_from(caller_pid);
+            if !allowed {
+                return KernelError::PermDenied.to_errno();
+            }
+
+            let flushed = p.signal_count as i64;
+            p.signal_head = 0;
+            p.signal_tail = 0;
+            p.signal_count = 0;
+            flushed
+        })
+        .unwrap_or(KernelError::NoProcess.to_errno())
 }
 
 /// Reset per-task statistics counters
@@ -518,33 +543,32 @@ pub(super) fn sys_reset_stats(target_pid: u32) -> i64 {
 
     let caller_pid = super::current_pid();
 
-    task::with_scheduler(|sched| {
-        if target_pid == 0 {
-            // Reset all — only allowed for tasks with CAP_ADMIN or as a convenience for any caller
-            // (ps -r is a diagnostic tool, not a security boundary)
-            for (_slot, task_opt) in sched.iter_tasks_mut() {
-                if let Some(t) = task_opt {
-                    t.reset_stats();
-                }
+    if target_pid == 0 {
+        // Reset all — only allowed for tasks with CAP_ADMIN or as a convenience for any caller
+        // (ps -r is a diagnostic tool, not a security boundary)
+        process::process_table().for_each_mut(|_slot, p| {
+            p.reset_stats();
+        });
+        return 0;
+    }
+
+    let target_slot = task::with_scheduler(|sched| {
+        sched.slot_by_pid(target_pid)
+    });
+
+    let target_slot = match target_slot {
+        Some(s) => s,
+        None => return KernelError::NoProcess.to_errno(),
+    };
+
+    process::process_table()
+        .with_mut(target_slot, |p| {
+            // Permission: caller is parent, caller==target
+            if caller_pid != target_pid && p.parent_id != caller_pid {
+                return KernelError::PermDenied.to_errno();
             }
-            return 0;
-        }
-
-        let slot = match sched.slot_by_pid(target_pid) {
-            Some(s) => s,
-            None => return KernelError::NoProcess.to_errno(),
-        };
-        let target = match sched.task_mut(slot) {
-            Some(t) => t,
-            None => return KernelError::NoProcess.to_errno(),
-        };
-
-        // Permission: caller is parent, caller==target
-        if caller_pid != target_pid && target.parent_id != caller_pid {
-            return KernelError::PermDenied.to_errno();
-        }
-
-        target.reset_stats();
-        0
-    })
+            p.reset_stats();
+            0
+        })
+        .unwrap_or(KernelError::NoProcess.to_errno())
 }

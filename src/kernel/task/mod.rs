@@ -119,6 +119,7 @@ pub use tcb::{
 };
 
 use crate::{kerror, print_direct};
+use crate::kernel::process::process_table;
 
 // ============================================================================
 // Error Handling Macros for State Transitions
@@ -238,13 +239,10 @@ impl Scheduler {
     /// This allows EventLoop to poll ProcessObjects and see child exits.
     /// Called during task termination to notify parent.
     pub(crate) fn wake_parent_if_sleeping(&mut self, slot_idx: usize) {
-        let parent_id = match self.tasks[slot_idx].as_ref() {
-            Some(task) => task.parent_id,
-            None => return,
+        let parent_id = match process_table().with(slot_idx, |p| p.parent_id) {
+            Some(pid) if pid != 0 => pid,
+            _ => return,
         };
-        if parent_id == 0 {
-            return;
-        }
         if let Some(parent_slot) = self.slot_by_pid(parent_id) {
             self.wake_task(parent_slot);
         }
@@ -479,7 +477,9 @@ impl Scheduler {
             crate::transition_or_log!(task, wake);
 
             // Reset liveness state - task responded/became active
-            task.liveness_state = super::liveness::LivenessState::Normal;
+            process_table().with_mut(slot, |p| {
+                p.liveness_state = super::liveness::LivenessState::Normal;
+            });
 
             // NOTE: Do NOT clear kernel_stack_owner here. If the task is
             // still mid-context-switch on another CPU, clearing would allow
@@ -619,7 +619,8 @@ impl Scheduler {
                 if let Some(ref mut task) = self.tasks[slot] {
                     if task.is_blocked() {
                         crate::transition_or_log!(task, wake);
-                        task.liveness_state.reset(task.id);
+                        let tid = task.id;
+                        process_table().with_mut(slot, |p| p.liveness_state.reset(tid));
                         // kernel_stack_owner cleared by pending_stack_release handler
                         task.set_on_runq(true);
                         self.policy.on_task_ready(slot, task.effective_priority());
@@ -659,7 +660,7 @@ impl Scheduler {
     }
 
     /// Add a user task to the scheduler
-    pub fn add_user_task(&mut self, name: &str) -> Option<(TaskId, usize)> {
+    pub fn add_user_task(&mut self, _name: &str) -> Option<(TaskId, usize)> {
         // Skip slots 0..MAX_CPUS reserved for per-CPU idle tasks
         let slot = self.tasks.iter().enumerate()
             .position(|(i, t)| i >= super::percpu::MAX_CPUS && t.is_none())?;
@@ -667,7 +668,7 @@ impl Scheduler {
         // Generate PID with current generation for this slot
         let id = self.make_pid(slot);
 
-        self.tasks[slot] = Task::new_user(id, name);
+        self.tasks[slot] = Task::new_user(id);
         if self.tasks[slot].is_some() {
             self.policy.assign_task_round_robin(slot);
             self.notify_ready(slot);
@@ -780,7 +781,7 @@ impl Scheduler {
         if let Some(ref mut task) = self.tasks[slot] {
             crate::transition_or_evict!(task, set_exiting, exit_code);
             // Clear is_init flag so new devd can be the init
-            task.is_init = false;
+            process_table().with_mut(slot, |p| p.is_init = false);
         }
         self.policy.on_task_exit(slot);
     }
@@ -856,33 +857,40 @@ impl Scheduler {
                 continue;
             }
 
-            let Some(ref mut task) = self.tasks[slot_idx] else { continue };
+            let Some(ref task) = self.tasks[slot_idx] else { continue };
             let pid = task.id;
+            let task_state = *task.state();
 
-            match (*task.state(), task.cleanup_phase) {
+            // Read cleanup_phase and parent_id from ProcessTable
+            let (cleanup, parent_id) = match process_table().with(slot_idx, |p| (p.cleanup_phase, p.parent_id)) {
+                Some(pair) => pair,
+                None => continue,
+            };
+
+            match (task_state, cleanup) {
                 // Exiting task whose Phase 1 wasn't enqueued yet
                 (TaskState::Exiting { .. }, CleanupPhase::None) => {
-                    task.cleanup_phase = CleanupPhase::Phase1Enqueued;
+                    process_table().with_mut(slot_idx, |p| p.cleanup_phase = CleanupPhase::Phase1Enqueued);
                     let _ = microtask::enqueue(MicroTask::IpcCleanup { pid });
                     let _ = microtask::enqueue(MicroTask::KillChildren { pid });
                 }
 
                 // Grace period expired → enqueue Phase 2 (parent notification + final cleanup)
                 (_, CleanupPhase::GracePeriod { until }) if current_counter >= until => {
-                    task.cleanup_phase = CleanupPhase::Phase2Enqueued;
+                    process_table().with_mut(slot_idx, |p| p.cleanup_phase = CleanupPhase::Phase2Enqueued);
                     // Parent notification — guaranteed after Phase 1 cleanup.
                     // By this point: IPC closed, bus handles released, children killed.
-                    if task.parent_id != 0 {
-                        let code = task.state().exit_code().unwrap_or(-1);
+                    if parent_id != 0 {
+                        let code = task_state.exit_code().unwrap_or(-1);
                         // CHILD_EXIT signal: value = pid<<32 | (exit_code as u32)
                         let value = ((pid as u64) << 32) | (code as u32 as u64);
                         let _ = microtask::enqueue(MicroTask::Signal {
-                            target: task.parent_id,
+                            target: parent_id,
                             event: abi::signal_event::CHILD_EXIT,
                             value,
                         });
                         let _ = microtask::enqueue(MicroTask::NotifyParentExit {
-                            parent_id: task.parent_id,
+                            parent_id,
                             child_pid: pid,
                             code,
                         });
@@ -893,21 +901,21 @@ impl Scheduler {
 
                 // Evicting task: record for second pass (needs wake_parent_if_sleeping)
                 (TaskState::Evicting { .. }, CleanupPhase::None) => {
-                    task.cleanup_phase = CleanupPhase::Phase2Enqueued;
+                    process_table().with_mut(slot_idx, |p| p.cleanup_phase = CleanupPhase::Phase2Enqueued);
                     if evicting_count < evicting_slots.len() {
                         evicting_slots[evicting_count] = slot_idx;
                         evicting_count += 1;
                     }
                     // Parent notification for evicted tasks
-                    if task.parent_id != 0 {
+                    if parent_id != 0 {
                         let value = ((pid as u64) << 32) | ((-1i32) as u32 as u64);
                         let _ = microtask::enqueue(MicroTask::Signal {
-                            target: task.parent_id,
+                            target: parent_id,
                             event: abi::signal_event::CHILD_EXIT,
                             value,
                         });
                         let _ = microtask::enqueue(MicroTask::NotifyParentExit {
-                            parent_id: task.parent_id,
+                            parent_id,
                             child_pid: pid,
                             code: -1,
                         });
@@ -1021,7 +1029,17 @@ impl Scheduler {
                     TaskState::Dead => "dead",
                 };
                 let marker = if i == current { ">" } else { " " };
-                print_direct!("    {} [{}] {} ({})\n", marker, task.id, task.name_str(), state_str);
+                let name = process_table().with(i, |p| {
+                    let mut buf = [0u8; 16];
+                    let len = p.name.iter().position(|&c| c == 0).unwrap_or(16);
+                    buf[..len].copy_from_slice(&p.name[..len]);
+                    (buf, len)
+                });
+                let name_str = match &name {
+                    Some((buf, len)) => core::str::from_utf8(&buf[..*len]).unwrap_or("???"),
+                    None => "???",
+                };
+                print_direct!("    {} [{}] {} ({})\n", marker, task.id, name_str, state_str);
             }
         }
     }
