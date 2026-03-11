@@ -154,6 +154,19 @@ struct AdminClient {
 }
 
 // =============================================================================
+// VFS Mount Table (devd2 owns the mount table, VfsClient queries it)
+// =============================================================================
+
+const MAX_VFS_MOUNTS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct VfsMountEntry {
+    prefix: [u8; 64],
+    prefix_len: u8,
+    shmem_id: u32,
+}
+
+// =============================================================================
 // Pending Port (registered but not yet Ready)
 // =============================================================================
 
@@ -183,6 +196,8 @@ struct Devd2 {
     configs: [Option<DriverConfig>; MAX_DRIVER_CONFIGS],
     config_count: usize,
     pending_ports: [Option<PendingPort>; MAX_PENDING_PORTS],
+    vfs_mounts: [Option<VfsMountEntry>; MAX_VFS_MOUNTS],
+    vfs_mount_count: usize,
 }
 
 impl Devd2 {
@@ -201,6 +216,8 @@ impl Devd2 {
             configs: [const { None }; MAX_DRIVER_CONFIGS],
             config_count: 0,
             pending_ports: [const { None }; MAX_PENDING_PORTS],
+            vfs_mounts: [const { None }; MAX_VFS_MOUNTS],
+            vfs_mount_count: 0,
         }
     }
 
@@ -927,6 +944,8 @@ impl Devd2 {
                     self.handle_port_registered(addr, value);
                 } else if key == b"port.state" {
                     self.handle_port_state(addr, value);
+                } else if key == b"mount.registered" {
+                    self.handle_mount_registered(value);
                 }
             }
             bus_msg_type::GET => {
@@ -940,6 +959,75 @@ impl Devd2 {
             }
             _ => {}
         }
+    }
+
+    // =========================================================================
+    // VFS Mount Table
+    // =========================================================================
+
+    fn handle_mount_registered(&mut self, value: &[u8]) {
+        // Value format: shmem_id(u32 LE) + prefix bytes
+        if value.len() < 5 {
+            return;
+        }
+        let shmem_id = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+        let prefix = &value[4..];
+        let prefix_len = prefix.len().min(64);
+
+        if self.vfs_mount_count >= MAX_VFS_MOUNTS {
+            uwarn!("devd2", "vfs_mount_table_full");
+            return;
+        }
+
+        // Find free slot
+        let slot = match self.vfs_mounts.iter().position(|m| m.is_none()) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let mut entry = VfsMountEntry {
+            prefix: [0u8; 64],
+            prefix_len: prefix_len as u8,
+            shmem_id,
+        };
+        entry.prefix[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+        self.vfs_mounts[slot] = Some(entry);
+        self.vfs_mount_count += 1;
+
+        uinfo!("devd2", "mount_registered";
+            shmem_id = shmem_id,
+            prefix = core::str::from_utf8(&prefix[..prefix_len]).unwrap_or("?"));
+    }
+
+    /// Resolve a VFS path against the mount table.
+    /// Returns (mount_index, remaining_path) for longest-prefix match.
+    /// Handles both "/mnt/nvme/foo" and "/mnt/nvme" (no trailing slash).
+    fn resolve_vfs_path<'a>(&self, path: &'a [u8]) -> Option<(usize, &'a [u8])> {
+        let mut best_idx = None;
+        let mut best_len = 0;
+
+        for (i, slot) in self.vfs_mounts.iter().enumerate() {
+            if let Some(entry) = slot {
+                let prefix = &entry.prefix[..entry.prefix_len as usize];
+                // Strip trailing slash for comparison so "/mnt/nvme" matches "/mnt/nvme/"
+                let prefix_base = if prefix.last() == Some(&b'/') {
+                    &prefix[..prefix.len() - 1]
+                } else {
+                    prefix
+                };
+                if (path.starts_with(prefix) && prefix.len() > best_len)
+                    || (path == prefix_base && prefix_base.len() > best_len)
+                {
+                    best_idx = Some(i);
+                    best_len = if path.starts_with(prefix) { prefix.len() } else { prefix_base.len() };
+                }
+            }
+        }
+
+        best_idx.map(|i| {
+            let remaining = &path[best_len..];
+            (i, remaining)
+        })
     }
 
     // =========================================================================
@@ -978,6 +1066,18 @@ impl Devd2 {
             Some(n) => n,
             None => return,
         };
+
+        // Detect binary query protocol (QueryHeader starts with msg_type u16 LE).
+        // Binary messages have specific msg_type values (0x010A, 0x010B, etc.)
+        // while text admin commands start with ASCII letters (>= 0x20).
+        if n >= 8 {
+            let msg_type = u16::from_le_bytes([buf[0], buf[1]]);
+            match msg_type {
+                0x010A => { self.handle_resolve_path(idx, &buf[..n]); return; }
+                0x010B => { self.handle_list_mounts(idx, &buf[..n]); return; }
+                _ => {}
+            }
+        }
 
         let parsed = match parse_config_cmd(&buf[..n]) {
             Some(p) => p,
@@ -1184,6 +1284,104 @@ impl Devd2 {
         if let Some(ref client) = self.admin_clients[idx] {
             let _ = client.channel.send(data);
         }
+    }
+
+    // =========================================================================
+    // Binary Query Protocol (VfsClient talks here)
+    // =========================================================================
+
+    fn handle_resolve_path(&self, admin_idx: usize, buf: &[u8]) {
+        let seq_id = if buf.len() >= 8 {
+            u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])
+        } else {
+            0
+        };
+
+        // Parse path from ResolvePath wire format: [8]=path_len, [9..]=path
+        let path = if buf.len() > 9 {
+            let path_len = (buf[8] as usize).min(64).min(buf.len() - 9);
+            &buf[9..9 + path_len]
+        } else {
+            b""
+        };
+
+        let mut reply = [0u8; 112];
+        let len = match self.resolve_vfs_path(path) {
+            Some((mount_idx, remaining)) => {
+                let entry = self.vfs_mounts[mount_idx].as_ref().unwrap();
+                // ResolvePathResponse::write_dataport format
+                let header_bytes = [
+                    0x0Au8, 0x03, // msg_type = RESOLVE_RESULT (0x030A) LE
+                    0, 0,         // flags
+                    buf[4], buf[5], buf[6], buf[7], // seq_id
+                ];
+                reply[0..8].copy_from_slice(&header_bytes);
+                reply[8] = 0;  // result = OK
+                reply[9] = 1;  // transport = DATAPORT
+                reply[10] = 0; // port_name_len = 0
+                reply[11] = remaining.len().min(64) as u8;
+                reply[12..16].copy_from_slice(&entry.shmem_id.to_le_bytes());
+                // [16..48] port_name — zeros
+                // [48..112] remaining_path
+                let rlen = remaining.len().min(64);
+                reply[48..48 + rlen].copy_from_slice(&remaining[..rlen]);
+                112
+            }
+            None => {
+                // Not found
+                let header_bytes = [
+                    0x0Au8, 0x03,
+                    0, 0,
+                    buf[4], buf[5], buf[6], buf[7],
+                ];
+                reply[0..8].copy_from_slice(&header_bytes);
+                reply[8] = 0xFF; // result = -1 (NOT_FOUND)
+                112
+            }
+        };
+
+        self.send_admin_reply_buf(admin_idx, &reply[..len]);
+    }
+
+    fn handle_list_mounts(&self, admin_idx: usize, buf: &[u8]) {
+        let seq_id_bytes = if buf.len() >= 8 { [buf[4], buf[5], buf[6], buf[7]] } else { [0; 4] };
+
+        // MountsListResponse: header(12) + entries(104 each)
+        // Max 5 per IPC message (576 byte limit)
+        let mut reply = [0u8; MSG_BUF_SIZE];
+
+        let count = self.vfs_mount_count.min(5) as u16;
+        let total = self.vfs_mount_count as u16;
+
+        // Header: msg_type(u16 LE) + flags(u16) + seq_id(u32) + count(u16) + total(u16)
+        reply[0..2].copy_from_slice(&0x0309u16.to_le_bytes()); // MOUNTS_LIST
+        reply[2..4].copy_from_slice(&[0, 0]); // flags
+        reply[4..8].copy_from_slice(&seq_id_bytes);
+        reply[8..10].copy_from_slice(&count.to_le_bytes());
+        reply[10..12].copy_from_slice(&total.to_le_bytes());
+
+        let mut pos = 12;
+        let mut written = 0u16;
+        for slot in &self.vfs_mounts {
+            if written >= count { break; }
+            if let Some(entry) = slot {
+                if pos + 104 > reply.len() { break; }
+                let plen = entry.prefix_len as usize;
+                // MountListEntry: transport(1) + prefix_len(1) + port_name_len(1) + pad(1)
+                //   + shmem_id(4) + prefix(64) + port_name(32) = 104
+                reply[pos] = 1; // DATAPORT
+                reply[pos + 1] = plen as u8;
+                reply[pos + 2] = 0; // no port_name
+                reply[pos + 3] = 0;
+                reply[pos + 4..pos + 8].copy_from_slice(&entry.shmem_id.to_le_bytes());
+                reply[pos + 8..pos + 8 + plen].copy_from_slice(&entry.prefix[..plen]);
+                // rest already zero
+                pos += 104;
+                written += 1;
+            }
+        }
+
+        self.send_admin_reply_buf(admin_idx, &reply[..pos]);
     }
 
     /// Snapshot service paths into a stack array for iteration without borrowing self.

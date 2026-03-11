@@ -1001,8 +1001,19 @@ impl BusCtx for RuntimeCtx {
         Err(BusError::NotFound) // Port discovery via busd not yet implemented
     }
 
-    fn register_mount(&mut self, _prefix: &[u8], _shmem_id: u32) -> Result<(), BusError> {
-        Ok(()) // Mount registration via busd not yet implemented
+    fn register_mount(&mut self, prefix: &[u8], shmem_id: u32) -> Result<(), BusError> {
+        // Pack shmem_id (4 bytes LE) + prefix into value, emit as bus event.
+        // devd2 listens for "mount.registered" events and populates its mount table.
+        let mut val = [0u8; 68]; // 4 + max 64 prefix
+        val[0..4].copy_from_slice(&shmem_id.to_le_bytes());
+        let plen = prefix.len().min(64);
+        val[4..4 + plen].copy_from_slice(&prefix[..plen]);
+
+        let (id, id_len) = self.identity_buf();
+        if let Some(ref mut bc) = self.bus_client {
+            let _ = bc.emit(&id[..id_len], b"mount.registered", &val[..4 + plen]);
+        }
+        Ok(())
     }
 
 }

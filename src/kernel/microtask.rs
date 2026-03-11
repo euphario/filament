@@ -477,9 +477,12 @@ fn exec_notify_parent_exit(parent_id: TaskId, child_pid: TaskId, code: i32) {
 
 /// Wake a task by PID.
 fn exec_wake(pid: TaskId) {
-    crate::kernel::task::with_scheduler(|sched| {
-        sched.wake_by_pid(pid);
+    let woken = crate::kernel::task::with_scheduler(|sched| {
+        sched.wake_by_pid(pid)
     });
+    if woken {
+        crate::kernel::sched::send_reschedule_ipi();
+    }
 }
 
 /// Phase 1 IPC cleanup: DMA stop, subscriber removal, peer notification, shmem begin.

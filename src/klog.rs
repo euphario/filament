@@ -398,7 +398,7 @@ impl LogRing {
 // ============================================================================
 
 /// Global log ring buffer (protected by SpinLock for SMP safety)
-pub static LOG_RING: crate::kernel::lock::SpinLock<LogRing> = crate::kernel::lock::SpinLock::new(crate::kernel::lock::lock_class::SUBSYSTEM, LogRing::new());
+pub static LOG_RING: crate::kernel::lock::SpinLock<LogRing> = crate::kernel::lock::SpinLock::new(crate::kernel::lock::lock_class::UNORDERED, LogRing::new());
 
 /// Reference count of bus owners that need UART drain suppressed.
 /// When >0, drain_one() skips UART output. Incremented when klog or uart

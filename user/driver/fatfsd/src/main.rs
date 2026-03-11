@@ -1820,10 +1820,23 @@ impl FatfsDriver {
                                 uerror!("fatfsd", "port_register_failed"; shmem_id = vfs_shmem_id);
                             }
 
-                            // Register mount — prefix from spawn context port name
-                            // e.g. source_name="block:0/fat:0" → "/mnt/block:0/fat:0/"
+                            // Register mount with devd2.
+                            // Use mount.path from config if set, otherwise fallback
+                            // to heuristic from source_name.
                             let mut mount_prefix = [0u8; 65];
-                            let prefix_len = {
+                            let prefix_len = if self.port_name_len > 0 {
+                                // Config-set mount path (e.g., "/mnt/nvme")
+                                let n = self.port_name_len.min(64);
+                                mount_prefix[..n].copy_from_slice(&self.port_name[..n]);
+                                let mut pos = n;
+                                // Ensure trailing slash
+                                if pos > 0 && mount_prefix[pos - 1] != b'/' && pos < 65 {
+                                    mount_prefix[pos] = b'/';
+                                    pos += 1;
+                                }
+                                pos
+                            } else {
+                                // Fallback: /mnt/<source_name>/
                                 let mut pos = 0;
                                 mount_prefix[pos] = b'/'; pos += 1;
                                 let m = b"mnt/";

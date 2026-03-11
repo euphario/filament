@@ -1976,51 +1976,16 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
     }
 
     // ── Phase 2: Block (task sleeps until event or timeout) ──
-    // NOTE: Mux blocking cannot use sleep_and_reschedule() because it needs
-    // a post-block re-poll to catch events that arrived between the poll and
-    // the state transition. The blocking and rescheduling must be separate
-    // steps to allow this race-detection window.
-    let transition_ok = task::with_scheduler(|sched| {
-        // First pass: check state and do transition
-        let ok = {
-            let Some(task) = sched.task_mut(slot) else {
-                return false;
-            };
-
-            // Handle task state at block point
-            let cpu = crate::kernel::percpu::cpu_id();
-            match task.state() {
-                task::TaskState::Running { .. } => {}
-                task::TaskState::Ready => {
-                    if task.set_running(cpu).is_err() {
-                        return false;
-                    }
-                }
-                task::TaskState::Sleeping { .. } | task::TaskState::Waiting { .. } => {
-                    return true; // Already blocked
-                }
-                _ => return false,
-            }
-
-            if earliest_deadline == u64::MAX {
-                task.set_sleeping(crate::kernel::task::SleepReason::EventLoop).is_ok()
-            } else {
-                task.set_waiting(crate::kernel::task::WaitReason::TimedEvent, earliest_deadline).is_ok()
-            }
-        }; // task borrow ends here
-
-        if ok {
-            if earliest_deadline != u64::MAX {
-                sched.note_deadline(earliest_deadline);
-            }
-            // CRITICAL: Prevent simple preemption race — another CPU must not
-            // schedule this task via trap-frame swap while our kernel stack is live.
-            if let Some(task) = sched.task_mut(slot) {
-                task.mark_context_saved();
-            }
-        }
-        ok
-    });
+    // NOTE: Cannot use sleep_and_reschedule() because we need a post-block
+    // re-poll between blocking and rescheduling to catch events that arrived
+    // during the Phase 1→2 gap. Use sleep_current/wait_current which block
+    // without rescheduling — they handle mark_context_saved, kernel_stack_owner,
+    // and notify_blocked atomically.
+    let transition_ok = if earliest_deadline == u64::MAX {
+        crate::kernel::sched::sleep_current(crate::kernel::task::SleepReason::EventLoop)
+    } else {
+        crate::kernel::sched::wait_current(crate::kernel::task::WaitReason::TimedEvent, earliest_deadline)
+    };
 
     if !transition_ok {
         return KernelError::InvalidArg.to_errno();
@@ -2053,7 +2018,8 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
     };
 
     if late_events_or_woken {
-        // Self-wake: transition back to Running via state machine
+        // Self-wake: transition back to Running via state machine.
+        // Undo the kernel_stack_owner + notify_blocked from Phase 2.
         task::with_scheduler(|sched| {
             if let Some(task) = sched.task_mut(slot) {
                 let cpu = crate::kernel::percpu::cpu_id();
@@ -2065,7 +2031,9 @@ fn read_mux_via_service(task_id: crate::kernel::task::TaskId, mux_handle: Handle
                 }
                 // Clear flag since we're NOT context switching (self-wake path)
                 task.mark_context_restored();
+                task.clear_kernel_stack_owner();
             }
+            sched.notify_ready(slot);
         });
     } else {
         // Apply priority inheritance boosts to channel peers before blocking

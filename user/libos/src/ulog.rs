@@ -393,8 +393,8 @@ impl RecordBuilder {
         self.buffer[1] = (total_len >> 8) as u8;
 
         let level = self.buffer[6];
-        if level <= Level::Notice as u8 {
-            // Error/Warn/Info/Notice → write directly to kernel klog (immediate)
+        if level <= LOG_LEVEL.load(Ordering::Relaxed) as u8 {
+            // Write to kernel klog (immediate) if within current log level
             libsys::syscall::klog_write(&self.buffer[..self.pos]);
         } else {
             // Debug/Trace → buffer locally, auto-flush every N writes

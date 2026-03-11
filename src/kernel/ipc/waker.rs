@@ -27,7 +27,6 @@
 //! ```
 
 use super::traits::{Subscriber, WakeReason};
-use crate::kernel::task;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Maximum subscribers per object
@@ -286,17 +285,9 @@ pub fn wake(list: &WakeList, _reason: WakeReason) {
 /// If lock is held, defers wake via microtask queue.
 #[track_caller]
 fn wake_one(sub: &Subscriber) {
-    // Use try_scheduler to avoid deadlock if called from reap_terminated
-    if let Some(mut sched) = task::try_scheduler() {
-        // Use unified wake function that handles IPC return values,
-        // liveness state reset, and state validation
-        sched.wake_by_pid(sub.task_id);
-    } else {
-        // Lock held — defer via microtask queue (lock ordering: SCHEDULER(10)→MICROTASK(15))
-        let _ = crate::kernel::microtask::enqueue(
-            crate::kernel::microtask::MicroTask::Wake { pid: sub.task_id },
-        );
-    }
+    // Delegate to sched::wake() which handles try_scheduler, microtask
+    // fallback, AND send_reschedule_ipi to wake idle CPUs.
+    crate::kernel::sched::wake(sub.task_id);
 }
 
 /// Wake a task by PID directly (for compatibility)

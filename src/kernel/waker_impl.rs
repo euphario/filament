@@ -1,16 +1,9 @@
 //! Kernel Waker Implementation
 //!
-//! Implements the `Waker` trait by delegating to the scheduler.
+//! Implements the `Waker` trait by delegating to `sched::wake()`.
 //! This provides a clean trait boundary for waking tasks.
-//!
-//! # Thread Safety
-//!
-//! Uses try_scheduler() to avoid deadlocks when called from contexts that
-//! already hold the scheduler lock (e.g., cleanup paths, reap_terminated).
-//! If the lock is held, defers the wake via microtask queue.
 
 use crate::kernel::traits::waker::{Waker, Subscriber, WakeReason, WakeList};
-use crate::kernel::task;
 
 /// Kernel waker implementation
 ///
@@ -26,18 +19,9 @@ impl KernelWaker {
 
 impl Waker for KernelWaker {
     fn wake(&self, sub: &Subscriber, _reason: WakeReason) {
-        // Use try_scheduler to avoid deadlock when called from cleanup paths
-        if let Some(mut sched) = task::try_scheduler() {
-            // Generation check is handled by wake_by_pid -> slot_by_pid:
-            // slot_by_pid compares task.id == pid which includes the generation
-            // bits, so stale PIDs will fail the lookup and won't wake anything.
-            sched.wake_by_pid(sub.task_id);
-        } else {
-            // Lock held — defer via microtask queue (lock ordering: SCHEDULER(10)→MICROTASK(15))
-            let _ = crate::kernel::microtask::enqueue(
-                crate::kernel::microtask::MicroTask::Wake { pid: sub.task_id },
-            );
-        }
+        // Delegate to sched::wake() which handles try_scheduler, microtask
+        // fallback, AND send_reschedule_ipi to wake idle CPUs.
+        crate::kernel::sched::wake(sub.task_id);
     }
 
     fn wake_all(&self, list: &WakeList, reason: WakeReason) {
