@@ -2,6 +2,7 @@
 //!
 //! [`HalfRing`] handles one direction of a byte ring in shared memory.
 //! [`TypedRing`] does the same for fixed-size structured items.
+//! [`NapiRing`] wraps a TypedRing with a trigger handle for NAPI-like polling.
 //!
 //! These are pure building blocks — no shmem allocation, no notification.
 //! For complete pipes with shmem and notify/wait, see `libf::sync`.
@@ -408,5 +409,128 @@ impl<T: Copy> TypedRing<T> {
                 );
             }
         }
+    }
+}
+
+// ============================================================================
+// NapiRing — TypedRing with NAPI-like notification
+// ============================================================================
+
+/// A [`TypedRing`] with NAPI-like notification.
+///
+/// Each NapiRing is one direction: one producer pushes, one consumer pulls.
+/// The trigger handle (channel doorbell, IRQ, timer) tells the consumer
+/// "go poll the ring."
+///
+/// **Producer side**: push items, call [`notify()`](Self::notify) to ring trigger.
+/// **Consumer side**: register [`handle()`](Self::handle) with Mux, call
+/// [`begin_poll()`](Self::begin_poll) when Mux fires, drain ring, call
+/// [`end_poll()`](Self::end_poll) when empty.
+pub struct NapiRing<T: Copy> {
+    ring: TypedRing<T>,
+    /// Trigger handle — any readable kernel object (channel, IRQ, timer).
+    trigger: crate::syscall::Handle,
+    /// In poll mode: trigger acked, actively draining the ring.
+    polling: bool,
+}
+
+impl<T: Copy> NapiRing<T> {
+    /// Create from a TypedRing and a trigger handle.
+    ///
+    /// The trigger is the consumer's end of a notification channel —
+    /// typically from [`ChannelDoorbell::pair()`](crate::ring::ChannelDoorbell::pair).
+    pub fn new(ring: TypedRing<T>, trigger: crate::syscall::Handle) -> Self {
+        Self { ring, trigger, polling: false }
+    }
+
+    // --- Producer side ---
+
+    /// Push one item into the ring. Returns `true` if accepted.
+    pub fn push(&self, item: &T) -> bool {
+        self.ring.push(item)
+    }
+
+    /// Push multiple items. Returns how many were accepted.
+    pub fn push_batch(&self, items: &[T]) -> usize {
+        self.ring.push_batch(items)
+    }
+
+    /// Ring the trigger to wake the consumer.
+    ///
+    /// Call after pushing items. Writes a single byte to the trigger handle.
+    /// If the handle's buffer is full, the consumer already has a pending
+    /// notification — safe to ignore the error.
+    pub fn notify(&self) {
+        let _ = crate::syscall::write(self.trigger, &[1]);
+    }
+
+    // --- Consumer side ---
+
+    /// Pull one item from the ring.
+    pub fn poll(&self) -> Option<T> {
+        self.ring.pull()
+    }
+
+    /// Pull multiple items. Returns how many were delivered.
+    pub fn poll_batch(&self, buf: &mut [T]) -> usize {
+        self.ring.pull_batch(buf)
+    }
+
+    /// Peek at the next item without consuming it.
+    pub fn peek(&self) -> Option<T> {
+        self.ring.peek()
+    }
+
+    /// Handle for Mux registration.
+    ///
+    /// Register this with `Mux::add(handle, MuxFilter::Readable)`.
+    pub fn handle(&self) -> crate::syscall::Handle {
+        self.trigger
+    }
+
+    /// Enter poll mode after Mux fires.
+    ///
+    /// Drains pending notification bytes from the trigger so it won't
+    /// re-fire spuriously. Call this, then drain the ring until empty,
+    /// then call [`end_poll()`](Self::end_poll).
+    pub fn begin_poll(&mut self) {
+        let mut buf = [0u8; 64];
+        let _ = crate::syscall::try_read(self.trigger, &mut buf);
+        self.polling = true;
+    }
+
+    /// Exit poll mode.
+    ///
+    /// The ring is empty — the next `notify()` from the producer will
+    /// fire the Mux again.
+    pub fn end_poll(&mut self) {
+        self.polling = false;
+    }
+
+    /// Whether we're currently in poll mode.
+    pub fn is_polling(&self) -> bool {
+        self.polling
+    }
+
+    // --- Shared ---
+
+    /// How many items are waiting to be pulled.
+    pub fn readable(&self) -> usize {
+        self.ring.readable()
+    }
+
+    /// How many items can be pushed.
+    pub fn writable(&self) -> usize {
+        self.ring.writable()
+    }
+
+    /// Total number of slots.
+    pub fn capacity(&self) -> usize {
+        self.ring.capacity()
+    }
+
+    /// Access the underlying TypedRing.
+    pub fn inner(&self) -> &TypedRing<T> {
+        &self.ring
     }
 }

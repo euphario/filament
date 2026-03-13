@@ -95,6 +95,9 @@ pub enum PortRole {
 /// High-level data port for layered I/O
 ///
 /// Wraps a LayeredRing with role-based API and pool allocation.
+/// Each direction has its own doorbell for NAPI-like notification:
+/// - `sq_doorbell`: consumer→provider "I posted SQEs"
+/// - `cq_doorbell`: provider→consumer "I posted CQEs"
 pub struct DataPort {
     ring: LayeredRing,
     role: PortRole,
@@ -102,9 +105,10 @@ pub struct DataPort {
     alloc: Option<PoolAlloc>,
     /// Next tag for requests (only used by Consumer)
     next_tag: u32,
-    /// Optional doorbell for event-driven notification.
-    /// When set, `notify()` rings the doorbell instead of shmem notify.
-    doorbell: Option<ChannelDoorbell>,
+    /// SQ doorbell: consumer rings after posting SQEs, provider listens.
+    sq_doorbell: Option<ChannelDoorbell>,
+    /// CQ doorbell: provider rings after posting CQEs, consumer listens.
+    cq_doorbell: Option<ChannelDoorbell>,
     /// Local CQ cursor for deferred-ack reads (consumer side).
     /// Tracks how many CQEs we've peeked locally. Only advanced by
     /// `ack_completions()` in shared memory.
@@ -130,7 +134,8 @@ impl DataPort {
             role: PortRole::Provider,
             alloc: Some(alloc),
             next_tag: 0,
-            doorbell: None,
+            sq_doorbell: None,
+            cq_doorbell: None,
             local_cq_cursor: 0,
         })
     }
@@ -151,7 +156,8 @@ impl DataPort {
             role: PortRole::Consumer,
             alloc: Some(alloc),
             next_tag: 1,
-            doorbell: None,
+            sq_doorbell: None,
+            cq_doorbell: None,
             local_cq_cursor: 0,
         })
     }
@@ -517,34 +523,105 @@ impl DataPort {
     }
 
     // =========================================================================
-    // Doorbell
+    // Per-Direction Doorbells
     // =========================================================================
 
-    /// Attach a doorbell for event-driven notifications.
+    /// Attach an SQ doorbell (consumer→provider notification).
     ///
-    /// When set, `notify()` rings the doorbell instead of shmem notify,
-    /// and `mux_handle()` returns the doorbell's handle.
-    pub fn set_doorbell(&mut self, bell: ChannelDoorbell) {
-        self.doorbell = Some(bell);
+    /// The consumer rings this after posting SQEs. The provider registers
+    /// `sq_mux_handle()` with its Mux to wake on new requests.
+    pub fn set_sq_doorbell(&mut self, bell: ChannelDoorbell) {
+        self.sq_doorbell = Some(bell);
     }
 
-    /// Get the handle to register with a Mux.
+    /// Attach a CQ doorbell (provider→consumer notification).
     ///
-    /// Returns the doorbell handle if set, otherwise the shmem handle.
-    pub fn mux_handle(&self) -> crate::syscall::Handle {
-        if let Some(ref bell) = self.doorbell {
-            bell.mux_handle()
-        } else {
-            self.ring.shmem_handle()
+    /// The provider rings this after posting CQEs. The consumer registers
+    /// `cq_mux_handle()` with its Mux to wake on completions.
+    pub fn set_cq_doorbell(&mut self, bell: ChannelDoorbell) {
+        self.cq_doorbell = Some(bell);
+    }
+
+    /// Attach a single doorbell for both directions (legacy compat).
+    ///
+    /// Sets both SQ and CQ doorbell to the same handle. Prefer
+    /// `set_sq_doorbell()` + `set_cq_doorbell()` for proper per-direction
+    /// notification.
+    pub fn set_doorbell(&mut self, bell: ChannelDoorbell) {
+        // Legacy: single doorbell covers both directions.
+        // Store in the direction this side listens on:
+        // - Provider listens for SQEs → sq_doorbell
+        // - Consumer listens for CQEs → cq_doorbell
+        match self.role {
+            PortRole::Provider => self.sq_doorbell = Some(bell),
+            PortRole::Consumer => self.cq_doorbell = Some(bell),
         }
     }
 
-    /// Acknowledge a doorbell notification (drain pending state).
+    /// SQ handle for Mux registration (provider side).
     ///
-    /// Call after Mux fires on this port's handle to prevent spurious wakes.
-    /// No-op if no doorbell is set (shmem notify is edge-triggered).
+    /// Returns the SQ doorbell handle if set, otherwise the shmem handle.
+    pub fn sq_mux_handle(&self) -> Option<crate::syscall::Handle> {
+        self.sq_doorbell.as_ref().map(|b| b.mux_handle())
+    }
+
+    /// CQ handle for Mux registration (consumer side).
+    ///
+    /// Returns the CQ doorbell handle if set, otherwise the shmem handle.
+    pub fn cq_mux_handle(&self) -> Option<crate::syscall::Handle> {
+        self.cq_doorbell.as_ref().map(|b| b.mux_handle())
+    }
+
+    /// Get the handle to register with a Mux (role-aware).
+    ///
+    /// Returns the appropriate per-direction doorbell handle if set,
+    /// otherwise falls back to shmem handle.
+    /// - Provider → SQ doorbell (wake on new requests)
+    /// - Consumer → CQ doorbell (wake on completions)
+    pub fn mux_handle(&self) -> crate::syscall::Handle {
+        match self.role {
+            PortRole::Provider => {
+                if let Some(ref bell) = self.sq_doorbell {
+                    return bell.mux_handle();
+                }
+            }
+            PortRole::Consumer => {
+                if let Some(ref bell) = self.cq_doorbell {
+                    return bell.mux_handle();
+                }
+            }
+        }
+        self.ring.shmem_handle()
+    }
+
+    /// Acknowledge doorbell notification (drain pending state).
+    ///
+    /// Acks the appropriate direction based on role.
     pub fn ack(&self) {
-        if let Some(ref bell) = self.doorbell {
+        match self.role {
+            PortRole::Provider => {
+                if let Some(ref bell) = self.sq_doorbell {
+                    bell.ack();
+                }
+            }
+            PortRole::Consumer => {
+                if let Some(ref bell) = self.cq_doorbell {
+                    bell.ack();
+                }
+            }
+        }
+    }
+
+    /// Acknowledge SQ doorbell specifically (provider drains SQ notification).
+    pub fn ack_sq(&self) {
+        if let Some(ref bell) = self.sq_doorbell {
+            bell.ack();
+        }
+    }
+
+    /// Acknowledge CQ doorbell specifically (consumer drains CQ notification).
+    pub fn ack_cq(&self) {
+        if let Some(ref bell) = self.cq_doorbell {
             bell.ack();
         }
     }
@@ -553,14 +630,37 @@ impl DataPort {
     // Notifications
     // =========================================================================
 
-    /// Notify peer that new entries are available.
+    /// Notify provider that new SQEs are available.
     ///
-    /// Rings the doorbell if set, otherwise falls back to shmem notify.
-    pub fn notify(&self) {
-        if let Some(ref bell) = self.doorbell {
+    /// Rings the SQ doorbell if set, otherwise falls back to shmem notify.
+    pub fn notify_sq(&self) {
+        if let Some(ref bell) = self.sq_doorbell {
             bell.ring();
         } else {
             self.ring.notify();
+        }
+    }
+
+    /// Notify consumer that new CQEs are available.
+    ///
+    /// Rings the CQ doorbell if set, otherwise falls back to shmem notify.
+    pub fn notify_cq(&self) {
+        if let Some(ref bell) = self.cq_doorbell {
+            bell.ring();
+        } else {
+            self.ring.notify();
+        }
+    }
+
+    /// Notify peer (role-aware convenience).
+    ///
+    /// - Consumer calls this after posting SQEs → rings SQ doorbell
+    /// - Provider calls this after posting CQEs → rings CQ doorbell
+    /// Falls back to shmem notify if no doorbell set.
+    pub fn notify(&self) {
+        match self.role {
+            PortRole::Consumer => self.notify_sq(),
+            PortRole::Provider => self.notify_cq(),
         }
     }
 

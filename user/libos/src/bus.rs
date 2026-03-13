@@ -1059,8 +1059,14 @@ pub trait BlockTransport {
     /// notified, false on timeout.
     fn wait(&self, timeout_ms: u32) -> bool;
 
-    /// Get the underlying shmem handle for Mux registration.
+    /// Get the underlying shmem handle for Mux registration (role-aware).
     fn mux_handle(&self) -> Option<libsys::syscall::Handle>;
+
+    /// SQ handle for Mux registration (provider listens for new requests).
+    fn sq_mux_handle(&self) -> Option<libsys::syscall::Handle> { None }
+
+    /// CQ handle for Mux registration (consumer listens for completions).
+    fn cq_mux_handle(&self) -> Option<libsys::syscall::Handle> { None }
 
     // === Pool reclaim + deferred ack ===
 

@@ -47,9 +47,19 @@ impl ShmemBlockPort {
         &mut self.port
     }
 
-    /// Attach a doorbell for event-driven notifications.
+    /// Attach a doorbell for event-driven notifications (legacy single-bell).
     pub fn set_doorbell(&mut self, bell: crate::ring::ChannelDoorbell) {
         self.port.set_doorbell(bell);
+    }
+
+    /// Attach SQ doorbell (consumer→provider "I posted SQEs").
+    pub fn set_sq_doorbell(&mut self, bell: crate::ring::ChannelDoorbell) {
+        self.port.set_sq_doorbell(bell);
+    }
+
+    /// Attach CQ doorbell (provider→consumer "I posted CQEs").
+    pub fn set_cq_doorbell(&mut self, bell: crate::ring::ChannelDoorbell) {
+        self.port.set_cq_doorbell(bell);
     }
 
     /// Acknowledge doorbell notification (drain pending state).
@@ -200,6 +210,14 @@ impl BlockTransport for ShmemBlockPort {
 
     fn mux_handle(&self) -> Option<libsys::syscall::Handle> {
         Some(self.port.mux_handle())
+    }
+
+    fn sq_mux_handle(&self) -> Option<libsys::syscall::Handle> {
+        self.port.sq_mux_handle()
+    }
+
+    fn cq_mux_handle(&self) -> Option<libsys::syscall::Handle> {
+        self.port.cq_mux_handle()
     }
 
     fn free(&mut self, offset: u32) {

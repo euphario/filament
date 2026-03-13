@@ -114,9 +114,11 @@ struct FatfsDriver {
     // Open files
     open_files: [OpenFile; MAX_OPEN_FILES],
 
-    // Port name derived from partition
+    // Mount path from config (e.g., "/mnt/nvme")
     port_name: [u8; 32],
     port_name_len: usize,
+    // VFS shmem_id for deferred mount registration
+    vfs_shmem_id: u32,
 
     // Scratch buffer for batch FAT sector reads
     fat_read_buf: [u8; FAT_READ_BUF_SIZE],
@@ -148,6 +150,7 @@ impl FatfsDriver {
             open_files: [OpenFile::empty(); MAX_OPEN_FILES],
             port_name: [0; 32],
             port_name_len: 0,
+            vfs_shmem_id: 0,
             fat_read_buf: [0u8; FAT_READ_BUF_SIZE],
         }
     }
@@ -1770,54 +1773,17 @@ impl FatfsDriver {
                             let vfs_shmem_id = port.shmem_id();
                             self.vfs_port = Some(port_id);
 
-                            // Simple local port name — bus_runtime prepends the
-                            // full parent path (e.g. block:0/fat:0/mnt:0).
+                            // Register as Filesystem port with devd
                             let pname = b"mnt:0";
-                            let pname_len = pname.len();
-
-                            self.port_name[..pname_len].copy_from_slice(&pname[..pname_len]);
-                            self.port_name_len = pname_len;
-
-                            // Register as Filesystem port with devd using unified PortInfo
-                            let mut info = PortInfo::new(&pname[..pname_len], PortClass::Filesystem);
+                            let mut info = PortInfo::new(pname, PortClass::Filesystem);
                             info.port_subclass = port_subclass::FS_FAT;
                             if let Err(_) = ctx.register_port_with_info(&info, vfs_shmem_id) {
                                 uerror!("fatfsd", "port_register_failed"; shmem_id = vfs_shmem_id);
                             }
 
-                            // Register mount with devd2.
-                            // Use mount.path from config if set, otherwise fallback
-                            // to heuristic from source_name.
-                            let mut mount_prefix = [0u8; 65];
-                            let prefix_len = if self.port_name_len > 0 {
-                                // Config-set mount path (e.g., "/mnt/nvme")
-                                let n = self.port_name_len.min(64);
-                                mount_prefix[..n].copy_from_slice(&self.port_name[..n]);
-                                let mut pos = n;
-                                // Ensure trailing slash
-                                if pos > 0 && mount_prefix[pos - 1] != b'/' && pos < 65 {
-                                    mount_prefix[pos] = b'/';
-                                    pos += 1;
-                                }
-                                pos
-                            } else {
-                                // Fallback: /mnt/<source_name>/
-                                let mut pos = 0;
-                                mount_prefix[pos] = b'/'; pos += 1;
-                                let m = b"mnt/";
-                                mount_prefix[pos..pos + m.len()].copy_from_slice(m);
-                                pos += m.len();
-                                let clen = source_name.len().min(65 - pos - 1);
-                                mount_prefix[pos..pos + clen].copy_from_slice(&source_name[..clen]);
-                                pos += clen;
-                                if pos < 65 && mount_prefix[pos - 1] != b'/' {
-                                    mount_prefix[pos] = b'/'; pos += 1;
-                                }
-                                pos
-                            };
-                            if let Err(_) = ctx.register_mount(&mount_prefix[..prefix_len], vfs_shmem_id) {
-                                uerror!("fatfsd", "mount_register_failed";);
-                            }
+                            // Mount registration deferred to config_done() —
+                            // mount.path config arrives from devd2 after init.
+                            self.vfs_shmem_id = vfs_shmem_id;
                             return true;
                         }
                     }
@@ -1914,6 +1880,24 @@ impl Driver for FatfsDriver {
         if self.vfs_port == Some(port) {
             self.process_vfs_requests(ctx);
         }
+    }
+
+    fn config_done(&mut self, ctx: &mut dyn BusCtx) {
+        // Register mount now that mount.path has been set by config
+        if self.port_name_len > 0 && self.vfs_shmem_id != 0 {
+            let mut mount_prefix = [0u8; 65];
+            let n = self.port_name_len.min(64);
+            mount_prefix[..n].copy_from_slice(&self.port_name[..n]);
+            let mut pos = n;
+            if pos > 0 && mount_prefix[pos - 1] != b'/' && pos < 65 {
+                mount_prefix[pos] = b'/';
+                pos += 1;
+            }
+            if let Err(_) = ctx.register_mount(&mount_prefix[..pos], self.vfs_shmem_id) {
+                uerror!("fatfsd", "mount_register_failed";);
+            }
+        }
+        let _ = ctx.bus_emit(b"state", b"Running");
     }
 
     fn config_set(&mut self, key: &[u8], value: &[u8], buf: &mut [u8], _ctx: &mut dyn BusCtx) -> usize {

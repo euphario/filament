@@ -35,8 +35,12 @@ const MAX_BLOCK_PORTS: usize = MAX_PORTS;
 /// Maximum children this driver can relay for.
 const MAX_CHILDREN: usize = 8;
 
-/// Tag base for block port shmem handles.
+/// Tag base for block port handles (SQ direction — provider listens for SQEs).
 const TAG_BLOCK_PORT_BASE: u32 = 0xFFFF_FE00;
+
+/// Tag base for block port CQ handles (consumer listens for CQEs).
+/// Offset from SQ base by MAX_PORTS so tags don't collide.
+const TAG_BLOCK_PORT_CQ_BASE: u32 = 0xFFFF_FE00 - MAX_PORTS as u32;
 
 /// Tag base for kernel bus channels.
 const TAG_KERNEL_BUS_BASE: u32 = 0xFFFF_FD00;
@@ -507,11 +511,17 @@ impl RuntimeCtx {
 
     /// Register a block port's handle with the Mux.
     ///
-    /// Uses the doorbell handle if set, otherwise falls back to shmem handle.
+    /// Registers the shmem handle for cross-process notification.
+    /// Uses per-direction tags so dispatch knows the port's role.
     fn register_block_port_handle(&mut self, port_idx: usize) {
+        use libsys::data_port::PortRole;
+
         if let Some(ref port) = self.block_ports[port_idx] {
             if let Some(h) = port.mux_handle() {
-                let tag = TAG_BLOCK_PORT_BASE + port_idx as u32;
+                let tag = match port.data_port().role() {
+                    PortRole::Provider => TAG_BLOCK_PORT_BASE + port_idx as u32,
+                    PortRole::Consumer => TAG_BLOCK_PORT_CQ_BASE + port_idx as u32,
+                };
                 if let Err(e) = self.mux.add(h, MuxFilter::Readable) {
                     crate::uerror!("bus", "port_mux_add_failed"; err = e.as_str());
                 }
@@ -1198,20 +1208,28 @@ impl<D: Driver> DriverRuntime<D> {
 
             if tag == TAG_BUSD {
                 self.handle_busd_message();
-            } else if tag >= TAG_KERNEL_BUS_BASE && tag < TAG_BLOCK_PORT_BASE {
-                // Kernel bus state notification
-                let bus_idx = (tag - TAG_KERNEL_BUS_BASE) as usize;
-                self.handle_kernel_bus_event(bus_idx);
             } else if tag >= TAG_BLOCK_PORT_BASE {
-                // Block port notification (doorbell or shmem)
+                // Block port SQ notification (provider: new SQEs from consumer)
                 let port_idx = (tag - TAG_BLOCK_PORT_BASE) as usize;
                 if port_idx < MAX_BLOCK_PORTS {
-                    // Ack the doorbell to prevent spurious re-fires
                     if let Some(ref port) = self.ctx.block_ports[port_idx] {
                         port.ack();
                     }
                     self.driver.data_ready(PortId(port_idx as u8), &mut self.ctx);
                 }
+            } else if tag >= TAG_BLOCK_PORT_CQ_BASE {
+                // Block port CQ notification (consumer: completions from provider)
+                let port_idx = (tag - TAG_BLOCK_PORT_CQ_BASE) as usize;
+                if port_idx < MAX_BLOCK_PORTS {
+                    if let Some(ref port) = self.ctx.block_ports[port_idx] {
+                        port.ack();
+                    }
+                    self.driver.data_ready(PortId(port_idx as u8), &mut self.ctx);
+                }
+            } else if tag >= TAG_KERNEL_BUS_BASE {
+                // Kernel bus state notification
+                let bus_idx = (tag - TAG_KERNEL_BUS_BASE) as usize;
+                self.handle_kernel_bus_event(bus_idx);
             } else {
                 // Driver-registered handle
                 self.driver.handle_event(tag, handle, &mut self.ctx);

@@ -641,6 +641,15 @@ fn block_current(op: BlockReason) -> bool {
         return false;
     };
 
+    // If task was preempted (Running→Ready) between syscall entry and
+    // acquiring the scheduler lock, fix up to Running before blocking.
+    // The task IS executing on this CPU — it just lost the Running flag
+    // to a timer-tick preemption that couldn't context-switch (we hold
+    // the lock now, or the preemption happened just before we took it).
+    if *task.state() == TaskState::Ready {
+        let _ = task.set_running(percpu::cpu_id());
+    }
+
     let transition_ok = match op {
         BlockReason::Sleep(reason) => task.set_sleeping(reason).is_ok(),
         BlockReason::Wait(reason, deadline) => task.set_waiting(reason, deadline).is_ok(),

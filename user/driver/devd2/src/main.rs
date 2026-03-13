@@ -510,13 +510,16 @@ impl Devd2 {
         };
         let path = core::str::from_utf8(&path_buf[..path_len]).unwrap_or("bin/???");
 
-        // Minimal mailbox: just bus path and priority
-        let svc_path_str = binary.as_bytes();
+        // Minimal mailbox: just bus path and priority.
+        // bus.path must match add_service path: "/<port_name>/<binary>".
+        // For services, port_name == binary, so bus.path = "/<binary>/<binary>".
         let mut bus_path = [0u8; 48];
         let bus_path_len = {
             let mut w = WireWriter::new(&mut bus_path);
             w.put_bytes(b"/");
-            w.put_bytes(svc_path_str);
+            w.put_bytes(binary.as_bytes());
+            w.put_bytes(b"/");
+            w.put_bytes(binary.as_bytes());
             w.finish()
         };
         let mut mb_buf = [0u8; 256];
